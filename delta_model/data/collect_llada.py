@@ -44,6 +44,7 @@ from . import schema as S
 from ..llada_runtime import (
     _get_num_transfer_tokens,
     _get_transfer_index,
+    _get_transfer_index_dynamic,
     load_llada,
 )
 
@@ -190,7 +191,8 @@ def collect_one_sample(
     gen_length: int = S.GEN_LENGTH,
     block_length: int = S.BLOCK_LENGTH,
     max_iter: int = S.MAX_ITER,
-    threshold: float = 0.9,
+    threshold: float | None = None,
+    factor: float | None = 1.0,
     temperature: float = 0.0,
     remasking: str = "low_confidence",
     mask_id: int = S.LLADA_MASK_TOKEN_ID,
@@ -198,7 +200,18 @@ def collect_one_sample(
     """Run prefix-cache generation on one prompt and return the cache dict
     described in `data/schema.py`. Returns None if the prompt is too short
     (< PREFIX_WINDOW tokens) — those samples are dropped.
+
+    Decoding mode is controlled by exactly one of:
+      - `threshold` (float in (0,1]): commit positions with confidence ≥ thr.
+      - `factor`    (float > 0):       per-rank dynamic threshold (Fast-dLLM
+                                       paper-recommended). Default 1.0.
+    Pass the other as None.
     """
+    if (threshold is None) == (factor is None):
+        raise ValueError(
+            "collect_one_sample: pass exactly one of `threshold` or `factor` "
+            f"(got threshold={threshold!r}, factor={factor!r})"
+        )
     prompt_ids = _format_prompt_llada(tokenizer, prompt_text)
     prompt_len = int(prompt_ids.shape[1])
     if prompt_len < S.PREFIX_WINDOW:
@@ -299,14 +312,20 @@ def collect_one_sample(
                     # to current block).
                     global_mask_index = (x == mask_id)
                     global_mask_index[:, e:] = False
-                    quota = (
-                        None if threshold is not None
-                        else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
-                    )
-                    x0, transfer_index = _get_transfer_index(
-                        logits, temperature, remasking, global_mask_index, x,
-                        quota, threshold,
-                    )
+                    if factor is not None:
+                        x0, transfer_index = _get_transfer_index_dynamic(
+                            logits, temperature, remasking, global_mask_index, x,
+                            factor=factor,
+                        )
+                    else:
+                        quota = (
+                            None if threshold is not None
+                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                        )
+                        x0, transfer_index = _get_transfer_index(
+                            logits, temperature, remasking, global_mask_index, x,
+                            quota, threshold,
+                        )
                     x = torch.where(transfer_index, x0, x)
 
                 else:
@@ -319,14 +338,20 @@ def collect_one_sample(
 
                     mask_index_blk = (x[:, s:] == mask_id)
                     mask_index_blk[:, block_length:] = False
-                    quota = (
-                        None if threshold is not None
-                        else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
-                    )
-                    x0_full, transfer_full = _get_transfer_index(
-                        logits, temperature, remasking, mask_index_blk,
-                        x[:, s:], quota, threshold,
-                    )
+                    if factor is not None:
+                        x0_full, transfer_full = _get_transfer_index_dynamic(
+                            logits, temperature, remasking, mask_index_blk,
+                            x[:, s:], factor=factor,
+                        )
+                    else:
+                        quota = (
+                            None if threshold is not None
+                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                        )
+                        x0_full, transfer_full = _get_transfer_index(
+                            logits, temperature, remasking, mask_index_blk,
+                            x[:, s:], quota, threshold,
+                        )
                     new_blk = torch.where(transfer_full, x0_full, x[:, s:])
                     x = torch.cat([x[:, :s], new_blk], dim=1)
 
@@ -373,6 +398,10 @@ def collect_one_sample(
             "block_length":   block_length,
             "max_iter":       max_iter,
             "fast_dllm_mode": "prefix_cache",
+            "decoding": (
+                {"mode": "factor",    "factor":    factor}    if factor is not None
+                else {"mode": "threshold", "threshold": threshold}
+            ),
             "schema_version": S.SCHEMA_VERSION,
         },
     }
@@ -418,8 +447,16 @@ def main() -> None:
     p.add_argument("--fast_dllm_path", type=str, default=None)
     p.add_argument("--shuffle_seed", type=int, default=42)
     p.add_argument(
-        "--threshold", type=float, default=0.9,
-        help="Confidence threshold for parallel decoding.",
+        "--threshold", type=float, default=None,
+        help="Confidence threshold for parallel decoding (Fast-dLLM "
+             "fixed-threshold mode). Mutually exclusive with --factor. "
+             "If neither is set, defaults to --factor 1.0.",
+    )
+    p.add_argument(
+        "--factor", type=float, default=None,
+        help="Dynamic per-rank threshold factor (Fast-dLLM paper-recommended "
+             "mode). Mutually exclusive with --threshold. Default behavior "
+             "(neither flag) is --factor 1.0.",
     )
     p.add_argument(
         "--start_index", type=int, default=0,
@@ -435,6 +472,23 @@ def main() -> None:
              "Nemotron. No HuggingFace auth needed. Used for smoke tests.",
     )
     args = p.parse_args()
+
+    # Mutual exclusion + default. Both default to None at the CLI; if neither
+    # was passed we use factor=1.0 (paper-recommended mode).
+    if args.threshold is not None and args.factor is not None:
+        p.error("--threshold and --factor are mutually exclusive")
+    if args.threshold is None and args.factor is None:
+        decoding_threshold: float | None = None
+        decoding_factor: float | None = 1.0
+    else:
+        decoding_threshold = args.threshold
+        decoding_factor = args.factor
+    print(
+        f"[collect] decoding mode: "
+        + (f"factor={decoding_factor}" if decoding_factor is not None
+           else f"threshold={decoding_threshold}"),
+        flush=True,
+    )
 
     out_root = args.output_root
     (out_root / "train").mkdir(parents=True, exist_ok=True)
@@ -472,6 +526,11 @@ def main() -> None:
         "n_test":   len(test_records),
         "shuffle_seed": args.shuffle_seed,
         "schema_version": S.SCHEMA_VERSION,
+        "decoding": (
+            {"mode": "factor",    "factor":    decoding_factor}
+            if decoding_factor is not None
+            else {"mode": "threshold", "threshold": decoding_threshold}
+        ),
         "records":  [
             {
                 "split": r["split"], "subset": r["subset"], "id": r["id"],
@@ -497,7 +556,8 @@ def main() -> None:
         try:
             t0 = time.time()
             data = collect_one_sample(
-                model, tokenizer, rec["prompt"], threshold=args.threshold,
+                model, tokenizer, rec["prompt"],
+                threshold=decoding_threshold, factor=decoding_factor,
             )
             if data is None:
                 skipped += 1

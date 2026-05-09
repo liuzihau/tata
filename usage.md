@@ -157,9 +157,24 @@ python -m delta_model.sanity.test_collect_roundtrip \
 ```
 
 Pass criteria:
+- collect prints `[collect] decoding mode: factor=1.0` once at startup
+  (this is the default; pass `--threshold 0.9` instead if ablating).
 - collect prints `[collect] N test file id=… done in YY.Y s` for each
   of the 5 prompts; no `FAILED` lines.
 - roundtrip prints `[OK ]` for every sample, ending with `5 OK, 0 bad.`
+- inspect a shard to confirm the decoding metadata is recorded:
+  ```bash
+  python -c "import torch; s = torch.load(sorted(__import__('glob').glob('cache_v1/llada_smoke/test/sample_*.pt'))[0]); \
+  print('meta.decoding =', s['meta']['decoding']); \
+  print('n_passes_actual per block =', [b['n_passes_actual'] for b in s['blocks']])"
+  ```
+  Expect `meta.decoding == {'mode': 'factor', 'factor': 1.0}` and most
+  blocks at `n_passes_actual ≤ MAX_ITER=6`. If many blocks hit 6
+  exactly, the trajectory is being truncated — investigate.
+- inspect the manifest to confirm the same mode is pinned cache-wide:
+  ```bash
+  python -c "import json; m = json.load(open('cache_v1/llada_smoke/manifest.json')); print(m['decoding'])"
+  ```
 
 ### 4) Real data collection (GPU + Fast-dLLM + HF login)
 
@@ -181,8 +196,15 @@ python -m delta_model.data.collect_llada \
 Optional knobs:
 - `--subset_ratios '{"chat":0.4,"math":0.4,"code":0.2,"stem":0.0}'`
   — math-heavier mix.
-- `--threshold 0.85` — looser parallel-decoding threshold (more
-  passes per block, more `(i_ref, i_target)` pairs per sample).
+- `--factor 1.0` (**default**) — Fast-dLLM dynamic per-rank threshold,
+  the paper-recommended parallel-decoding mode. Per-rank bar is
+  `1 - factor/(rank+1)` so rank-1 is always committed and the bar
+  tightens for lower-confidence ranks.
+- `--threshold 0.9` — switches to the fixed-threshold variant
+  (`get_transfer_index`) instead. Mutually exclusive with `--factor`.
+  Use only if eval will also be run in fixed-threshold mode — the
+  training and inference decoding modes **must match** or the
+  `(i_ref, i_target, reveal_frac)` distribution will diverge.
 - `--start_index N` to resume a partially-done run.
 
 Storage: ~80 GB at default 5800 samples (5000 train + 800 test).
@@ -240,6 +262,19 @@ python -m delta_model.eval.gsm8k_e2e \
     --out_json eval_results/m1_v0.json
 ```
 
+The eval inherits the same `--factor` / `--threshold` flags as collect
+(default `--factor 1.0`). **Whatever mode you collected with, eval must
+match** — otherwise the delta model is being tested in a regime it
+never trained on. The cache's `manifest.json["decoding"]` field
+records the collect-time setting; pass the matching flag here.
+
+Pass criteria for the eval smoke run:
+- prints `[gsm8k] decoding mode: factor=1.0` (or `threshold=…`) once
+  at startup. If this line is missing or wrong, the eval and collect
+  modes are out of sync.
+- per-`conf_threshold` block returns a dict with non-NaN
+  `accuracy_hybrid`, `accuracy_vanilla`, `speedup_ratio`.
+
 Output dict per threshold contains:
 - `accuracy_hybrid`, `accuracy_vanilla`, `accuracy_delta`
 - `speedup_ratio` (vanilla wall-time / hybrid wall-time)
@@ -276,7 +311,12 @@ thing, but couldn't verify without GPU access. Check on first run.
    ports `generate_with_prefix_cache` and adds hooks. The smoke test
    (step 3) catches gross issues. For deeper verification: diff the
    generated tokens from collect vs. running Fast-dLLM directly on
-   the same prompt — should match exactly at the same `--threshold`.
+   the same prompt — should match exactly at the same `--threshold`
+   or `--factor`. Note that in `factor` mode, our port of
+   `get_transfer_index_dynamic` (`llada_runtime.py:_get_transfer_index_dynamic`)
+   uses tensor ops to find the first rank that fails its threshold;
+   it preserves the boundary-bump quirk at `top_i ∈ {0, M-1}` so
+   committed-token counts match the reference impl.
 
 4. **`prefix_proj` dim assumption.** `delta_model/models/variant_c.py`
    assumes `n_kv_heads * d_head == d_model`. True for LLaDA (no GQA).
@@ -327,7 +367,8 @@ tata/
 | wandb hangs at init | not logged in | `wandb login` once, then re-run |
 | 401/403 from HuggingFace on Nemotron load | not logged in or Nemotron not accepted | `huggingface-cli login` and accept Nemotron license at the dataset's HF page |
 | OOM during training | batch too big for the GPU | `--override data.batch_size=128` (or 64) |
-| OOM during collect | LLaDA + cache snapshots peak | reduce concurrent samples / restart, or rebuild with `--threshold 0.85` (faster blocks → less peak) |
+| OOM during collect | LLaDA + cache snapshots peak | reduce concurrent samples / restart, or rebuild with a more-aggressive decoding setting (`--factor 1.5` or `--threshold 0.85`) so blocks finish in fewer passes |
+| Eval and collect disagree on `n_passes_actual` distribution | train/eval decoding-mode mismatch | check `manifest.json` → `decoding`. Cache must be rebuilt with the same mode (`factor` or `threshold`) that eval will use |
 | GSM8K mid-train eval fails | usually a rollback path bug under bf16 dtype mismatch | logged + skipped (training continues), check the printed traceback in the run log |
 
 ## Cleanup / partial-data scenarios

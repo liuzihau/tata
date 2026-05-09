@@ -51,17 +51,20 @@ def _format_prompt_llada(tokenizer, question: str) -> torch.Tensor:
 
 def _vanilla_prefix_cache_generate(model, prompt: torch.Tensor, *,
                                      gen_length: int, block_length: int,
-                                     threshold: float, mask_id: int):
+                                     threshold: float | None,
+                                     factor: float | None,
+                                     mask_id: int):
     """Run Fast-dLLM v1 generate_with_prefix_cache on this prompt.
 
     Imported lazily so this module doesn't pin the path at import time.
+    Exactly one of `threshold` / `factor` must be set; the other is None.
     """
     from generate import generate_with_prefix_cache  # noqa: WPS433
     out = generate_with_prefix_cache(
         model, prompt,
         steps=128, gen_length=gen_length, block_length=block_length,
         temperature=0.0, remasking="low_confidence",
-        mask_id=mask_id, threshold=threshold,
+        mask_id=mask_id, threshold=threshold, factor=factor,
     )
     if isinstance(out, tuple):
         return out[0]
@@ -77,9 +80,21 @@ def run_gsm8k_eval(
     n_problems: int = 200,
     conf_threshold: float = 0.85,
     seed: int = 42,
-    threshold: float = 0.9,
+    threshold: float | None = None,
+    factor: float | None = 1.0,
 ) -> dict:
-    """Run hybrid + vanilla on the same GSM8K slice. Returns metrics dict."""
+    """Run hybrid + vanilla on the same GSM8K slice. Returns metrics dict.
+
+    Decoding mode: pass exactly one of `threshold` (Fast-dLLM fixed) or
+    `factor` (Fast-dLLM dynamic, default 1.0 = paper-recommended). Must
+    match whatever was used at collect time, or the delta model's training
+    distribution won't match what it sees here.
+    """
+    if (threshold is None) == (factor is None):
+        raise ValueError(
+            "run_gsm8k_eval: pass exactly one of `threshold` or `factor` "
+            f"(got threshold={threshold!r}, factor={factor!r})"
+        )
     from datasets import load_dataset
 
     if backbone_model is None or delta_model is None:
@@ -126,7 +141,8 @@ def run_gsm8k_eval(
         out_ids, stats = generate_with_delta(
             backbone_model, delta_model, final_norm, lm_head, token_embed,
             prompt_ids,
-            conf_threshold=conf_threshold, threshold=threshold,
+            conf_threshold=conf_threshold,
+            threshold=threshold, factor=factor,
         )
         t_hybrid += time.time() - t0
         gen_text_h = tokenizer.decode(
@@ -142,7 +158,8 @@ def run_gsm8k_eval(
         out_v = _vanilla_prefix_cache_generate(
             backbone_model, prompt_ids,
             gen_length=S.GEN_LENGTH, block_length=S.BLOCK_LENGTH,
-            threshold=threshold, mask_id=S.LLADA_MASK_TOKEN_ID,
+            threshold=threshold, factor=factor,
+            mask_id=S.LLADA_MASK_TOKEN_ID,
         )
         t_vanilla += time.time() - t0
         gen_text_v = tokenizer.decode(
@@ -173,10 +190,34 @@ def main() -> None:
         "--conf_thresholds", default="0.80,0.85,0.90,0.95",
         help="Comma-separated thresholds to sweep.",
     )
-    p.add_argument("--threshold", type=float, default=0.9)
+    p.add_argument(
+        "--threshold", type=float, default=None,
+        help="Fast-dLLM fixed-threshold decoding. Mutually exclusive with "
+             "--factor. If neither is set, defaults to --factor 1.0.",
+    )
+    p.add_argument(
+        "--factor", type=float, default=None,
+        help="Fast-dLLM dynamic per-rank threshold. Mutually exclusive with "
+             "--threshold. Must match the mode used at collect time.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_json", default=None)
     args = p.parse_args()
+
+    if args.threshold is not None and args.factor is not None:
+        p.error("--threshold and --factor are mutually exclusive")
+    if args.threshold is None and args.factor is None:
+        decoding_threshold: float | None = None
+        decoding_factor: float | None = 1.0
+    else:
+        decoding_threshold = args.threshold
+        decoding_factor = args.factor
+    print(
+        f"[gsm8k] decoding mode: "
+        + (f"factor={decoding_factor}" if decoding_factor is not None
+           else f"threshold={decoding_threshold}"),
+        flush=True,
+    )
 
     rows = []
     for thr in [float(x) for x in args.conf_thresholds.split(",") if x.strip()]:
@@ -187,7 +228,8 @@ def main() -> None:
             n_problems=args.n_problems,
             conf_threshold=thr,
             seed=args.seed,
-            threshold=args.threshold,
+            threshold=decoding_threshold,
+            factor=decoding_factor,
         )
         print(json.dumps(m, indent=2), flush=True)
         rows.append(m)

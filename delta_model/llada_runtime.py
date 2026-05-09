@@ -11,6 +11,8 @@ Contents:
     _add_gumbel_noise       — Fast-dLLM Gumbel-noise utility
     _get_num_transfer_tokens — Fast-dLLM per-step transfer count schedule
     _get_transfer_index     — Fast-dLLM low-confidence remask token picker
+    _get_transfer_index_dynamic — Fast-dLLM dynamic per-rank threshold picker
+                                  (paper-recommended "factor" variant)
 """
 from __future__ import annotations
 
@@ -147,4 +149,70 @@ def _get_transfer_index(logits, temperature, remasking, mask_index, x,
     transfer_int = torch.zeros(B, L, device=confidence.device, dtype=torch.int8)
     transfer_int = transfer_int.scatter(1, idx, select_sorted.to(torch.int8))
     transfer_index = transfer_int.bool() & mask_index
+    return x0, transfer_index
+
+
+def _get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x,
+                                 factor: float = 1.0):
+    """Dynamic per-rank threshold picker (Fast-dLLM v1 ``factor`` variant).
+
+    For each batch row with ``M`` masked positions, sort masked positions by
+    confidence (descending). The rank-``n`` (1-indexed) position is committed
+    iff its confidence ≥ ``1 - factor / (n + 1)``. Rank 1 is always committed
+    (its threshold is forced to -1). Ranks are checked in order; the first
+    rank that fails its threshold terminates the commit prefix. If no rank
+    fails, all masked positions commit.
+
+    Mirrors ``Fast-dLLM/v1/llada/generate.py:get_transfer_index_dynamic``;
+    we keep the same edge-case handling at top_i ∈ {0, M-1}.
+    """
+    logits_with_noise = _add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)
+    if remasking == "low_confidence":
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+    elif remasking == "random":
+        x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float64)
+    else:
+        raise NotImplementedError(remasking)
+
+    x0 = torch.where(mask_index, x0, x)
+    neg_inf = torch.tensor(
+        torch.finfo(x0_p.dtype).min, device=x0_p.device, dtype=x0_p.dtype,
+    )
+    confidence = torch.where(mask_index, x0_p, neg_inf)
+
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    num_masked = mask_index.sum(dim=1)  # (B,)
+
+    for j in range(confidence.shape[0]):
+        m = int(num_masked[j].item())
+        if m == 0:
+            continue
+
+        # Per-rank thresholds: rank n (1..m) → 1 - factor/(n+1).
+        # Rank 1's threshold is forced to -1 to guarantee at least one commit.
+        threshs = torch.tensor(
+            [-1.0] + [1.0 - factor / (n + 1) for n in range(2, m + 1)],
+            device=confidence.device, dtype=confidence.dtype,
+        )
+        sorted_conf, _ = torch.sort(
+            confidence[j][mask_index[j]], dim=-1, descending=True,
+        )
+        # Find the first rank (0-indexed) that fails its threshold.
+        fails = sorted_conf < threshs
+        if fails.any():
+            top_i = int(torch.argmax(fails.to(torch.int8)).item())
+        else:
+            top_i = m - 1  # never failed; fall through to the +1 branch below
+
+        # Edge-case parity with Fast-dLLM ref impl: at the boundaries we bump
+        # top_i by 1 (commit at least 2 when m=1 corner-case; commit all when
+        # we never broke).
+        if top_i == 0 or top_i == m - 1:
+            top_i += 1
+
+        _, select_index = torch.topk(confidence[j], k=top_i)
+        transfer_index[j, select_index] = True
+
     return x0, transfer_index
