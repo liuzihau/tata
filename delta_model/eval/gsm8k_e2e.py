@@ -5,8 +5,8 @@ Compares the hybrid `generate_with_delta` against the vanilla
 GSM8K test slice. Logs accuracy delta, wall-clock speedup, and mean
 rollback count per problem.
 
-CLI:
-    python -m peft_project.tata.delta_model.eval.gsm8k_e2e \\
+CLI (run from inside the tata repo root):
+    python -m delta_model.eval.gsm8k_e2e \\
         --delta_ckpt ckpts/m1_llada_variant_c/step_0020000.pt \\
         --n_problems 200 \\
         --conf_thresholds 0.80,0.85,0.90,0.95
@@ -24,11 +24,10 @@ from typing import Optional
 import numpy as np
 import torch
 
-from probe_runner.llada_runner import load_llada
-from peft_project.tata.delta_model.data import schema as S
-from peft_project.tata.delta_model.inference.hybrid_runner import \
-    generate_with_delta
-from peft_project.tata.delta_model.models.variant_c import VariantC
+from ..data import schema as S
+from ..llada_runtime import load_llada
+from ..inference.hybrid_runner import generate_with_delta
+from ..models.variant_c import VariantC
 
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")

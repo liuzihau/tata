@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 
-from peft_project.tata.delta_model.data import schema as S
+from . import schema as S
 
 
 class TataDeltaDataset(Dataset):

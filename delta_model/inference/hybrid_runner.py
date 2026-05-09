@@ -17,13 +17,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from probe_runner.llada_runner import (
-    _add_gumbel_noise,                # noqa: F401  (re-exported for parity)
+from ..data import schema as S
+from ..llada_runtime import (
     _get_num_transfer_tokens,
     _get_transfer_index,
 )
-
-from peft_project.tata.delta_model.data import schema as S
 
 
 def _find_last_block(model: nn.Module) -> nn.Module:

@@ -13,8 +13,8 @@ a scalable train set (default 5000 problems). The test partition is
 deterministic across collect runs so increasing n_train never overlaps
 with the held-out test set.
 
-CLI:
-    python -m peft_project.tata.delta_model.data.collect_llada \\
+CLI (run from inside the tata repo root):
+    python -m delta_model.data.collect_llada \\
         --n_train 5000 --n_test 800 \\
         --output_root cache_v1/llada \\
         --fast_dllm_path external/Fast-dLLM/v1 \\
@@ -40,16 +40,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from probe_runner.configs import resolve_fast_dllm_path
-from probe_runner.llada_runner import (
-    _add_fast_dllm_to_path,
-    _add_gumbel_noise,
+from . import schema as S
+from ..llada_runtime import (
     _get_num_transfer_tokens,
     _get_transfer_index,
     load_llada,
 )
-
-from peft_project.tata.delta_model.data import schema as S
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +388,22 @@ def _atomic_save(obj, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _load_prompts_file(path: Path, seed: int) -> tuple[list[dict], list[dict]]:
+    """Load prompts from a plain-text file (one prompt per line).
+
+    Used for the smoke test path that bypasses Nemotron — no HF auth
+    required. Every prompt becomes a 'test' split record.
+    """
+    raw = [
+        line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    records = [{
+        "prompt": p, "subset": "file", "split": "test", "id": _stable_hash(p),
+    } for p in raw]
+    return [], records  # no train, all test (smoke-test convention)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--n_train", type=int, default=5000)
@@ -417,19 +429,35 @@ def main() -> None:
         "--limit", type=int, default=None,
         help="Optional cap for testing (overrides n_train+n_test).",
     )
+    p.add_argument(
+        "--prompts_file", type=Path, default=None,
+        help="If set, load prompts from this file (one per line) instead of "
+             "Nemotron. No HuggingFace auth needed. Used for smoke tests.",
+    )
     args = p.parse_args()
 
-    subset_ratios = json.loads(args.subset_ratios)
     out_root = args.output_root
     (out_root / "train").mkdir(parents=True, exist_ok=True)
     (out_root / "test").mkdir(parents=True, exist_ok=True)
 
-    train_records, test_records = _load_and_split_nemotron(
-        subset_ratios=subset_ratios,
-        n_train=args.n_train,
-        n_test=args.n_test,
-        seed=args.shuffle_seed,
-    )
+    if args.prompts_file is not None:
+        train_records, test_records = _load_prompts_file(
+            args.prompts_file, seed=args.shuffle_seed,
+        )
+        subset_ratios = {"file": 1.0}
+        print(
+            f"[collect] using --prompts_file {args.prompts_file} "
+            f"({len(test_records)} prompts, all to 'test' split)",
+            flush=True,
+        )
+    else:
+        subset_ratios = json.loads(args.subset_ratios)
+        train_records, test_records = _load_and_split_nemotron(
+            subset_ratios=subset_ratios,
+            n_train=args.n_train,
+            n_test=args.n_test,
+            seed=args.shuffle_seed,
+        )
     all_records = test_records + train_records  # collect test first so eval is unblocked early
     if args.limit is not None:
         all_records = all_records[: args.limit]

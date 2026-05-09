@@ -23,8 +23,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from peft_project.tata.delta_model.data import schema as S
-from peft_project.tata.delta_model.models.heads import ConfHead, DeltaHead
+from ..data import schema as S
+from .heads import ConfHead, DeltaHead
 
 
 class _CrossAttnBlock(nn.Module):

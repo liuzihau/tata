@@ -36,12 +36,12 @@ named TODO.
 
 ## 1. Repo layout
 
-All new code lives under `peft_project/tata/delta_model/`. Existing
-references in `scoping.md` §"File / module layout" stand; the
-concrete M1-only file list is:
+All new code lives under `delta_model/` at the root of the standalone
+**tata** repo. Existing references in `scoping.md` §"File / module
+layout" stand; the concrete M1-only file list is:
 
 ```
-peft_project/tata/
+tata/                                  ← repo root, cwd for all commands
   scoping.md
   implementation_plan.md                (this doc)
   delta_model/
@@ -133,7 +133,7 @@ per-sample cache described in §2.
 **CLI:**
 
 ```
-python -m peft_project.tata.delta_model.data.collect_llada \
+python -m delta_model.data.collect_llada \
     --n_samples 5000 \
     --output_root cache_v1/llada \
     --fast_dllm_path external/Fast-dLLM/v1 \
@@ -495,8 +495,8 @@ This is a one-time GPU cost of ≈ 0.5 GB (just the projection layers).
 **CLI:**
 
 ```
-python -m peft_project.tata.delta_model.train \
-    --config peft_project/tata/delta_model/configs/m1_llada_variant_c.yaml \
+python -m delta_model.train \
+    --config delta_model/configs/m1_llada_variant_c.yaml \
     --resume_from <ckpt_path>     # optional
 ```
 

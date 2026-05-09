@@ -1,10 +1,10 @@
 """tata delta-model training loop.
 
-CLI:
-    python -m peft_project.tata.delta_model.train \\
-        --config peft_project/tata/delta_model/configs/m1_llada_variant_c.yaml \\
+CLI (run from inside the tata repo root):
+    python -m delta_model.train \\
+        --config delta_model/configs/m1_llada_variant_c.yaml \\
         [--override key=value ...]
-    python -m peft_project.tata.delta_model.train --resume_from <ckpt_path>
+    python -m delta_model.train --resume_from <ckpt_path>
 
 Loads frozen backbone components (token_embed, final_norm, lm_head) once
 at startup, builds train + val Datasets, runs the AdamW + cosine
@@ -27,13 +27,13 @@ import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 
-from peft_project.tata.delta_model.data import schema as S
-from peft_project.tata.delta_model.data.dataset import (
+from .data import schema as S
+from .data.dataset import (
     TataDeltaDataset,
     make_train_val_filter,
 )
-from peft_project.tata.delta_model.losses import composite_loss
-from peft_project.tata.delta_model.models.variant_c import VariantC
+from .losses import composite_loss
+from .models.variant_c import VariantC
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ def _load_backbone_components(model_type: str, fast_dllm_path: str | None
                                ) -> tuple[nn.Embedding, nn.Module, nn.Linear]:
     """Returns (token_embed, final_norm, lm_head) — all frozen, on CUDA."""
     if model_type == "llada":
-        from probe_runner.llada_runner import load_llada
+        from .llada_runtime import load_llada
         model, _tok = load_llada(fast_dllm_path=fast_dllm_path)
     else:
         raise NotImplementedError(f"Backbone '{model_type}' not wired in M1.")
@@ -367,8 +367,7 @@ def main() -> None:
         if (step > 0 and cfg.log.gsm8k_every > 0
                 and step % cfg.log.gsm8k_every == 0):
             try:
-                from peft_project.tata.delta_model.eval.gsm8k_e2e import \
-                    run_gsm8k_eval
+                from .eval.gsm8k_e2e import run_gsm8k_eval
                 gsm = run_gsm8k_eval(
                     backbone_model=None,         # let the eval load its own
                     delta_model=model,

@@ -5,8 +5,8 @@ Run after `collect_llada.py` produces at least one shard. Asserts:
   - per-block tensors have the documented shapes / dtypes
   - reveal pattern is monotone (a position never un-reveals)
 
-Invocation:
-    python -m peft_project.tata.delta_model.sanity.test_collect_roundtrip \\
+Invocation (from inside the tata repo root):
+    python -m delta_model.sanity.test_collect_roundtrip \\
         cache_v1/llada/test/sample_*.pt
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from peft_project.tata.delta_model.data import schema as S
+from ..data import schema as S
 
 
 def check_one(path: Path) -> list[str]:

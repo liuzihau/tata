@@ -10,8 +10,8 @@ This means:
 We don't need real backbone weights — this test stubs final_norm + lm_head
 and just checks the model's invariant.
 
-Run:
-    python -m peft_project.tata.delta_model.sanity.test_zero_init
+Run (from inside the tata repo root):
+    python -m delta_model.sanity.test_zero_init
 """
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ import sys
 import torch
 import torch.nn as nn
 
-from peft_project.tata.delta_model.data import schema as S
-from peft_project.tata.delta_model.losses import composite_loss
-from peft_project.tata.delta_model.models.variant_c import VariantC
+from ..data import schema as S
+from ..losses import composite_loss
+from ..models.variant_c import VariantC
 
 
 def main() -> None:
