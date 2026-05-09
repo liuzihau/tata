@@ -1,0 +1,396 @@
+"""tata delta-model training loop.
+
+CLI:
+    python -m peft_project.tata.delta_model.train \\
+        --config peft_project/tata/delta_model/configs/m1_llada_variant_c.yaml \\
+        [--override key=value ...]
+    python -m peft_project.tata.delta_model.train --resume_from <ckpt_path>
+
+Loads frozen backbone components (token_embed, final_norm, lm_head) once
+at startup, builds train + val Datasets, runs the AdamW + cosine
+warmup loop with wandb logging, periodic validation, periodic GSM8K
+subset eval, and rolling checkpoints.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import yaml
+from torch.utils.data import DataLoader
+
+from peft_project.tata.delta_model.data import schema as S
+from peft_project.tata.delta_model.data.dataset import (
+    TataDeltaDataset,
+    make_train_val_filter,
+)
+from peft_project.tata.delta_model.losses import composite_loss
+from peft_project.tata.delta_model.models.variant_c import VariantC
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+class _Cfg(dict):
+    """Dict with attribute access (so we can write `cfg.data.batch_size`)."""
+    def __getattr__(self, key):
+        try:
+            v = self[key]
+        except KeyError as e:
+            raise AttributeError(key) from e
+        return _Cfg(v) if isinstance(v, dict) else v
+
+
+def _load_config(path: str, overrides: list[str]) -> _Cfg:
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    for o in overrides or []:
+        k, _, v = o.partition("=")
+        # Coerce to int / float / bool / str heuristically.
+        try:
+            v_cast = yaml.safe_load(v)
+        except yaml.YAMLError:
+            v_cast = v
+        keys = k.split(".")
+        d = cfg
+        for kk in keys[:-1]:
+            d = d.setdefault(kk, {})
+        d[keys[-1]] = v_cast
+    return _Cfg(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Backbone components
+# ---------------------------------------------------------------------------
+
+def _load_backbone_components(model_type: str, fast_dllm_path: str | None
+                               ) -> tuple[nn.Embedding, nn.Module, nn.Linear]:
+    """Returns (token_embed, final_norm, lm_head) — all frozen, on CUDA."""
+    if model_type == "llada":
+        from probe_runner.llada_runner import load_llada
+        model, _tok = load_llada(fast_dllm_path=fast_dllm_path)
+    else:
+        raise NotImplementedError(f"Backbone '{model_type}' not wired in M1.")
+
+    # LLaDA topology under Fast-dLLM v1 wrappers:
+    #   model.model.transformer.wte      → token embedding
+    #   model.model.transformer.ln_f     → final norm
+    #   model.model.transformer.ff_out   → lm_head (weight-tied to wte in LLaDA)
+    transformer = model.model.transformer
+    token_embed = transformer.wte
+    final_norm  = transformer.ln_f
+    lm_head     = transformer.ff_out  # nn.Linear-like
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    # Detach a CPU-resident copy of the token embed for dataloader workers
+    # (avoids a CUDA fork-safety footgun and keeps dataloader CPU-only).
+    cpu_embed = nn.Embedding(token_embed.weight.shape[0],
+                              token_embed.weight.shape[1])
+    cpu_embed.weight.data.copy_(token_embed.weight.data.detach().cpu())
+    cpu_embed.weight.requires_grad_(False)
+
+    final_norm = final_norm.cuda()
+    lm_head    = lm_head.cuda()
+    return cpu_embed, final_norm, lm_head
+
+
+# ---------------------------------------------------------------------------
+# Lr schedule (warmup + cosine)
+# ---------------------------------------------------------------------------
+
+def _lr_schedule(step: int, *, warmup: int, total: int, base_lr: float,
+                 kind: str = "cosine") -> float:
+    if step < warmup:
+        return base_lr * (step + 1) / max(1, warmup)
+    progress = (step - warmup) / max(1, total - warmup)
+    if kind == "cosine":
+        return base_lr * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    if kind == "linear":
+        return base_lr * max(0.0, 1.0 - progress)
+    raise ValueError(kind)
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def run_val(model, val_dl, final_norm, lm_head, *, lambda_mse, lambda_kl,
+            lambda_conf, bins_gap, bins_reveal, max_batches: int = 50,
+            device="cuda", dtype=torch.bfloat16) -> dict:
+    """Compute val loss components + per-bin breakdowns."""
+    model.eval()
+    sums = defaultdict(float); counts = defaultdict(int)
+    bin_sums = defaultdict(lambda: defaultdict(float))
+    bin_counts = defaultdict(lambda: defaultdict(int))
+
+    for bi, batch in enumerate(val_dl):
+        if bi >= max_batches:
+            break
+        batch_dev = {
+            k: v.to(device, dtype=dtype) if isinstance(v, torch.Tensor)
+                                            and v.dtype.is_floating_point
+            else (v.to(device) if isinstance(v, torch.Tensor) else v)
+            for k, v in batch.items()
+        }
+        delta_h, c_pred = model(
+            batch_dev["h_ref"], batch_dev["prev_emb"], batch_dev["prefix_kv"],
+        )
+        loss_dict = composite_loss(
+            delta_h, c_pred,
+            batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
+            final_norm, lm_head,
+            lambda_mse=lambda_mse, lambda_kl=lambda_kl, lambda_conf=lambda_conf,
+        )
+        for k, v in loss_dict.items():
+            sums[k]   += float(v.item())
+            counts[k] += 1
+
+        # Per-(gap, reveal_bin) sums of MSE per row.
+        gap = (batch["i_target"] - batch["i_ref"]).numpy()              # [B]
+        reveal = batch["reveal_frac"].numpy()                            # [B]
+        with torch.no_grad():
+            row_mse = ((delta_h - (batch_dev["h_target"] - batch_dev["h_ref"]))
+                        ** 2).mean(dim=(1, 2))                           # [B]
+            row_mse_np = row_mse.float().cpu().numpy()
+        for r_idx in range(len(gap)):
+            g = int(gap[r_idx])
+            if g in bins_gap:
+                bin_sums["gap"][g]   += float(row_mse_np[r_idx])
+                bin_counts["gap"][g] += 1
+            # reveal bin (find the bucket index)
+            r = float(reveal[r_idx])
+            for bi_, (lo, hi) in enumerate(zip(bins_reveal[:-1], bins_reveal[1:])):
+                if lo <= r <= hi:
+                    bin_sums["reveal"][bi_]   += float(row_mse_np[r_idx])
+                    bin_counts["reveal"][bi_] += 1
+                    break
+
+    out = {}
+    for k, total in sums.items():
+        out[k] = total / max(1, counts[k])
+    for g, total in bin_sums["gap"].items():
+        out[f"mse_by_gap_{g}"] = total / max(1, bin_counts["gap"][g])
+    for bi_, total in bin_sums["reveal"].items():
+        out[f"mse_by_reveal_{bi_}"] = total / max(1, bin_counts["reveal"][bi_])
+    model.train()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def _setup_wandb(cfg: _Cfg):
+    if cfg.log.framework != "wandb":
+        return None
+    import wandb  # noqa: WPS433
+    wandb.init(
+        project=cfg.log.project,
+        group=cfg.log.group,
+        name=cfg.run_name,
+        config=dict(cfg),
+        tags=[cfg.model.variant, cfg.backbone.model, "M1"],
+    )
+    return wandb
+
+
+def _ckpt_save(model, opt, step, cfg, *, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"step_{step:07d}.pt"
+    torch.save({
+        "step": step,
+        "model": model.state_dict(),
+        "opt":   opt.state_dict(),
+        "cfg":   dict(cfg),
+    }, path)
+    # rotate
+    ckpts = sorted(out_dir.glob("step_*.pt"))
+    keep = cfg.checkpoint.keep_last
+    for old in ckpts[:-keep] if keep > 0 else []:
+        old.unlink()
+    return path
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", required=True)
+    p.add_argument("--override", action="append", default=[])
+    p.add_argument("--resume_from", default=None)
+    args = p.parse_args()
+
+    cfg = _load_config(args.config, args.override)
+
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    device = "cuda"
+    dtype  = {"bf16": torch.bfloat16, "fp16": torch.float16,
+              "fp32": torch.float32}[cfg.optim.precision]
+
+    print("[train] loading backbone components …", flush=True)
+    token_embed, final_norm, lm_head = _load_backbone_components(
+        cfg.backbone.model, cfg.backbone.fast_dllm_path,
+    )
+
+    print("[train] building Datasets …", flush=True)
+    train_filter, val_filter = make_train_val_filter(
+        cfg.data.val_frac, seed=cfg.data.shuffle_seed,
+    )
+    train_ds = TataDeltaDataset(
+        cfg.data.cache_root, token_embed, split="train",
+        mask_token_id=cfg.data.mask_token_id, index_filter=train_filter,
+    )
+    val_ds = TataDeltaDataset(
+        cfg.data.cache_root, token_embed, split="train",
+        mask_token_id=cfg.data.mask_token_id, index_filter=val_filter,
+    )
+    print(f"[train] train pairs={len(train_ds)}  val pairs={len(val_ds)}",
+          flush=True)
+
+    train_dl = DataLoader(
+        train_ds, batch_size=cfg.data.batch_size, shuffle=True,
+        num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
+        drop_last=True, persistent_workers=cfg.data.num_workers > 0,
+    )
+    val_dl = DataLoader(
+        val_ds, batch_size=cfg.data.batch_size, shuffle=False,
+        num_workers=max(1, cfg.data.num_workers // 2),
+        pin_memory=cfg.data.pin_memory,
+    )
+
+    print("[train] building model …", flush=True)
+    model = VariantC(
+        d_model=cfg.model.d_model, n_heads=cfg.model.n_heads,
+        n_layers=cfg.model.n_layers, d_ff=cfg.model.d_ff,
+        dropout=cfg.model.dropout,
+    ).to(device, dtype=dtype)
+
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=cfg.optim.lr, betas=tuple(cfg.optim.betas),
+        weight_decay=cfg.optim.weight_decay,
+    )
+
+    step = 0
+    if args.resume_from:
+        ckpt = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["opt"])
+        step = int(ckpt["step"])
+        print(f"[train] resumed from {args.resume_from} at step {step}", flush=True)
+
+    wandb = _setup_wandb(cfg)
+    ckpt_dir = Path(cfg.checkpoint.out_dir)
+
+    log_keys = ("loss", "mse", "kl", "bce", "c_label_mean", "c_pred_mean")
+    print("[train] starting", flush=True)
+    t0 = time.time()
+    train_iter = iter(train_dl)
+    while step < cfg.optim.max_steps:
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_dl)
+            batch = next(train_iter)
+
+        batch_dev = {
+            k: v.to(device, dtype=dtype) if isinstance(v, torch.Tensor)
+                                            and v.dtype.is_floating_point
+            else (v.to(device) if isinstance(v, torch.Tensor) else v)
+            for k, v in batch.items()
+        }
+        delta_h, c_pred = model(
+            batch_dev["h_ref"], batch_dev["prev_emb"], batch_dev["prefix_kv"],
+        )
+        loss_dict = composite_loss(
+            delta_h, c_pred,
+            batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
+            final_norm, lm_head,
+            lambda_mse=cfg.loss.lambda_mse,
+            lambda_kl=cfg.loss.lambda_kl,
+            lambda_conf=cfg.loss.lambda_conf,
+        )
+        loss_dict["loss"].backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
+
+        lr = _lr_schedule(
+            step, warmup=cfg.optim.warmup_steps,
+            total=cfg.optim.max_steps, base_lr=cfg.optim.lr,
+            kind=cfg.optim.scheduler,
+        )
+        for g in opt.param_groups:
+            g["lr"] = lr
+        opt.step(); opt.zero_grad()
+
+        if step % cfg.log.log_every == 0 and wandb is not None:
+            payload = {f"train/{k}": float(loss_dict[k].item()) for k in log_keys}
+            payload["lr"] = lr
+            payload["throughput/samples_per_sec"] = (
+                cfg.data.batch_size / max(1e-6, time.time() - t0)
+            )
+            wandb.log(payload, step=step)
+            t0 = time.time()
+        elif step % cfg.log.log_every == 0:
+            print(
+                f"[train] step={step:6d} lr={lr:.2e} "
+                + " ".join(f"{k}={float(loss_dict[k].item()):.4e}" for k in log_keys),
+                flush=True,
+            )
+
+        if step > 0 and step % cfg.log.val_every == 0:
+            val_metrics = run_val(
+                model, val_dl, final_norm, lm_head,
+                lambda_mse=cfg.loss.lambda_mse,
+                lambda_kl=cfg.loss.lambda_kl,
+                lambda_conf=cfg.loss.lambda_conf,
+                bins_gap=cfg.log.bins_gap,
+                bins_reveal=cfg.log.bins_reveal,
+                device=device, dtype=dtype,
+            )
+            if wandb is not None:
+                wandb.log({f"val/{k}": v for k, v in val_metrics.items()},
+                          step=step)
+            else:
+                print(f"[val ] step={step:6d} {val_metrics}", flush=True)
+
+        if (step > 0 and cfg.log.gsm8k_every > 0
+                and step % cfg.log.gsm8k_every == 0):
+            try:
+                from peft_project.tata.delta_model.eval.gsm8k_e2e import \
+                    run_gsm8k_eval
+                gsm = run_gsm8k_eval(
+                    backbone_model=None,         # let the eval load its own
+                    delta_model=model,
+                    n_problems=cfg.log.gsm8k_subset,
+                    seed=cfg.seed,
+                )
+                if wandb is not None:
+                    wandb.log({f"gsm8k/{k}": v for k, v in gsm.items()},
+                              step=step)
+            except Exception as e:
+                print(f"[gsm8k] mid-train eval failed (continuing): {e}",
+                      flush=True)
+
+        if step > 0 and step % cfg.checkpoint.every == 0:
+            path = _ckpt_save(model, opt, step, cfg, out_dir=ckpt_dir)
+            print(f"[ckpt] {path}", flush=True)
+
+        step += 1
+
+    final = _ckpt_save(model, opt, step, cfg, out_dir=ckpt_dir)
+    print(f"[train] done. final ckpt: {final}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

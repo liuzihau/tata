@@ -1,0 +1,67 @@
+# M1 default config — LLaDA-8B + VariantC + 5000 train samples + 800 stable test.
+#
+# Knobs the user is likely to tune:
+#   - data.subset_ratios       chat/math/code/stem mix
+#   - data.batch_size          drop to 128 if 80GB GPU is tight
+#   - optim.lr / max_steps     scale with batch size
+#   - log.gsm8k_subset         set to 0 to disable mid-training GSM8K eval
+#
+# Resume / overrides via train.py --override "key=value" (dot notation).
+
+run_name:          m1_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada                       # llada | dream
+  fast_dllm_path:  null                        # falls back to env / external/Fast-dLLM/v1
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1/llada
+  manifest:        cache_v1/llada/manifest.json
+  val_frac:        0.10                        # of the train split → held-out validation
+  shuffle_seed:    42
+  num_workers:     4
+  batch_size:      256
+  pin_memory:      true
+  mask_token_id:   126336
+
+model:
+  variant:         C                           # C (M1) | B | A
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2
+  d_ff:            16384
+  dropout:         0.0
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.01
+  betas:           [0.9, 0.95]
+  warmup_steps:    500
+  max_steps:       20000
+  scheduler:       cosine                      # cosine | linear
+  grad_clip:       1.0
+  precision:       bf16                        # bf16 | fp16 | fp32
+
+loss:
+  lambda_mse:      1.0
+  lambda_kl:       0.1
+  lambda_conf:     0.1
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M1-llada
+  log_every:       50
+  val_every:       500
+  gsm8k_every:     5000
+  gsm8k_subset:    50
+  bins_gap:        [1, 2, 3, 4, 5]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  keep_last:       3
+  out_dir:         ckpts/m1_llada_variant_c

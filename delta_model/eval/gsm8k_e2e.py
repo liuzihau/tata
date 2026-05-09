@@ -1,0 +1,202 @@
+"""End-to-end GSM8K accuracy + speedup eval for the hybrid runner.
+
+Compares the hybrid `generate_with_delta` against the vanilla
+`generate_with_prefix_cache` baseline on the same `seed`-shuffled
+GSM8K test slice. Logs accuracy delta, wall-clock speedup, and mean
+rollback count per problem.
+
+CLI:
+    python -m peft_project.tata.delta_model.eval.gsm8k_e2e \\
+        --delta_ckpt ckpts/m1_llada_variant_c/step_0020000.pt \\
+        --n_problems 200 \\
+        --conf_thresholds 0.80,0.85,0.90,0.95
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+
+from probe_runner.llada_runner import load_llada
+from peft_project.tata.delta_model.data import schema as S
+from peft_project.tata.delta_model.inference.hybrid_runner import \
+    generate_with_delta
+from peft_project.tata.delta_model.models.variant_c import VariantC
+
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def extract_final_number(text: str) -> Optional[str]:
+    """Best-effort GSM8K answer extraction. Try '#### N' marker first,
+    then last number in the text."""
+    m = re.search(r"####\s*(-?\d+(?:\.\d+)?)", text)
+    if m:
+        return m.group(1)
+    nums = _NUMBER_RE.findall(text)
+    return nums[-1] if nums else None
+
+
+def _format_prompt_llada(tokenizer, question: str) -> torch.Tensor:
+    msg = [{"role": "user", "content": question}]
+    p = tokenizer.apply_chat_template(msg, add_generation_prompt=True, tokenize=False)
+    return torch.tensor(tokenizer(p)["input_ids"], dtype=torch.long).unsqueeze(0).cuda()
+
+
+def _vanilla_prefix_cache_generate(model, prompt: torch.Tensor, *,
+                                     gen_length: int, block_length: int,
+                                     threshold: float, mask_id: int):
+    """Run Fast-dLLM v1 generate_with_prefix_cache on this prompt.
+
+    Imported lazily so this module doesn't pin the path at import time.
+    """
+    from generate import generate_with_prefix_cache  # noqa: WPS433
+    out = generate_with_prefix_cache(
+        model, prompt,
+        steps=128, gen_length=gen_length, block_length=block_length,
+        temperature=0.0, remasking="low_confidence",
+        mask_id=mask_id, threshold=threshold,
+    )
+    if isinstance(out, tuple):
+        return out[0]
+    return out
+
+
+def run_gsm8k_eval(
+    *,
+    backbone_model=None,
+    delta_model=None,
+    delta_ckpt: str | None = None,
+    fast_dllm_path: str | None = None,
+    n_problems: int = 200,
+    conf_threshold: float = 0.85,
+    seed: int = 42,
+    threshold: float = 0.9,
+) -> dict:
+    """Run hybrid + vanilla on the same GSM8K slice. Returns metrics dict."""
+    from datasets import load_dataset
+
+    if backbone_model is None or delta_model is None:
+        # Standalone invocation path. Train.py passes both in, eval CLI loads here.
+        if backbone_model is None:
+            backbone_model, tokenizer = load_llada(fast_dllm_path=fast_dllm_path)
+        else:
+            tokenizer = backbone_model._tokenizer  # set by load_llada wrapper if avail
+        if delta_model is None:
+            assert delta_ckpt is not None, "Need delta_ckpt or in-memory delta_model"
+            ckpt = torch.load(delta_ckpt, map_location="cpu", weights_only=False)
+            cfg_m = ckpt["cfg"]["model"]
+            delta_model = VariantC(
+                d_model=cfg_m["d_model"], n_heads=cfg_m["n_heads"],
+                n_layers=cfg_m["n_layers"], d_ff=cfg_m.get("d_ff"),
+                dropout=cfg_m.get("dropout", 0.0),
+            ).cuda().eval()
+            delta_model.load_state_dict(ckpt["model"])
+    else:
+        tokenizer = backbone_model._tokenizer
+    delta_model.eval()
+
+    # Pull frozen norm + lm_head + token_embed off the backbone.
+    transformer = backbone_model.model.transformer
+    final_norm  = transformer.ln_f.cuda()
+    lm_head     = transformer.ff_out.cuda()
+    token_embed = transformer.wte.cuda()
+
+    ds = load_dataset("gsm8k", "main", split="test")
+    if n_problems < len(ds):
+        ds = ds.shuffle(seed=seed).select(range(n_problems))
+
+    hits_hybrid = hits_vanilla = 0
+    rollbacks: list[int] = []
+    backbone_calls: list[int] = []
+    t_hybrid = t_vanilla = 0.0
+
+    for prob in ds:
+        prompt_ids = _format_prompt_llada(tokenizer, prob["question"])
+        gold_num = extract_final_number(prob["answer"])
+
+        # Hybrid run.
+        t0 = time.time()
+        out_ids, stats = generate_with_delta(
+            backbone_model, delta_model, final_norm, lm_head, token_embed,
+            prompt_ids,
+            conf_threshold=conf_threshold, threshold=threshold,
+        )
+        t_hybrid += time.time() - t0
+        gen_text_h = tokenizer.decode(
+            out_ids[0, prompt_ids.shape[1]:].tolist(), skip_special_tokens=True,
+        )
+        pred_h = extract_final_number(gen_text_h)
+        hits_hybrid += int(pred_h is not None and pred_h == gold_num)
+        rollbacks.append(stats["rollbacks"])
+        backbone_calls.append(stats["backbone_forwards"])
+
+        # Vanilla run.
+        t0 = time.time()
+        out_v = _vanilla_prefix_cache_generate(
+            backbone_model, prompt_ids,
+            gen_length=S.GEN_LENGTH, block_length=S.BLOCK_LENGTH,
+            threshold=threshold, mask_id=S.LLADA_MASK_TOKEN_ID,
+        )
+        t_vanilla += time.time() - t0
+        gen_text_v = tokenizer.decode(
+            out_v[0, prompt_ids.shape[1]:].tolist(), skip_special_tokens=True,
+        )
+        pred_v = extract_final_number(gen_text_v)
+        hits_vanilla += int(pred_v is not None and pred_v == gold_num)
+
+    n = len(ds)
+    return {
+        "n_problems":            n,
+        "accuracy_hybrid":       hits_hybrid / n,
+        "accuracy_vanilla":      hits_vanilla / n,
+        "accuracy_delta":        (hits_hybrid - hits_vanilla) / n,
+        "speedup_ratio":         (t_vanilla / max(1e-6, t_hybrid)),
+        "mean_rollbacks":        float(np.mean(rollbacks)),
+        "mean_backbone_calls":   float(np.mean(backbone_calls)),
+        "conf_threshold":        conf_threshold,
+    }
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--delta_ckpt", required=True)
+    p.add_argument("--fast_dllm_path", default=None)
+    p.add_argument("--n_problems", type=int, default=200)
+    p.add_argument(
+        "--conf_thresholds", default="0.80,0.85,0.90,0.95",
+        help="Comma-separated thresholds to sweep.",
+    )
+    p.add_argument("--threshold", type=float, default=0.9)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--out_json", default=None)
+    args = p.parse_args()
+
+    rows = []
+    for thr in [float(x) for x in args.conf_thresholds.split(",") if x.strip()]:
+        print(f"[gsm8k] conf_threshold={thr}", flush=True)
+        m = run_gsm8k_eval(
+            delta_ckpt=args.delta_ckpt,
+            fast_dllm_path=args.fast_dllm_path,
+            n_problems=args.n_problems,
+            conf_threshold=thr,
+            seed=args.seed,
+            threshold=args.threshold,
+        )
+        print(json.dumps(m, indent=2), flush=True)
+        rows.append(m)
+
+    if args.out_json:
+        Path(args.out_json).write_text(json.dumps(rows, indent=2))
+        print(f"[gsm8k] saved {args.out_json}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
