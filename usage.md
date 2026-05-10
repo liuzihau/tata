@@ -120,6 +120,50 @@ huggingface-cli login       # before real Nemotron collect (step 4 only)
 
 ---
 
+## Diagnostic tests reference
+
+Quick-reference table of every check command, what it tests, and the
+pass criterion. Run T1–T2 freely (no GPU needed). Run T4 before
+trusting any training run that came out of the existing cache.
+
+| # | Test | Purpose | Cost | Command |
+|---|---|---|---|---|
+| T1 | Compile-check | Catch syntax errors / broken imports across the package. | <5 s, no torch needed | see [Step 1](#1-compile-check-no-torch-needed) below |
+| T2 | Zero-init sanity | Δh head is zero-init at step 0 (so MSE term equals the h_ref-reuse baseline) AND the new RoPE / RMSNorm / SwiGLU plumbing from §1.5+§1.6 actually runs end-to-end. | ~5 s, CPU-only | `python -m delta_model.sanity.test_zero_init` |
+| T3 | Cache-format roundtrip | On-disk cache schema matches `data/schema.py`; per-block tensor shapes/dtypes correct; reveal pattern is monotone (positions never un-reveal). | ~10 s per sample | `python -m delta_model.sanity.test_collect_roundtrip "cache_v1/llada_smoke/test/sample_*.pt"` |
+| T4 | **§3.1 partial-vs-full forward equivalence** | Verifies that `model(x[:, s:], past_key_values=cache_to_s)` (used by collect at iter ≥ 1 and by Fast-dLLM vanilla) produces the same block-region hidden states as `model(x)` at the same `x` state. If they diverge, RoPE position IDs aren't being auto-derived in partial-forward mode, which would mean every `h_per_pass[i ≥ 1]` in the cache is computed at wrong absolute positions — silent corruption of all training data. | ~30 s, **GPU + Fast-dLLM required** | `python -m delta_model.sanity.test_partial_full_forward_equivalence --fast_dllm_path external/Fast-dLLM/v1` |
+
+### Pass / fail criteria
+
+- **T1** prints `OK`. Anything else → fix the listed file before continuing.
+- **T2** prints `delta_h.abs().max() = 0.000000e+00` AND `✓ zero-init sanity passed`. Failure → model rewrite (§1.5 / §1.6) broke the zero-init invariant; check `DeltaHead`.
+- **T3** prints `[OK ]` for every sample, ending with `N OK, 0 bad.`. Bad samples have specific error lines describing the schema violation; fix the cache file or re-collect.
+- **T4 PASS:**
+  ```
+  [sanity] |full - partial|: max = X.XXe-04  mean = Y.YYe-05  relative-to-max = Z.ZZe-04
+  [sanity] ✓ PASS — partial and full forward agree to within 5e-03. §3.1 position-id alignment is fine.
+  ```
+  Means §3.1 is **not** the bug; the GSM8K e2e issue is something else (§3.2 calibration or trajectory drift). Existing cache is fine.
+- **T4 FAIL:**
+  ```
+  [sanity] |full - partial|: max = X.XXe-01  …
+  [sanity] ✗ FAIL — divergence X.XX e-01 > 5e-03.
+  [sanity]   Consistent with the §3.1 position-id bug: the partial forward at iter ≥ 1 is rotating Q/K from absolute position 0 instead of S, so all `h_per_pass[i ≥ 1]` in the cache are computed at wrong positions.
+  [sanity]   Likely fix: in `collect_llada.py:332`, pass
+  [sanity]     position_ids=torch.arange(s, x.shape[1], device=x.device).unsqueeze(0)
+  [sanity]   to the partial forward, then re-collect the cache from scratch.
+  ```
+  Means **the bug is real**. The current cache is poisoned and must be re-collected after the fix lands. All training results so far are uninterpretable.
+
+### Recommended run order
+
+1. **First time / after major code changes:** T1 → T2.
+2. **After a `collect_llada` run:** T3 on the new cache.
+3. **Before trusting any training run on the existing cache:** T4. This is the §3.1 verification; it's currently the most important diagnostic because it disambiguates "the model doesn't generalize" from "the cache is wrong."
+4. **After T4 passes (or after re-collect if T4 failed):** proceed with training (Step 5 below).
+
+---
+
 ## Build order — what to run, in order
 
 All commands below assume cwd = **tata repo root**.
@@ -141,6 +185,7 @@ python3 -m py_compile \
     delta_model/eval/gsm8k_e2e.py \
     delta_model/sanity/test_collect_roundtrip.py \
     delta_model/sanity/test_zero_init.py \
+    delta_model/sanity/test_partial_full_forward_equivalence.py \
     delta_model/train.py \
   && echo OK
 ```
@@ -484,8 +529,9 @@ tata/
       shared_mass.py                         — overlap metric
       gsm8k_e2e.py                           — end-to-end eval harness
     sanity/
-      test_collect_roundtrip.py              — cache-format check
-      test_zero_init.py                      — model + loss invariant check
+      test_collect_roundtrip.py              — cache-format check (T3)
+      test_zero_init.py                      — model + loss invariant check (T2)
+      test_partial_full_forward_equivalence.py  — §3.1 position-id verification (T4)
     configs/m1_llada_variant_c.yaml          — default M1 config
 ```
 
