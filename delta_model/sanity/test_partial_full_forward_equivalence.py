@@ -149,49 +149,85 @@ def main() -> None:
             tuple(t[:, :, :s, :] for t in pkv) for pkv in past_key_values
         ]
 
-        # ---- Path B: partial forward over x[:, s:] with cached prefix.
-        # NOTE: this mirrors the call in collect_llada.py:332 — no
-        # `position_ids` argument is passed, so this test reproduces the
-        # exact code path used to build the training cache.
+        # ---- Path B1: partial forward WITHOUT position_ids (the broken path
+        # that collect_llada used pre-§3.1 fix). Reproduces the original bug.
         capture["latest"] = None
         _ = model(x[:, s:], past_key_values=past_to_s, use_cache=True)
-        h_partial_seq = capture["latest"]                             # [1, GL+Lp-s, d_model]
-        h_partial_block = h_partial_seq[:, :BL, :].clone()            # [1, BL, d_model]
+        h_b1_seq = capture["latest"]
+        h_b1_block = h_b1_seq[:, :BL, :].clone()
+
+        # ---- Path B2: partial forward WITH explicit position_ids. This
+        # mirrors the post-§3.1 fix in collect_llada.py:332.
+        position_ids = torch.arange(
+            s, x.shape[1], device=device,
+        ).unsqueeze(0)
+        capture["latest"] = None
+        _ = model(
+            x[:, s:], past_key_values=past_to_s, use_cache=True,
+            position_ids=position_ids,
+        )
+        h_b2_seq = capture["latest"]
+        h_b2_block = h_b2_seq[:, :BL, :].clone()
     finally:
         handle.remove()
 
-    # Compare.
-    diff = (h_full_block.float() - h_partial_block.float()).abs()
-    max_diff  = float(diff.max().item())
-    mean_diff = float(diff.mean().item())
-    base_max  = float(h_full_block.abs().max().item())
-    rel_max   = max_diff / max(base_max, 1e-9)
+    base_max = float(h_full_block.abs().max().item())
 
-    print(f"[sanity] |h_full_block|.max  = {base_max:.4e}")
-    print(f"[sanity] |h_part_block|.max  = {float(h_partial_block.abs().max().item()):.4e}")
-    print(f"[sanity] |full - partial|: max = {max_diff:.4e}  mean = {mean_diff:.4e}  "
-          f"relative-to-max = {rel_max:.4e}")
-
-    if max_diff <= _FP16_NOISE_TOL:
+    def _report(tag: str, h_other: torch.Tensor) -> tuple[float, float]:
+        diff = (h_full_block.float() - h_other.float()).abs()
+        max_d  = float(diff.max().item())
+        mean_d = float(diff.mean().item())
+        rel    = max_d / max(base_max, 1e-9)
+        ok     = max_d <= _FP16_NOISE_TOL
+        marker = "✓" if ok else "✗"
         print(
-            f"[sanity] ✓ PASS — partial and full forward agree to within "
-            f"{_FP16_NOISE_TOL:.0e}. §3.1 position-id alignment is fine."
+            f"[sanity] {marker} {tag}: max={max_d:.4e}  mean={mean_d:.4e}  "
+            f"relative={rel:.4e}"
+        )
+        return max_d, mean_d
+
+    print(f"[sanity] |h_full_block|.max = {base_max:.4e}")
+    print(f"[sanity] tolerance = {_FP16_NOISE_TOL:.0e}")
+    print()
+    print("[sanity] Path B1 — partial forward, NO position_ids (collect-pre-fix path):")
+    b1_max, _ = _report("B1 vs A (full)", h_b1_block)
+    print()
+    print("[sanity] Path B2 — partial forward, WITH position_ids (collect-post-fix path):")
+    b2_max, _ = _report("B2 vs A (full)", h_b2_block)
+    print()
+
+    b1_ok = b1_max <= _FP16_NOISE_TOL
+    b2_ok = b2_max <= _FP16_NOISE_TOL
+
+    if b1_ok and b2_ok:
+        print(
+            "[sanity] ✓ PASS — both partial-forward paths agree with the full "
+            "forward. §3.1 was never a bug on this LLaDA build."
         )
         sys.exit(0)
+    elif (not b1_ok) and b2_ok:
+        print(
+            "[sanity] ✓ FIX VERIFIED — without position_ids the partial forward "
+            "is broken (B1 diverges), but passing position_ids=arange(s, len) "
+            "recovers full-forward equivalence (B2 within tolerance)."
+        )
+        print(
+            "[sanity]   Action: confirm collect_llada.py passes position_ids "
+            "to the partial forward, then re-collect the cache from scratch."
+        )
+        sys.exit(0)
+    elif (not b1_ok) and (not b2_ok):
+        print(
+            "[sanity] ✗ FAIL — both partial paths diverge from full. position_ids "
+            "alone does not fix it; LLaDA's modeling code likely needs deeper "
+            "audit (cache_position kwarg? attention_mask? layer_past slicing?)."
+        )
+        sys.exit(1)
     else:
         print(
-            f"[sanity] ✗ FAIL — divergence {max_diff:.3e} > {_FP16_NOISE_TOL:.0e}."
-        )
-        print(
-            f"[sanity]   Consistent with the §3.1 position-id bug: the partial "
-            f"forward at iter ≥ 1 is rotating Q/K from absolute position 0 "
-            f"instead of {s}, so all `h_per_pass[i ≥ 1]` in the cache are "
-            f"computed at wrong positions."
-        )
-        print(
-            "[sanity]   Likely fix: in `collect_llada.py:332`, pass\n"
-            "[sanity]     position_ids=torch.arange(s, x.shape[1], device=x.device).unsqueeze(0)\n"
-            "[sanity]   to the partial forward, then re-collect the cache from scratch."
+            "[sanity] ✗ FAIL — B1 (no position_ids) passes but B2 (with position_ids) "
+            "diverges. Unexpected; LLaDA may interpret position_ids differently. "
+            "Print q/k positions in the RoPE module to investigate."
         )
         sys.exit(1)
 

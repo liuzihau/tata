@@ -10,20 +10,133 @@ sibling `peft_project/` tree. The only external code dependency is
 
 ---
 
+## §3.1 fix recovery — RUN THIS FIRST
+
+The §3.1 partial-forward `position_ids` bug was confirmed on 2026-05-11
+(T4 reported `max=6.0`, `mean=0.089`, `rel=1.8%` — far above the 5e-3
+fp16-noise tolerance). The fix landed in `collect_llada.py:332`, but the
+existing cache was built before the fix and is poisoned. **All training
+results to date are uninterpretable.** Sequential recovery plan, ~5–8 h
+total wall time. Run on the cluster, in this order:
+
+### 1. Verify the fix end-to-end (~30 s, GPU + Fast-dLLM)
+
+```bash
+python -m delta_model.sanity.test_partial_full_forward_equivalence \
+    --fast_dllm_path external/Fast-dLLM/v1
+```
+
+T4 now runs both paths and reports each. Expected output:
+
+```
+[sanity] Path B1 — partial forward, NO position_ids (collect-pre-fix path):
+[sanity] ✗ B1 vs A (full): max=6.0e+00 ...        ← still broken (expected)
+
+[sanity] Path B2 — partial forward, WITH position_ids (collect-post-fix path):
+[sanity] ✓ B2 vs A (full): max=~1e-3 ...           ← fix recovered equivalence
+
+[sanity] ✓ FIX VERIFIED — without position_ids the partial forward is broken
+(B1 diverges), but passing position_ids=arange(s, len) recovers full-forward
+equivalence (B2 within tolerance).
+```
+
+If **B2 also fails** (max > 5e-3): STOP and report. Means LLaDA's modeling
+needs more than `position_ids` (possibly `cache_position` or attention-mask
+tweaks); we'd investigate before sinking 7 hours into a recollect.
+
+### 2. Move the broken artifacts aside (5 s)
+
+Don't delete — keep as a "broken-cache" reference for diff / postmortem.
+
+```bash
+mv cache_v1/llada                      cache_v1/llada_broken_3_1
+mv ckpts/m1_llada_variant_c            ckpts/m1_llada_variant_c_pre_3_1   2>/dev/null || true
+```
+
+(The `2>/dev/null || true` on the ckpt dir tolerates "doesn't exist".)
+
+### 3. (Optional but recommended) Smoke recollect to sanity-check the fix in collect (~3 min)
+
+Uses 5 built-in prompts; no HuggingFace auth needed. Cheap insurance that
+the fixed `collect_llada.py` doesn't crash and produces well-formed cache
+files.
+
+```bash
+python -m delta_model.data.collect_llada \
+    --prompts_file delta_model/data/sample_prompts.txt \
+    --output_root cache_v1/llada_smoke_post_fix \
+    --fast_dllm_path external/Fast-dLLM/v1
+
+python -m delta_model.sanity.test_collect_roundtrip \
+    "cache_v1/llada_smoke_post_fix/test/sample_*.pt"
+```
+
+Pass: roundtrip prints `5 OK, 0 bad.`
+
+### 4. Real recollect (~4–7 h on a single A100/H100)
+
+```bash
+python -m delta_model.data.collect_llada \
+    --n_train 5000 --n_test 800 \
+    --output_root cache_v1/llada \
+    --fast_dllm_path external/Fast-dLLM/v1
+```
+
+Resumable — if interrupted, just re-run; existing files are skipped.
+
+### 5. Sanity-check the new cache (~10 s)
+
+```bash
+python -m delta_model.sanity.test_collect_roundtrip \
+    "cache_v1/llada/test/sample_*.pt" 2>&1 | tail -5
+```
+
+Expected: `800 OK, 0 bad.`
+
+### 6. Train fresh (~3–4 h for 20k steps)
+
+No `--resume_from` — pre-fix checkpoints were trained on poisoned data
+AND under a different architecture (pre §1.5). Doubly invalid.
+
+```bash
+python -m delta_model.train \
+    --config delta_model/configs/m1_llada_variant_c.yaml \
+    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+```
+
+What to watch in wandb:
+- `train/loss` curve. Initial value should be lower than the pre-§3.1 run
+  (h_target is now sane).
+- `val/loss` should track `train/loss` for longer (no divergence at 8k).
+- `gsm8k/accuracy_hybrid` per checkpoint: trend should be **rising** over
+  training, not falling. Absolute number doesn't have to reach baseline
+  0.72 yet — the *direction* tells us whether §3.1 was the dominant issue.
+
+### 7. Mid-training decision point (around step 5k)
+
+Check `gsm8k/accuracy_hybrid` in wandb at step 5000:
+- **Higher than the pre-fix run's 0.30 at step 5000** → §3.1 was the
+  dominant issue. Let training run to 20k.
+- **Same or worse** → §3.1 wasn't the only issue. Stop the run and we
+  move to §3.2 (per-position confidence + agreement decode) before any
+  more training.
+
+---
+
 ## Picking up after the §1 model+IO refactor
 
-If you've just landed §1.1–§1.6 from `improvements.md`, here's what's
-required vs. optional before the next training run:
+Pre-§3.1-recovery context. After step 6 above, the §3.1 row in this
+table is resolved; the others stay relevant for any subsequent fresh run.
 
 | | required? | command |
 |---|---|---|
-| **Re-collect data** | **No** — the on-disk cache schema is unchanged. Existing `cache_v1/llada/{train,test}/sample_*.pt` works as-is. | (skip) |
+| **Re-collect data** | **YES** — see "§3.1 fix recovery" above. | step 4 in §3.1 recovery |
 | **Re-run zero-init sanity** | **Yes** — exercises the new RoPE / RMSNorm / SwiGLU / `block_start_pos` plumbing. | `python -m delta_model.sanity.test_zero_init` |
-| **Discard old checkpoints** | **Yes** — VariantC's state_dict shape changed (RMSNorm keys, SwiGLU keys, dropped `pos_emb` / `prefix_proj`). Don't `--resume_from` an M1-pre-§1.5 ckpt. | (delete or move aside) |
-| **Repack into shards** | Optional — pure shard repack alone does NOT fix random-shuffle data thrash; consider `data.preload: true` (default, see below) instead, or pair shards with a locality-aware sampler. | `python -m delta_model.data.repack --cache_root cache_v1/llada` |
+| **Discard old checkpoints** | **Yes** — VariantC's state_dict shape changed (RMSNorm keys, SwiGLU keys, dropped `pos_emb` / `prefix_proj`). Don't `--resume_from` an M1-pre-§1.5 ckpt. | step 2 in §3.1 recovery |
+| **Repack into shards** | Optional — pure shard repack alone does NOT fix random-shuffle data thrash; `data.preload: true` (default, see below) is the right call on big-RAM nodes. | `python -m delta_model.data.repack --cache_root cache_v1/llada` |
 | **Use `data.preload: true`** | **Yes** — already the default in the config. Loads all samples into RAM at startup; eliminates per-step disk I/O. Needs ~80 GiB RAM at default cache size. Set `data.preload: false` only if RAM-constrained. | (no command — just leave the config alone) |
 | **Update config** | Already done in this repo: `d_ff: 16384` → `d_ff_inner: 10944`. | (none) |
-| **Audit collect for §3.1** | Recommended before trusting any e2e number. Verify the partial-forward `position_ids` (see `improvements.md` §3.1). If broken → re-collect. | (separate check) |
+| **Audit collect for §3.1** | **DONE 2026-05-11** — bug confirmed, fix applied, recollect required (see "§3.1 fix recovery" above). | (resolved) |
 
 ---
 

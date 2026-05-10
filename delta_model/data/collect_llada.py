@@ -329,10 +329,21 @@ def collect_one_sample(
                     x = torch.where(transfer_index, x0, x)
 
                 else:
+                    # CRITICAL: pass position_ids explicitly. LLaDA's RoPE
+                    # module rotates K at positions [0, key_len) when no
+                    # position_ids is given, so the new tokens (x[:, s:])
+                    # would be rotated as if they start at absolute position
+                    # 0 instead of `s`. That silently corrupts every
+                    # `h_per_pass[i ≥ 1]` we record. Verified by
+                    # `delta_model/sanity/test_partial_full_forward_equivalence.py`.
+                    position_ids = torch.arange(
+                        s, x.shape[1], device=x.device,
+                    ).unsqueeze(0)
                     out = model(
                         x[:, s:],
                         past_key_values=past_key_values,
                         use_cache=True,
+                        position_ids=position_ids,
                     )
                     logits = out.logits
 
