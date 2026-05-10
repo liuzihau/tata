@@ -58,7 +58,7 @@ def main() -> None:
     # All-True pad mask for the synthetic prefix_kv (no padding in this test).
     prefix_kv_pad_mask = torch.ones(B, S.PREFIX_WINDOW, dtype=torch.bool)
 
-    delta_h, c_pred = model(
+    delta_h, c_pos = model(
         h_ref, prev_emb, prefix_kv, block_start_pos,
         prefix_kv_pad_mask=prefix_kv_pad_mask,
     )
@@ -66,7 +66,7 @@ def main() -> None:
     assert delta_h.abs().max().item() == 0.0, "Δh head not zero-initialized"
 
     loss_dict = composite_loss(
-        delta_h, c_pred, h_ref, h_target, mask_tgt,
+        delta_h, c_pos, h_ref, h_target, mask_tgt,
         final_norm, lm_head,
     )
     expected_mse = ((h_target - h_ref) ** 2).mean()

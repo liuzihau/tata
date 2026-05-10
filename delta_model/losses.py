@@ -2,15 +2,21 @@
 
 L = λ_mse · MSE(Δh_pred, Δh_target)
   + λ_kl  · KL(p_actual ‖ p_predicted) at mask positions
-  + λ_conf· BCE(c_pred, c_label)
+  + λ_conf· BCE(c_pos, c_label_per_pos) at mask positions only
 
 where:
-    Δh_target  = h_target_actual − h_ref_actual                 (i_ref < i_target ≤ MAX_ITER-1)
-    p_actual   = softmax(lm_head(final_norm(h_target_actual)))
-    p_predicted= softmax(lm_head(final_norm(h_ref_actual + Δh_pred)))
-    c_label    = mean shared_mass(p_actual, p_predicted) over mask positions
-                  (detached — only c_pred trains)
-    c_pred     = sigmoid(...)  (already squashed by ConfHead)
+    Δh_target        = h_target_actual − h_ref_actual                 (i_ref < i_target ≤ MAX_ITER-1)
+    p_actual         = softmax(lm_head(final_norm(h_target_actual)))
+    p_predicted      = softmax(lm_head(final_norm(h_ref_actual + Δh_pred)))
+    c_label_per_pos  = shared_mass(p_actual, p_predicted) per token
+                       (= sum_v min(p_actual_v, p_pred_v); detached)
+    c_pos            = sigmoid output of the per-position confidence head, [B, T]
+
+Compared to the legacy block-aggregate variant (one scalar `c_label` per
+sample, one `c_pred`), §3.2 trains the confidence head per position so
+inference can decide *per-position* whether to commit a token. BCE is
+masked to mask positions only — revealed positions don't contribute to
+the conf gradient (their tokens are already committed; nothing to predict).
 
 `final_norm` and `lm_head` are the *frozen* backbone components. Pass them
 in via the closure / module — losses.py never instantiates them.
@@ -24,10 +30,10 @@ import torch.nn.functional as F
 
 def composite_loss(
     delta_h_pred: torch.Tensor,         # [B, T, d_model]
-    c_pred:       torch.Tensor,         # [B]                        in (0, 1)
+    c_pos:        torch.Tensor,         # [B, T]                     per-position conf in (0, 1)
     h_ref:        torch.Tensor,         # [B, T, d_model]            from dataset
     h_target:     torch.Tensor,         # [B, T, d_model]
-    mask_tgt:     torch.Tensor,         # [B, T]   bool              True = mask, KL evaluated here
+    mask_tgt:     torch.Tensor,         # [B, T]   bool              True = mask
     final_norm:   nn.Module,            # frozen backbone final RMSNorm/LayerNorm
     lm_head:      nn.Linear,            # frozen backbone LM head
     *,
@@ -54,18 +60,28 @@ def composite_loss(
     # KL(p_actual ‖ p_predicted) at mask positions only.
     kl_per_pos = (p_actual * (log_p_actual - log_p_pred)).sum(-1)       # [B, T]
     mask_f     = mask_tgt.to(kl_per_pos.dtype)                          # [B, T]
-    denom      = mask_f.sum().clamp_min(1.0)
-    kl         = (kl_per_pos * mask_f).sum() / denom
+    mask_denom = mask_f.sum().clamp_min(1.0)                            # scalar
+    kl         = (kl_per_pos * mask_f).sum() / mask_denom
 
-    # BCE on confidence head; soft target = mean shared mass at mask positions.
+    # Per-position shared-mass label (detached — only c_pos trains).
     with torch.no_grad():
         p_pred_detached = log_p_pred.exp()
-        shared = torch.minimum(p_actual, p_pred_detached).sum(-1)       # [B, T]
-        per_seq_denom = mask_f.sum(-1).clamp_min(1.0)                   # [B]
-        c_label = (shared * mask_f).sum(-1) / per_seq_denom             # [B]
-    # c_pred is in the model dtype (e.g. bf16); c_label is fp32 from the
-    # softmax upcast above. BCE requires matching dtypes — do it in fp32.
-    bce = F.binary_cross_entropy(c_pred.float(), c_label.detach().float())
+        c_label_per_pos = torch.minimum(p_actual, p_pred_detached).sum(-1)   # [B, T]
+
+    # Per-position BCE, masked to mask positions only. c_pos is in the
+    # model dtype (bf16); c_label_per_pos is fp32 from the softmax upcast
+    # above — compute BCE in fp32 for stability.
+    bce_per_pos = F.binary_cross_entropy(
+        c_pos.float(), c_label_per_pos.detach().float(),
+        reduction="none",
+    )                                                                   # [B, T]
+    bce = (bce_per_pos * mask_f).sum() / mask_denom
+
+    # Aggregate metrics for logging — averaged over mask positions only,
+    # so they're comparable to the old block-level scalars.
+    with torch.no_grad():
+        c_pred_mean  = (c_pos.float()         * mask_f).sum() / mask_denom
+        c_label_mean = (c_label_per_pos       * mask_f).sum() / mask_denom
 
     total = lambda_mse * mse + lambda_kl * kl + lambda_conf * bce
     return {
@@ -73,6 +89,6 @@ def composite_loss(
         "mse":          mse.detach(),
         "kl":           kl.detach(),
         "bce":          bce.detach(),
-        "c_label_mean": c_label.detach().mean(),
-        "c_pred_mean":  c_pred.detach().mean(),
+        "c_label_mean": c_label_mean.detach(),
+        "c_pred_mean":  c_pred_mean.detach(),
     }

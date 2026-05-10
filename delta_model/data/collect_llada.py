@@ -243,13 +243,18 @@ def collect_one_sample(
     x[:, :prompt_len] = prompt_ids
 
     # --- Hook to capture last-block (= last-layer pre-norm) hidden states ---
-    # We always do a full forward (see iter ≥ 1 branch below), so the hook
-    # always slices the block region [s:e] from the full-sequence output.
-    hook_state = {"latest": None, "s": 0, "e": 0}
+    # Pass 0 is a full forward over the whole sequence; we slice the block
+    # region [s:e] from its output. Iter ≥ 1 uses a partial forward over
+    # x[:, s:] (Fast-dLLM prefix-cache style) — the block region is the
+    # first `block_length` rows of that output.
+    hook_state = {"latest": None, "pass_idx": 0, "s": 0, "e": 0}
 
     def _last_block_hook(module, inputs, output):
-        h = output[0] if isinstance(output, tuple) else output  # [1, seq_len, d_model]
-        slice_h = h[:, hook_state["s"]:hook_state["e"], :]
+        h = output[0] if isinstance(output, tuple) else output  # [1, T, d_model]
+        if hook_state["pass_idx"] == 0:
+            slice_h = h[:, hook_state["s"]:hook_state["e"], :]
+        else:
+            slice_h = h[:, :block_length, :]
         hook_state["latest"] = (
             slice_h.detach().to("cpu", dtype=S.DTYPE_HIDDEN, copy=True).squeeze(0)
         )
@@ -292,49 +297,34 @@ def collect_one_sample(
                     )
                     reveal_per_pass.append(pre_reveal)
 
+                hook_state["pass_idx"] = i
                 hook_state["s"] = s
                 hook_state["e"] = e
 
-                # §3.1 — full-forward at every iter.
-                #
-                # Why not the partial-forward optimization?
-                # The pre-§3.1 path (forward `x[:, s:]` with `past_key_values`
-                # sliced to `[:s]`) silently rotated new K at positions
-                # `[0, new_len)` instead of `[s, s+new_len)`. We tried
-                # Fast-dLLM v1's intended `replace_position` API as a fix —
-                # both paths were verified to diverge from a full forward by
-                # max abs ~6–8 (1.8–2.4% relative) on T4
-                # (`delta_model/sanity/test_partial_full_forward_equivalence.py`).
-                # The most likely reason is that LLaDA's attention bias /
-                # position handling assumes new tokens are at the tail of the
-                # sequence, which is incompatible with mid-sequence block
-                # decoding. Rather than monkey-patch the modeling code, we
-                # use a full forward at every iter — guaranteed correct, ~30%
-                # slower at collect time.
-                #
-                # `use_cache=True` is needed at iter 0 only, to extract the
-                # last-32 prefix KV for the delta model's cross-attn input.
+                # Fast-dLLM prefix-cache decoding:
+                #   pass 0 of each block: full forward over x; cache prefix [:s].
+                #   pass ≥ 1: partial forward over x[:, s:] with cached prefix.
+                # This matches what the vanilla `generate_with_prefix_cache`
+                # baseline does at inference, so h_per_pass[i] captured here
+                # is what the baseline would compute at the same iter. Training
+                # the delta model on these targets keeps the hidden-state
+                # distribution aligned between collect, baseline, and the
+                # hybrid runner's pass-0 full forward.
                 if i == 0:
                     out = model(x, use_cache=True)
                     past_key_values = out.past_key_values
 
-                    # Capture last-32 prefix KV from the last layer at
-                    # positions [s-32, s). Cache stores K/V *unrotated*
-                    # (`present` is captured before RoPE in attention), so
-                    # this is the right content for variantc's cross-attn
-                    # K/V passthrough (which expects backbone-RoPE'd K — see
-                    # §1.5 in improvements.md).
-                    # Capture up to `prefix_window` last-prefix-token KV.
-                    # When `s < prefix_window` (very short prompt at block 0),
-                    # we have only `s` valid tokens; front-pad the rest with
-                    # zeros and record validity in `prefix_kv_pad_mask`.
+                    # Capture up to `prefix_window` last-prefix-token KV at
+                    # positions [s-valid_len, s). When `s < prefix_window`
+                    # (short prompt at block 0), we have fewer valid slots;
+                    # front-pad with zeros and record validity in
+                    # `prefix_kv_pad_mask` so cross-attn at training/inference
+                    # masks the padded positions out.
                     valid_len = min(s, prefix_window)
                     pad_len   = prefix_window - valid_len
-                    last_K_v = past_key_values[-1][0][0, :, s - valid_len:s, :]   # [KV_H, valid_len, d_head]
+                    last_K_v = past_key_values[-1][0][0, :, s - valid_len:s, :]
                     last_V_v = past_key_values[-1][1][0, :, s - valid_len:s, :]
                     if pad_len > 0:
-                        # F.pad signature for [KV_H, T, d_head]: pads last dims first.
-                        # (0, 0) on d_head, (pad_len, 0) on T = front-pad.
                         last_K = F.pad(last_K_v, (0, 0, pad_len, 0))
                         last_V = F.pad(last_V_v, (0, 0, pad_len, 0))
                     else:
@@ -345,31 +335,69 @@ def collect_one_sample(
                     ).to("cpu", dtype=S.DTYPE_KV, copy=True)
                     prefix_kv_pad_mask = torch.zeros(prefix_window, dtype=torch.bool)
                     prefix_kv_pad_mask[pad_len:] = True
-                else:
-                    out = model(x)
 
-                logits = out.logits
+                    # Slice the cache to [:s] for use at iter ≥ 1. This is
+                    # the "prefix cache" the Fast-dLLM baseline reuses across
+                    # iterations within the block.
+                    past_key_values = [
+                        tuple(t[:, :, :s, :] for t in pkv)
+                        for pkv in past_key_values
+                    ]
+                    logits = out.logits
 
-                # Token transfer for current block. Logits cover the full
-                # sequence; we restrict transfer to the current block by
-                # zeroing out `global_mask_index` outside [..., e).
-                global_mask_index = (x == mask_id)
-                global_mask_index[:, e:] = False
-                if factor is not None:
-                    x0, transfer_index = _get_transfer_index_dynamic(
-                        logits, temperature, remasking, global_mask_index, x,
-                        factor=factor,
-                    )
+                    # Pass-0 token transfer: logits are full-sequence, restrict
+                    # the transfer mask to the current block.
+                    global_mask_index = (x == mask_id)
+                    global_mask_index[:, e:] = False
+                    if factor is not None:
+                        x0, transfer_index = _get_transfer_index_dynamic(
+                            logits, temperature, remasking, global_mask_index, x,
+                            factor=factor,
+                        )
+                    else:
+                        quota = (
+                            None if threshold is not None
+                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                        )
+                        x0, transfer_index = _get_transfer_index(
+                            logits, temperature, remasking, global_mask_index, x,
+                            quota, threshold,
+                        )
+                    x = torch.where(transfer_index, x0, x)
+
                 else:
-                    quota = (
-                        None if threshold is not None
-                        else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                    # Partial forward over the suffix x[:, s:] with cached
+                    # prefix. This is the prefix-cache decoding pattern the
+                    # baseline uses; h_per_pass[i] for i ≥ 1 is captured
+                    # under this same path so training target distribution
+                    # aligns with what the baseline produces at the same iter.
+                    out = model(
+                        x[:, s:],
+                        past_key_values=past_key_values,
+                        use_cache=True,
                     )
-                    x0, transfer_index = _get_transfer_index(
-                        logits, temperature, remasking, global_mask_index, x,
-                        quota, threshold,
-                    )
-                x = torch.where(transfer_index, x0, x)
+                    logits = out.logits   # [1, GL - nb*BL, V] — covers x[:, s:]
+
+                    # Pass-≥1 token transfer: logits are suffix-only; restrict
+                    # the mask to the first `block_length` positions (the block).
+                    mask_index_blk = (x[:, s:] == mask_id)
+                    mask_index_blk[:, block_length:] = False
+                    if factor is not None:
+                        x0_full, transfer_full = _get_transfer_index_dynamic(
+                            logits, temperature, remasking, mask_index_blk,
+                            x[:, s:], factor=factor,
+                        )
+                    else:
+                        quota = (
+                            None if threshold is not None
+                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                        )
+                        x0_full, transfer_full = _get_transfer_index(
+                            logits, temperature, remasking, mask_index_blk,
+                            x[:, s:], quota, threshold,
+                        )
+                    new_suffix = torch.where(transfer_full, x0_full, x[:, s:])
+                    x = torch.cat([x[:, :s], new_suffix], dim=1)
 
                 if recorded_passes < max_iter:
                     h_per_pass.append(hook_state["latest"])

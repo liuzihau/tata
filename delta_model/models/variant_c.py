@@ -13,7 +13,7 @@ Architecture, post §1.5 + §1.6 alignment with the LLaDA backbone:
 
   Outputs:
       delta_h   [B, 32, d_model]
-      c_pred    [B]   ∈ (0, 1)
+      c_pos     [B, 32]   ∈ (0, 1) per-position confidence (§3.2)
 
   Block structure (per layer): pre-RMSNorm → RoPE self-attn → +x → pre-RMSNorm
   → RoPE cross-attn (queries from x, K/V passed in untouched from prefix_kv)
@@ -36,7 +36,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ..data import schema as S
-from .heads import ConfHead, DeltaHead
+from .heads import ConfHeadPerPos, DeltaHead
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +259,8 @@ class VariantC(nn.Module):
         ])
         self.final_norm = _RMSNorm(d_model, eps=rms_eps)
 
-        self.delta_head = DeltaHead(d_model)
-        self.conf_head  = ConfHead(d_model)
+        self.delta_head        = DeltaHead(d_model)
+        self.conf_head_per_pos = ConfHeadPerPos(d_model)
 
     @staticmethod
     def _split_prefix_kv(prefix_kv: torch.Tensor
@@ -319,7 +319,6 @@ class VariantC(nn.Module):
         x = self.final_norm(x)
 
         feats   = x[:, BL:, :]                                        # prev_emb half
-        delta_h = self.delta_head(feats)                              # [B, 32, D]
-        pooled  = feats.mean(dim=1)                                   # [B, D]
-        c_pred  = self.conf_head(pooled)                              # [B]
-        return delta_h, c_pred
+        delta_h = self.delta_head(feats)                              # [B, BL, D]
+        c_pos   = self.conf_head_per_pos(feats)                        # [B, BL] ∈ (0, 1)
+        return delta_h, c_pos

@@ -1,11 +1,16 @@
 """Output heads shared across delta-model variants.
 
-`DeltaHead`  — zero-init linear that emits Δh. At step 0 the model is
-              equivalent to "reuse h_ref verbatim" (the no-training
-              baseline).
-`ConfHead`   — pooled feature → scalar in [0, 1]. Trained with BCE
-              against shared-mass on mask positions; consumed at
-              inference to decide rollback.
+`DeltaHead`        — zero-init linear that emits Δh. At step 0 the model
+                     is equivalent to "reuse h_ref verbatim" (the
+                     no-training baseline).
+`ConfHead`         — pooled feature → scalar in [0, 1]. Block-level
+                     aggregate (legacy; kept for back-compat with old
+                     checkpoints / sanity tests).
+`ConfHeadPerPos`   — per-position feature → vector in [0, 1]^BL. Trained
+                     with BCE against per-position shared-mass at mask
+                     positions. Used at inference for §3.2 agreement
+                     decoding (commit a position only if both Fast-dLLM
+                     wants it AND the per-pos conf passes the threshold).
 """
 from __future__ import annotations
 
@@ -41,3 +46,24 @@ class ConfHead(nn.Module):
 
     def forward(self, pooled: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.proj(pooled).squeeze(-1))
+
+
+class ConfHeadPerPos(nn.Module):
+    """Per-position confidence in [0, 1] from per-position features.
+
+    Same MLP shape as `ConfHead` but applied per-token without pooling.
+    Output is `[B, T]`. Trained with BCE against per-position shared-mass
+    at mask positions; used at inference to gate per-position commits."""
+
+    def __init__(self, d_model: int, hidden: int | None = None):
+        super().__init__()
+        h = hidden if hidden is not None else d_model // 4
+        self.proj = nn.Sequential(
+            nn.Linear(d_model, h),
+            nn.GELU(),
+            nn.Linear(h, 1),
+        )
+
+    def forward(self, feats: torch.Tensor) -> torch.Tensor:
+        # feats: [B, T, d_model]
+        return torch.sigmoid(self.proj(feats).squeeze(-1))    # [B, T]

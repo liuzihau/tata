@@ -19,38 +19,40 @@ existing cache was built before the fix and is poisoned. **All training
 results to date are uninterpretable.** Sequential recovery plan, ~5–8 h
 total wall time. Run on the cluster, in this order:
 
-### 1. Verify the fix is in place (~30 s, GPU + Fast-dLLM)
+### 1. Verify T4 documents Fast-dLLM's partial-forward behavior (~30 s, GPU + Fast-dLLM)
 
 ```bash
 python -m delta_model.sanity.test_partial_full_forward_equivalence \
     --fast_dllm_path external/Fast-dLLM/v1
 ```
 
-T4 documents the §3.1 bug by running both partial-forward paths against
-a full forward. **Expected output on this Fast-dLLM v1 build:**
+T4 is now a *documentation* test, not a gate. It checks that both
+partial-forward paths (B1 = `generate_with_prefix_cache`-style, B3 =
+`replace_position`-style) diverge from a hypothetical full forward at
+the same `x` state. **Expected output on this Fast-dLLM v1 build:**
 
 ```
 [sanity] Path B1 — pre-§3.1 collect path (sliced cache, auto-derive RoPE):
-[sanity] ✗ B1 vs A (full): max=6.0e+00 ...   ← divergent (expected — documents the bug)
+[sanity] ✗ B1 vs A (full): max=6.0e+00 ...   ← divergent (Fast-dLLM behavior, intentional)
 
 [sanity] Path B3 — replace_position pattern (Fast-dLLM's intended API):
-[sanity] ✗ B3 vs A (full): max=~8e+00 ...    ← also divergent (expected — Fast-dLLM v1's API doesn't fix mid-sequence decoding)
+[sanity] ✗ B3 vs A (full): max=~8e+00 ...    ← also divergent (same)
 
 [sanity] ✓ EXPECTED — both partial-forward paths diverge from the full
-forward, consistent with the §3.1 bug in this Fast-dLLM v1 build (LLaDA
-modeling assumes new tokens are at the tail of the sequence). collect_llada.py
-correctly uses a full-forward fallback at every iter, which guarantees
-correctness at the cost of ~30% recollect time.
+forward. This is the Fast-dLLM partial-decoding behavior the baseline
+uses; collect_llada deliberately captures h_per_pass[i ≥ 1] under the
+same path so training targets, baseline outputs, and the hybrid runner
+stay aligned.
 ```
 
-T4 exits 0 in this case — both partial paths failing is the *expected*
-outcome and confirms the modeling bug exists. The actual fix in
-`collect_llada.py` is to do a full forward at every iter (no partial
-forward, no cache reuse beyond pass 0's prefix-KV extraction).
+T4 exits 0. **Both paths diverging is the desired state** — `collect_llada`
+uses the same partial-forward + prefix-cache decoding that
+`generate_with_prefix_cache` uses, so training targets match what the
+baseline produces. Multi-token decoding's only canonical baseline is
+Fast-dLLM, and Fast-dLLM is partial-forward by design.
 
-If T4 instead reports `⚠ NOTABLE`, it means a future LLaDA upgrade has
-fixed the partial-forward bug. We could re-enable partial forwards for
-faster recollect, but it's optional — the full-forward path keeps working.
+If T4 prints `⚠ NOTABLE`, a future LLaDA build has made partial- and
+full-forward agree (informational only, no action needed).
 
 If you see `TypeError`: a stale `__pycache__` may be loading old code.
 Clear it:
@@ -99,18 +101,22 @@ collected (none `skipped (prompt too short)`). T3 reads the per-cache
 64-stored real caches indistinguishably; the optional `prefix_kv_pad_mask`
 field is validated for shape/dtype if present.
 
-### 4. Real recollect (~5–9 h on a single A100/H100)
+### 4. Real recollect (~4–7 h on a single A100/H100)
 
-> Slower than the original 4–7 h estimate because the §3.1 fix uses
-> full-forward at every iter instead of the partial-forward optimization.
-> ~30% overhead is the cost of correctness on this LLaDA build.
+> collect uses Fast-dLLM partial-forward + prefix cache at iter ≥ 1
+> (same path as the `generate_with_prefix_cache` baseline), so
+> `h_per_pass[i]` matches what the baseline computes at the same iter.
+> Training the delta model against these targets keeps the
+> collect/baseline/inference distributions aligned.
 >
-> Storage also grew because collect now records a 64-token prefix-KV
-> window (`COLLECT_PREFIX_WINDOW`, see §3.4) instead of 32, so the cache
-> has headroom for future window-size ablations without re-collecting.
-> Per-sample size goes from ~16 MiB to ~20 MiB; total cache ~80 GiB →
-> ~120 GiB at 5000 train + 800 test. Schema version bumps to 2; v1
-> caches will fail T3.
+> Storage grew because collect records a 64-token prefix-KV window
+> (`COLLECT_PREFIX_WINDOW`, see §3.4) instead of 32 — headroom for
+> future window-size ablations without re-collecting. Per-sample size
+> ~16 MiB → ~20 MiB; total cache ~80 GiB → ~120 GiB at 5000 train + 800
+> test. Schema version bumps to 2; v1 caches fail T3.
+>
+> Short prompts are now padded-and-masked (§3.5) rather than skipped,
+> so all sample_prompts get collected even at `--prefix_window 64`.
 
 ```bash
 python -m delta_model.data.collect_llada \
@@ -569,7 +575,7 @@ python -m delta_model.eval.gsm8k_e2e \
     --delta_ckpt ckpts/m1_llada_variant_c/step_0020000.pt \
     --fast_dllm_path external/Fast-dLLM/v1 \
     --n_problems 200 \
-    --conf_thresholds 0.80,0.85,0.90,0.95 \
+    --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
     --out_json eval_results/m1_v0.json
 ```
 
@@ -583,8 +589,10 @@ Pass criteria for the eval smoke run:
 - prints `[gsm8k] decoding mode: factor=1.0` (or `threshold=…`) once
   at startup. If this line is missing or wrong, the eval and collect
   modes are out of sync.
-- per-`conf_threshold` block returns a dict with non-NaN
-  `accuracy_hybrid`, `accuracy_vanilla`, `speedup_ratio`.
+- per-`per_pos_threshold` block returns a dict with non-NaN
+  `accuracy_hybrid`, `accuracy_vanilla`, `speedup_ratio`,
+  `disagreements` (per-prompt mean — proxy for how often the per-pos
+  gate forced a backbone rollback).
 
 Output dict per threshold contains:
 - `accuracy_hybrid`, `accuracy_vanilla`, `accuracy_delta`

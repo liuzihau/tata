@@ -213,13 +213,13 @@ def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
             for k, v in batch.items()
         }
         prev_emb = token_embed(batch_dev["substituted_ids"])
-        delta_h, c_pred = model(
+        delta_h, c_pos = model(
             batch_dev["h_ref"], prev_emb, batch_dev["prefix_kv"],
             batch_dev["block_start_pos"],
             prefix_kv_pad_mask=batch_dev.get("prefix_kv_pad_mask"),
         )
         loss_dict = composite_loss(
-            delta_h, c_pred,
+            delta_h, c_pos,
             batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
             final_norm, lm_head,
             lambda_mse=lambda_mse, lambda_kl=lambda_kl, lambda_conf=lambda_conf,
@@ -405,7 +405,7 @@ def main() -> None:
                 prev_emb = token_embed(batch_dev["substituted_ids"])
 
         with timers.time("fwd"):
-            delta_h, c_pred = model(
+            delta_h, c_pos = model(
                 batch_dev["h_ref"], prev_emb, batch_dev["prefix_kv"],
                 batch_dev["block_start_pos"],
                 prefix_kv_pad_mask=batch_dev.get("prefix_kv_pad_mask"),
@@ -413,7 +413,7 @@ def main() -> None:
 
         with timers.time("loss"):
             loss_dict = composite_loss(
-                delta_h, c_pred,
+                delta_h, c_pos,
                 batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
                 final_norm, lm_head,
                 lambda_mse=cfg.loss.lambda_mse,
@@ -485,6 +485,9 @@ def main() -> None:
                     backbone_model=None,         # let the eval load its own
                     delta_model=model,
                     n_problems=cfg.log.gsm8k_subset,
+                    per_pos_threshold=getattr(
+                        cfg.log, "gsm8k_per_pos_threshold", 0.85,
+                    ),
                     seed=cfg.seed,
                 )
                 if wandb is not None:

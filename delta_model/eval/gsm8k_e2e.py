@@ -9,7 +9,7 @@ CLI (run from inside the tata repo root):
     python -m delta_model.eval.gsm8k_e2e \\
         --delta_ckpt ckpts/m1_llada_variant_c/step_0020000.pt \\
         --n_problems 200 \\
-        --conf_thresholds 0.80,0.85,0.90,0.95
+        --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95
 """
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def run_gsm8k_eval(
     delta_ckpt: str | None = None,
     fast_dllm_path: str | None = None,
     n_problems: int = 200,
-    conf_threshold: float = 0.85,
+    per_pos_threshold: float = 0.85,
     seed: int = 42,
     threshold: float | None = None,
     factor: float | None = 1.0,
@@ -107,10 +107,21 @@ def run_gsm8k_eval(
             assert delta_ckpt is not None, "Need delta_ckpt or in-memory delta_model"
             ckpt = torch.load(delta_ckpt, map_location="cpu", weights_only=False)
             cfg_m = ckpt["cfg"]["model"]
+            # Read backbone hyperparams off the loaded LLaDA so RoPE / RMSNorm
+            # match between the variantc and what produced h_target.
+            bb_cfg = {
+                "rope_theta":  float(getattr(backbone_model.config, "rope_theta", 1e6)),
+                "rms_eps":     float(getattr(backbone_model.config, "layer_norm_eps", 1e-5)),
+                "max_seq_len": int(getattr(backbone_model.config, "max_sequence_length", 8192)),
+            }
             delta_model = VariantC(
                 d_model=cfg_m["d_model"], n_heads=cfg_m["n_heads"],
-                n_layers=cfg_m["n_layers"], d_ff=cfg_m.get("d_ff"),
+                n_layers=cfg_m["n_layers"],
+                d_ff_inner=cfg_m.get("d_ff_inner"),
                 dropout=cfg_m.get("dropout", 0.0),
+                rope_theta=bb_cfg["rope_theta"],
+                rms_eps=bb_cfg["rms_eps"],
+                max_seq_len=bb_cfg["max_seq_len"],
             ).cuda().eval()
             delta_model.load_state_dict(ckpt["model"])
     else:
@@ -141,7 +152,7 @@ def run_gsm8k_eval(
         out_ids, stats = generate_with_delta(
             backbone_model, delta_model, final_norm, lm_head, token_embed,
             prompt_ids,
-            conf_threshold=conf_threshold,
+            per_pos_threshold=per_pos_threshold,
             threshold=threshold, factor=factor,
         )
         t_hybrid += time.time() - t0
@@ -177,7 +188,7 @@ def run_gsm8k_eval(
         "speedup_ratio":         (t_vanilla / max(1e-6, t_hybrid)),
         "mean_rollbacks":        float(np.mean(rollbacks)),
         "mean_backbone_calls":   float(np.mean(backbone_calls)),
-        "conf_threshold":        conf_threshold,
+        "per_pos_threshold":     per_pos_threshold,
     }
 
 
@@ -187,8 +198,11 @@ def main() -> None:
     p.add_argument("--fast_dllm_path", default=None)
     p.add_argument("--n_problems", type=int, default=200)
     p.add_argument(
-        "--conf_thresholds", default="0.80,0.85,0.90,0.95",
-        help="Comma-separated thresholds to sweep.",
+        "--per_pos_thresholds", default="0.70,0.80,0.85,0.90,0.95",
+        help="Comma-separated per-position confidence thresholds to sweep "
+             "(§3.2 agreement decoding). A position commits only when both "
+             "Fast-dLLM wants it AND c_pos[i] >= threshold; any disagreement "
+             "forces a backbone rollback at the next iter.",
     )
     p.add_argument(
         "--threshold", type=float, default=None,
@@ -220,13 +234,13 @@ def main() -> None:
     )
 
     rows = []
-    for thr in [float(x) for x in args.conf_thresholds.split(",") if x.strip()]:
-        print(f"[gsm8k] conf_threshold={thr}", flush=True)
+    for thr in [float(x) for x in args.per_pos_thresholds.split(",") if x.strip()]:
+        print(f"[gsm8k] per_pos_threshold={thr}", flush=True)
         m = run_gsm8k_eval(
             delta_ckpt=args.delta_ckpt,
             fast_dllm_path=args.fast_dllm_path,
             n_problems=args.n_problems,
-            conf_threshold=thr,
+            per_pos_threshold=thr,
             seed=args.seed,
             threshold=decoding_threshold,
             factor=decoding_factor,

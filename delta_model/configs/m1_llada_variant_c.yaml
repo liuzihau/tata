@@ -64,6 +64,12 @@ log:
   val_every:       500
   gsm8k_every:     5000
   gsm8k_subset:    50
+  # §3.2 agreement-decode threshold for mid-training GSM8K eval.
+  # Per-position confidence ∈ [0,1]; 0.85 ≈ "predicted distribution
+  # overlaps actual by ≥ 85% at this position". Lower = more lenient
+  # (more delta-driven commits, more potential errors); higher = more
+  # conservative (more rollbacks). Final eval can sweep this.
+  gsm8k_per_pos_threshold: 0.85
   bins_gap:        [1, 2, 3, 4, 5]
   bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 

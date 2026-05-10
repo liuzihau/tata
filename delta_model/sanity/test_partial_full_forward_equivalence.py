@@ -251,14 +251,25 @@ def main() -> None:
         )
         sys.exit(0)
     else:
-        # The expected state: both partial paths broken on this LLaDA build.
+        # The expected state: both partial paths diverge from a full forward.
+        # This is NOT a bug we work around — it's the actual Fast-dLLM
+        # prefix-cache decoding path that the baseline uses at inference.
+        # collect_llada deliberately captures h_per_pass[i ≥ 1] under the
+        # same partial-forward path so the delta model's training target
+        # matches the baseline's hidden-state distribution. Compare:
+        #   - baseline `generate_with_prefix_cache`: full forward at pass 0,
+        #     partial forward at iter ≥ 1 (uses B1's path).
+        #   - collect: same.
+        #   - hybrid_runner: full forward at pass 0, delta at iter ≥ 1
+        #     (predicts what partial-forward would have given).
+        # If T4 *ever* prints "⚠ NOTABLE" instead, it means a future LLaDA
+        # build made the two paths agree — useful info, but not required.
         print(
             "[sanity] ✓ EXPECTED — both partial-forward paths diverge from "
-            "the full forward, consistent with the §3.1 bug in this Fast-dLLM "
-            "v1 build (LLaDA modeling assumes new tokens are at the tail of "
-            "the sequence). `collect_llada.py` correctly uses a full-forward "
-            "fallback at every iter, which guarantees correctness at the "
-            "cost of ~30% recollect time."
+            "the full forward. This is the Fast-dLLM partial-decoding "
+            "behavior the baseline uses; collect_llada deliberately captures "
+            "h_per_pass[i ≥ 1] under the same path so training targets, "
+            "baseline outputs, and the hybrid runner stay aligned."
         )
         sys.exit(0)
 

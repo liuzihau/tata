@@ -1,13 +1,26 @@
 """Hybrid backbone-then-delta runner.
 
 Inference engine that mirrors Fast-dLLM v1 `generate_with_prefix_cache`
-(`v1/llada/generate.py:132`) but swaps the in-block backbone forward
-for the delta model at passes ≥ 1. A confidence-head threshold triggers
-a rollback — a fresh full backbone forward — which refreshes `h_ref`
-and the prefix-KV slice the delta model attends to.
+(`v1/llada/generate.py:132`) but swaps the in-block backbone forward for
+the delta model at iter ≥ 1. §3.2 agreement decoding gates per-position
+commits via the delta model's per-position confidence head:
 
-Returned stats include rollback counts (per block + total) so the eval
-harness can plot accuracy / speed trade-offs by `conf_threshold`.
+  At each delta pass, run Fast-dLLM's standard token-transfer selection
+  on logits = lm_head(final_norm(h_ref + Δh_pred)) → returns positions
+  Fast-dLLM wants to commit (top-K by per-position confidence with the
+  dynamic-rank or fixed-threshold rule). We then intersect this set with
+  the per-position confidence head's signal: a position commits only if
+  BOTH (a) Fast-dLLM wants it AND (b) c_pos[i] ≥ per_pos_threshold. Any
+  disagreement (Fast-dLLM wants more positions than agreement-set has)
+  forces a backbone rollback at the start of the *next* iter.
+
+Rollback uses a *partial* backbone forward with the cached prefix from
+pass 0, matching collect's iter ≥ 1 path (see improvements.md §3.1) so
+the refreshed h_ref stays in the same distribution the delta model was
+trained on.
+
+Returned stats include rollback / disagreement counts so the eval
+harness can plot accuracy / speed / per-position-threshold curves.
 """
 from __future__ import annotations
 
@@ -47,7 +60,7 @@ def generate_with_delta(
     gen_length: int = S.GEN_LENGTH,
     block_length: int = S.BLOCK_LENGTH,
     max_iter_per_block: int = S.MAX_ITER,
-    conf_threshold: float = 0.85,
+    per_pos_threshold: float = 0.85,        # §3.2 — per-position confidence gate
     threshold: float | None = None,         # Fast-dLLM fixed-threshold mode
     factor: float | None = 1.0,             # Fast-dLLM dynamic-threshold mode
     temperature: float = 0.0,
@@ -60,8 +73,16 @@ def generate_with_delta(
     (the other must be None). The default factor=1.0 matches the collect
     pipeline's default and the Fast-dLLM paper's recommended setting.
 
+    `per_pos_threshold` ∈ (0, 1] gates per-position commits via the delta
+    model's per-position confidence head. Set to 0 to commit everything
+    Fast-dLLM wants (fastest, most lenient). Set to 1 to commit nothing
+    (forces rollback every iter — equivalent to backbone-only baseline).
+    Useful sweep: {0.7, 0.8, 0.85, 0.9, 0.95}.
+
     stats keys: rollbacks (int), backbone_forwards (int), delta_forwards (int),
-                walltime (float, sec), per_block_passes (list[int]).
+                disagreements (int — passes where Fast-dLLM wanted more than
+                the per-pos head agreed to), walltime (float, sec),
+                per_block_passes (list[int]).
     """
     if (threshold is None) == (factor is None):
         raise ValueError(
@@ -80,7 +101,7 @@ def generate_with_delta(
 
     stats = {
         "rollbacks": 0, "backbone_forwards": 0, "delta_forwards": 0,
-        "per_block_passes": [],
+        "disagreements": 0, "per_block_passes": [],
     }
     t0 = time.time()
 
@@ -121,10 +142,10 @@ def generate_with_delta(
                 tuple(t[:, :, :s, :] for t in pkv) for pkv in past_key_values
             ]
 
-            # Last-32 prefix KV for the delta model.
+            # Last-PREFIX_WINDOW prefix KV for the delta model.
             last_K = past_key_values[-1][0][0, :, s - S.PREFIX_WINDOW:s, :]
             last_V = past_key_values[-1][1][0, :, s - S.PREFIX_WINDOW:s, :]
-            prefix_kv_slice = torch.stack([last_K, last_V], dim=0).unsqueeze(0)   # [1, 2, KV_H, 32, d_head]
+            prefix_kv_slice = torch.stack([last_K, last_V], dim=0).unsqueeze(0)
 
             # h_ref: last-block output at the masked block region.
             h_ref = hook_state["latest"]                                         # [1, BL, D]
@@ -146,31 +167,47 @@ def generate_with_delta(
             x = torch.where(transfer_index, x0, x)
             n_passes = 1
 
-            # ---- Passes 1..max_iter_per_block-1: delta model w/ rollback ----
+            # The prompt's prefix is always at least PREFIX_WINDOW tokens at
+            # inference (precondition), so the pad mask we hand to the delta
+            # model is all-True.
+            prefix_kv_pad_mask = torch.ones(
+                (1, S.PREFIX_WINDOW), dtype=torch.bool, device=device,
+            )
+
+            # ---- Passes 1..max_iter_per_block-1: delta + agreement decode ----
+            force_rollback_next = False
             while n_passes < max_iter_per_block:
                 if (x[:, s:e] == mask_id).sum().item() == 0:
                     break
 
+                # If the previous pass had a disagreement, refresh h_ref via
+                # a partial-forward rollback BEFORE this pass's delta forward.
+                # Same path as collect's iter ≥ 1 — keeps h_ref distribution
+                # aligned with the delta model's training distribution.
+                if force_rollback_next:
+                    hook_state["is_full_forward"] = False
+                    hook_state["s"] = s; hook_state["e"] = e
+                    out_rb = model(
+                        x[:, s:],
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    stats["backbone_forwards"] += 1
+                    stats["rollbacks"] += 1
+                    h_ref = hook_state["latest"]
+                    force_rollback_next = False
+
                 # Build prev_emb at the current state of the block.
                 block_ids = x[0, s:e]
-                # mask_id positions get the mask embedding via token_embed lookup.
                 prev_emb = token_embed(block_ids).to(
                     device=device, dtype=h_ref.dtype,
                 ).unsqueeze(0)                                                  # [1, BL, D]
 
-                # Delta forward.
+                # Delta forward — produces Δh and per-position confidence.
                 block_start_pos_t = torch.tensor(
                     [s], dtype=torch.long, device=device,
                 )
-                # At inference, the prefix is always taken from a full
-                # backbone forward at positions [s-PREFIX_WINDOW, s), which
-                # exist whenever the prompt is at least PREFIX_WINDOW tokens
-                # — a precondition for hybrid_runner to make sense at all.
-                # Pass an all-True mask so the model signature matches train.
-                prefix_kv_pad_mask = torch.ones(
-                    (1, S.PREFIX_WINDOW), dtype=torch.bool, device=device,
-                )
-                delta_h, c_pred = delta_model(
+                delta_h, c_pos = delta_model(
                     h_ref.to(delta_model.delta_head.proj.weight.dtype),
                     prev_emb.to(delta_model.delta_head.proj.weight.dtype),
                     prefix_kv_slice.to(torch.float16),
@@ -179,48 +216,44 @@ def generate_with_delta(
                 )
                 stats["delta_forwards"] += 1
 
-                if c_pred.item() < conf_threshold:
-                    # ---- Rollback: full backbone forward to refresh h_ref ----
-                    hook_state["is_full_forward"] = True
-                    hook_state["s"] = s; hook_state["e"] = e
-                    out = model(x, use_cache=True)
-                    stats["backbone_forwards"] += 1
-                    stats["rollbacks"] += 1
-                    past_key_values = out.past_key_values
-                    logits = out.logits
-                    past_key_values = [
-                        tuple(t[:, :, :s, :] for t in pkv) for pkv in past_key_values
-                    ]
-                    last_K = past_key_values[-1][0][0, :, s - S.PREFIX_WINDOW:s, :]
-                    last_V = past_key_values[-1][1][0, :, s - S.PREFIX_WINDOW:s, :]
-                    prefix_kv_slice = torch.stack(
-                        [last_K, last_V], dim=0,
-                    ).unsqueeze(0)
-                    h_ref = hook_state["latest"]
+                # Compute h_pred and logits for token transfer.
+                h_pred_block = h_ref + delta_h.to(h_ref.dtype)                  # [1, BL, D]
+                logits_block = lm_head(final_norm(h_pred_block))                # [1, BL, V]
+
+                # Step 1: Fast-dLLM's standard transfer selection on
+                # delta-derived logits.
+                mask_blk = (x[:, s:e] == mask_id)                               # [1, BL]
+                if factor is not None:
+                    x0_blk, transfer_blk = _get_transfer_index_dynamic(
+                        logits_block, temperature, remasking, mask_blk,
+                        x[:, s:e], factor=factor,
+                    )
                 else:
-                    # Use the delta model's prediction as h_target.
-                    h_pred_block = h_ref + delta_h.to(h_ref.dtype)              # [1, BL, D]
-                    logits_block = lm_head(final_norm(h_pred_block))            # [1, BL, V]
-                    # Pad logits up to the full sequence shape get_transfer_index expects.
-                    # Easier path: use a block-only mask over the block and call _get_transfer_index
-                    # with x[:, s:e] only.
-                    mask_blk = (x[:, s:e] == mask_id)
-                    if factor is not None:
-                        x0_blk, transfer_blk = _get_transfer_index_dynamic(
-                            logits_block, temperature, remasking, mask_blk,
-                            x[:, s:e], factor=factor,
-                        )
-                    else:
-                        quota = (
-                            None if threshold is not None
-                            else num_transfer_tokens[:, min(n_passes, num_transfer_tokens.size(1) - 1)]
-                        )
-                        x0_blk, transfer_blk = _get_transfer_index(
-                            logits_block, temperature, remasking, mask_blk,
-                            x[:, s:e], quota, threshold,
-                        )
-                    new_blk = torch.where(transfer_blk, x0_blk, x[:, s:e])
-                    x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
+                    quota = (
+                        None if threshold is not None
+                        else num_transfer_tokens[:, min(n_passes, num_transfer_tokens.size(1) - 1)]
+                    )
+                    x0_blk, transfer_blk = _get_transfer_index(
+                        logits_block, temperature, remasking, mask_blk,
+                        x[:, s:e], quota, threshold,
+                    )
+                # transfer_blk: [1, BL] bool — positions Fast-dLLM wants.
+
+                # Step 2: per-position confidence gate.
+                #   c_pos has shape [1, BL]; broadcast threshold check.
+                per_pos_pass = (c_pos.float() >= per_pos_threshold)             # [1, BL]
+                agreement_blk = transfer_blk & per_pos_pass                      # [1, BL]
+
+                # Step 3: commit ONLY agreement-set positions this pass.
+                new_blk = torch.where(agreement_blk, x0_blk, x[:, s:e])
+                x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
+
+                # Step 4: any disagreement → force rollback next pass.
+                n_want   = int(transfer_blk.sum().item())
+                n_agree  = int(agreement_blk.sum().item())
+                if n_want > n_agree:
+                    force_rollback_next = True
+                    stats["disagreements"] += 1
 
                 n_passes += 1
 
