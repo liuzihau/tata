@@ -26,23 +26,39 @@ python -m delta_model.sanity.test_partial_full_forward_equivalence \
     --fast_dllm_path external/Fast-dLLM/v1
 ```
 
-T4 now runs both paths and reports each. Expected output:
+T4 runs both paths and reports each.
 
+> **Note (2026-05-11 update):** in this Fast-dLLM v1 build, neither
+> `LLaDAModelLM.forward()` nor the inner `LLaDAModel.forward()` accept a
+> `position_ids` kwarg, so the previous post-fix path raises `TypeError`.
+> Until we land an alternative position-offset injection (see step 1b),
+> `collect_llada.py` falls back to the partial-forward call **without**
+> `position_ids` — i.e. the cache is still poisoned. **Do not run step 4
+> (recollect) until step 1b is done.**
+
+If T4 raises `TypeError: ... got an unexpected keyword argument 'position_ids'`,
+proceed to **step 1b**.
+
+If T4 prints `✓ FIX VERIFIED — both paths agree` (i.e. step 1b has already
+landed), proceed to step 2.
+
+### 1b. Diagnose Fast-dLLM modeling to plan the position-offset injection (~30 s)
+
+Captures the actual `RotaryEmbedding.forward` and attention-block forward
+source from the loaded model, plus forward signatures and the on-disk
+modeling-file path. Output is what we need to write a precise patch.
+
+```bash
+python -m delta_model.sanity.inspect_llada_modeling \
+    --fast_dllm_path external/Fast-dLLM/v1 \
+    > inspect.txt 2>&1
+cat inspect.txt
 ```
-[sanity] Path B1 — partial forward, NO position_ids (collect-pre-fix path):
-[sanity] ✗ B1 vs A (full): max=6.0e+00 ...        ← still broken (expected)
 
-[sanity] Path B2 — partial forward, WITH position_ids (collect-post-fix path):
-[sanity] ✓ B2 vs A (full): max=~1e-3 ...           ← fix recovered equivalence
-
-[sanity] ✓ FIX VERIFIED — without position_ids the partial forward is broken
-(B1 diverges), but passing position_ids=arange(s, len) recovers full-forward
-equivalence (B2 within tolerance).
-```
-
-If **B2 also fails** (max > 5e-3): STOP and report. Means LLaDA's modeling
-needs more than `position_ids` (possibly `cache_position` or attention-mask
-tweaks); we'd investigate before sinking 7 hours into a recollect.
+Paste the output back into the chat. The patch (probably a forward-pre-hook
+on every RotaryEmbedding instance that overrides positions based on a
+stashed offset) will land in `delta_model/llada_runtime.py`. Once it's in
+place and T4 reports both paths agree, return to step 1.
 
 ### 2. Move the broken artifacts aside (5 s)
 
