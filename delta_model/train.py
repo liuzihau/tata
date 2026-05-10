@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 # Avoid /dev/shm bus errors on shared HPC nodes: route DataLoader worker
 # tensors through the file-system strategy instead of SysV shared memory.
@@ -268,9 +269,13 @@ def main() -> None:
         num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
         drop_last=True, persistent_workers=cfg.data.num_workers > 0,
     )
+    # Mirror the training loader's worker count exactly: if cfg.data.num_workers
+    # is 0 (e.g. constrained /dev/shm), val must also be 0, otherwise the first
+    # val pass spawns a worker and SIGBUSes on shm.
+    val_workers = (cfg.data.num_workers // 2) if cfg.data.num_workers > 1 else 0
     val_dl = DataLoader(
         val_ds, batch_size=cfg.data.batch_size, shuffle=False,
-        num_workers=max(1, cfg.data.num_workers // 2),
+        num_workers=val_workers,
         pin_memory=cfg.data.pin_memory,
     )
 
@@ -301,6 +306,10 @@ def main() -> None:
     print("[train] starting", flush=True)
     t0 = time.time()
     train_iter = iter(train_dl)
+    pbar = tqdm(
+        total=cfg.optim.max_steps, initial=step,
+        desc="train", dynamic_ncols=True,
+    )
     while step < cfg.optim.max_steps:
         try:
             batch = next(train_iter)
@@ -337,6 +346,15 @@ def main() -> None:
             g["lr"] = lr
         opt.step(); opt.zero_grad()
 
+        pbar.set_postfix(
+            loss=f"{float(loss_dict['loss'].item()):.3e}",
+            mse=f"{float(loss_dict['mse'].item()):.2e}",
+            kl=f"{float(loss_dict['kl'].item()):.2e}",
+            bce=f"{float(loss_dict['bce'].item()):.2e}",
+            lr=f"{lr:.1e}",
+            refresh=False,
+        )
+
         if step % cfg.log.log_every == 0 and wandb is not None:
             payload = {f"train/{k}": float(loss_dict[k].item()) for k in log_keys}
             payload["lr"] = lr
@@ -346,10 +364,9 @@ def main() -> None:
             wandb.log(payload, step=step)
             t0 = time.time()
         elif step % cfg.log.log_every == 0:
-            print(
+            pbar.write(
                 f"[train] step={step:6d} lr={lr:.2e} "
                 + " ".join(f"{k}={float(loss_dict[k].item()):.4e}" for k in log_keys),
-                flush=True,
             )
 
         if step > 0 and step % cfg.log.val_every == 0:
@@ -366,7 +383,7 @@ def main() -> None:
                 wandb.log({f"val/{k}": v for k, v in val_metrics.items()},
                           step=step)
             else:
-                print(f"[val ] step={step:6d} {val_metrics}", flush=True)
+                pbar.write(f"[val ] step={step:6d} {val_metrics}")
 
         if (step > 0 and cfg.log.gsm8k_every > 0
                 and step % cfg.log.gsm8k_every == 0):
@@ -382,15 +399,16 @@ def main() -> None:
                     wandb.log({f"gsm8k/{k}": v for k, v in gsm.items()},
                               step=step)
             except Exception as e:
-                print(f"[gsm8k] mid-train eval failed (continuing): {e}",
-                      flush=True)
+                pbar.write(f"[gsm8k] mid-train eval failed (continuing): {e}")
 
         if step > 0 and step % cfg.checkpoint.every == 0:
             path = _ckpt_save(model, opt, step, cfg, out_dir=ckpt_dir)
-            print(f"[ckpt] {path}", flush=True)
+            pbar.write(f"[ckpt] {path}")
 
         step += 1
+        pbar.update(1)
 
+    pbar.close()
     final = _ckpt_save(model, opt, step, cfg, out_dir=ckpt_dir)
     print(f"[train] done. final ckpt: {final}", flush=True)
 
