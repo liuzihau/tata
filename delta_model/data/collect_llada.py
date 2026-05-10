@@ -336,11 +336,16 @@ def collect_one_sample(
                     # 0 instead of `s`. That silently corrupts every
                     # `h_per_pass[i ≥ 1]` we record. Verified by
                     # `delta_model/sanity/test_partial_full_forward_equivalence.py`.
+                    #
+                    # The outer `LLaDAModelLM.forward()` doesn't accept
+                    # `position_ids` (Fast-dLLM v1's wrapper signature),
+                    # so we go one level down to the inner LLaDAModel which
+                    # does. It returns the same `.logits` we need here.
                     position_ids = torch.arange(
                         s, x.shape[1], device=x.device,
                     ).unsqueeze(0)
-                    out = model(
-                        x[:, s:],
+                    out = model.model(
+                        input_ids=x[:, s:],
                         past_key_values=past_key_values,
                         use_cache=True,
                         position_ids=position_ids,

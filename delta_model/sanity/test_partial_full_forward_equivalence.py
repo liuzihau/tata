@@ -156,14 +156,15 @@ def main() -> None:
         h_b1_seq = capture["latest"]
         h_b1_block = h_b1_seq[:, :BL, :].clone()
 
-        # ---- Path B2: partial forward WITH explicit position_ids. This
-        # mirrors the post-§3.1 fix in collect_llada.py:332.
+        # ---- Path B2: partial forward WITH explicit position_ids. The outer
+        # `LLaDAModelLM` doesn't accept `position_ids`, so we go one level
+        # down to `model.model` (the inner LLaDAModel), which does.
         position_ids = torch.arange(
             s, x.shape[1], device=device,
         ).unsqueeze(0)
         capture["latest"] = None
-        _ = model(
-            x[:, s:], past_key_values=past_to_s, use_cache=True,
+        _ = model.model(
+            input_ids=x[:, s:], past_key_values=past_to_s, use_cache=True,
             position_ids=position_ids,
         )
         h_b2_seq = capture["latest"]
