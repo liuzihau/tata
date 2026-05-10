@@ -107,18 +107,40 @@ def main() -> None:
         _print_source(type(block).forward,
                       f"{type(block).__name__}.forward", max_lines=200)
 
-    # ----- 5. Modeling file path -----
+        # 4b. Attention sub-module (where RoPE is actually called).
+        attn = getattr(block, "attention", None)
+        if attn is not None:
+            print(f"\n[inspect] attention class: {type(attn).__name__}")
+            _print_source(type(attn).forward,
+                          f"{type(attn).__name__}.forward", max_lines=200)
+
+    # ----- 5. Modeling file path + targeted greps -----
     print("\n=== modeling file path ===")
+    modeling_path: Path | None = None
     try:
-        path = Path(inspect.getfile(type(model)))
-        print(path)
-        print(f"size: {path.stat().st_size} bytes")
+        modeling_path = Path(inspect.getfile(type(model)))
+        print(modeling_path)
+        print(f"size: {modeling_path.stat().st_size} bytes")
     except (TypeError, OSError) as e:
         print(f"  could not locate: {e}")
 
-    # ----- 6. Useful greps the user can run on the modeling file -----
-    print("\n=== suggested follow-up greps (run on the modeling file path above) ===")
-    print("grep -n 'past_key_values\\|past_length\\|layer_past\\|position_ids\\|cache_position\\|key_len\\|query_len' <modeling_file>")
+    if modeling_path is not None and modeling_path.exists():
+        print("\n=== grep results: where the RoPE/cache plumbing happens ===")
+        text = modeling_path.read_text(encoding="utf-8", errors="replace")
+        keywords = [
+            "block_end_index",      # the RoPE kwarg we discovered
+            "replace_position",     # the model-level kwarg discovered in forward signatures
+            "self.rotary_emb",      # callers of RoPE
+            "rotary_emb(",
+            "past_key_values",
+            "past_length",
+            "layer_past",
+        ]
+        for kw in keywords:
+            print(f"\n--- {kw!r} ---")
+            for i, line in enumerate(text.splitlines(), start=1):
+                if kw in line:
+                    print(f"  {i:5d}: {line.rstrip()}")
 
 
 if __name__ == "__main__":
