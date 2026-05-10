@@ -27,6 +27,10 @@ import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 
+# Avoid /dev/shm bus errors on shared HPC nodes: route DataLoader worker
+# tensors through the file-system strategy instead of SysV shared memory.
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 from .data import schema as S
 from .data.dataset import (
     TataDeltaDataset,
