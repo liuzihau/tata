@@ -230,17 +230,13 @@ def collect_one_sample(
     x[:, :prompt_len] = prompt_ids
 
     # --- Hook to capture last-block (= last-layer pre-norm) hidden states ---
-    hook_state = {"latest": None, "pass_idx": 0, "s": 0, "e": 0}
+    # We always do a full forward (see iter ≥ 1 branch below), so the hook
+    # always slices the block region [s:e] from the full-sequence output.
+    hook_state = {"latest": None, "s": 0, "e": 0}
 
     def _last_block_hook(module, inputs, output):
-        h = output[0] if isinstance(output, tuple) else output  # [1, T, d_model]
-        if hook_state["pass_idx"] == 0:
-            # Full forward over the whole sequence.
-            slice_h = h[:, hook_state["s"]:hook_state["e"], :]
-        else:
-            # Forward over x[:, current_block_start:] — block region is the
-            # first `block_length` of it.
-            slice_h = h[:, :block_length, :]
+        h = output[0] if isinstance(output, tuple) else output  # [1, seq_len, d_model]
+        slice_h = h[:, hook_state["s"]:hook_state["e"], :]
         hook_state["latest"] = (
             slice_h.detach().to("cpu", dtype=S.DTYPE_HIDDEN, copy=True).squeeze(0)
         )
@@ -283,98 +279,68 @@ def collect_one_sample(
                     )
                     reveal_per_pass.append(pre_reveal)
 
-                hook_state["pass_idx"] = i
                 hook_state["s"] = s
                 hook_state["e"] = e
 
+                # §3.1 — full-forward at every iter.
+                #
+                # Why not the partial-forward optimization?
+                # The pre-§3.1 path (forward `x[:, s:]` with `past_key_values`
+                # sliced to `[:s]`) silently rotated new K at positions
+                # `[0, new_len)` instead of `[s, s+new_len)`. We tried
+                # Fast-dLLM v1's intended `replace_position` API as a fix —
+                # both paths were verified to diverge from a full forward by
+                # max abs ~6–8 (1.8–2.4% relative) on T4
+                # (`delta_model/sanity/test_partial_full_forward_equivalence.py`).
+                # The most likely reason is that LLaDA's attention bias /
+                # position handling assumes new tokens are at the tail of the
+                # sequence, which is incompatible with mid-sequence block
+                # decoding. Rather than monkey-patch the modeling code, we
+                # use a full forward at every iter — guaranteed correct, ~30%
+                # slower at collect time.
+                #
+                # `use_cache=True` is needed at iter 0 only, to extract the
+                # last-32 prefix KV for the delta model's cross-attn input.
                 if i == 0:
                     out = model(x, use_cache=True)
-                    # KEEP past_key_values FULL-LENGTH. Pre-§3.1 we sliced it
-                    # to [:s] and then called partial forward without explicit
-                    # position info, which silently rotated new K at the wrong
-                    # absolute positions (verified in T4). Fast-dLLM's intended
-                    # API for partial decoding is `replace_position` against a
-                    # full-length cache (see iter ≥ 1 branch below).
                     past_key_values = out.past_key_values
-                    logits = out.logits
 
-                    # Capture last-32 prefix KV from the last layer at the
-                    # block-prefix positions [s-32, s). Cache stores K/V
-                    # *unrotated* (`present` is captured before RoPE in
-                    # Fast-dLLM's attention), so this is the same content the
-                    # delta model's prefix_kv input expects.
+                    # Capture last-32 prefix KV from the last layer at
+                    # positions [s-32, s). Cache stores K/V *unrotated*
+                    # (`present` is captured before RoPE in attention), so
+                    # this is the right content for variantc's cross-attn
+                    # K/V passthrough (which expects backbone-RoPE'd K — see
+                    # §1.5 in improvements.md).
                     last_K = past_key_values[-1][0][0, :, s - S.PREFIX_WINDOW:s, :]
                     last_V = past_key_values[-1][1][0, :, s - S.PREFIX_WINDOW:s, :]
                     prefix_kv_last32 = torch.stack(
                         [last_K, last_V], dim=0,
                     ).to("cpu", dtype=S.DTYPE_KV, copy=True)
-
-                    # Token transfer for pass 0 (logits cover full seq; restrict
-                    # to current block).
-                    global_mask_index = (x == mask_id)
-                    global_mask_index[:, e:] = False
-                    if factor is not None:
-                        x0, transfer_index = _get_transfer_index_dynamic(
-                            logits, temperature, remasking, global_mask_index, x,
-                            factor=factor,
-                        )
-                    else:
-                        quota = (
-                            None if threshold is not None
-                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
-                        )
-                        x0, transfer_index = _get_transfer_index(
-                            logits, temperature, remasking, global_mask_index, x,
-                            quota, threshold,
-                        )
-                    x = torch.where(transfer_index, x0, x)
-
                 else:
-                    # §3.1 fix: use Fast-dLLM's `replace_position` API for
-                    # partial decoding. Forward ONLY the block tokens (length
-                    # `block_length`) plus a [1, full_len] `replace_position`
-                    # mask marking the absolute slots [s, e). Inside attention,
-                    # this triggers an in-place replacement of past_key/value
-                    # at those slots, then RoPE is called with
-                    # `block_end_index = e` so Q rotates at [e - BL, e) = [s, e)
-                    # and K rotates at [0, full_len) over the unrotated cache.
-                    # Both are the same positions the full forward at pass 0
-                    # used → equivalent hidden states. Verified by T4
-                    # (delta_model/sanity/test_partial_full_forward_equivalence.py).
-                    #
-                    # Side effect: replace_position MUTATES past_key_values in
-                    # place. That's what we want — successive passes within
-                    # this block see the previous pass's updated K/V.
-                    replace_position = torch.zeros(
-                        1, x.shape[1], dtype=torch.long, device=x.device,
-                    )
-                    replace_position[0, s:e] = 1
-                    out = model(
-                        input_ids=x[:, s:e],
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                        replace_position=replace_position,
-                    )
-                    # logits shape: [1, block_length, V] — only the block tokens.
-                    logits = out.logits
+                    out = model(x)
 
-                    mask_index_blk = (x[:, s:e] == mask_id)            # [1, BL]
-                    if factor is not None:
-                        x0_blk, transfer_blk = _get_transfer_index_dynamic(
-                            logits, temperature, remasking, mask_index_blk,
-                            x[:, s:e], factor=factor,
-                        )
-                    else:
-                        quota = (
-                            None if threshold is not None
-                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
-                        )
-                        x0_blk, transfer_blk = _get_transfer_index(
-                            logits, temperature, remasking, mask_index_blk,
-                            x[:, s:e], quota, threshold,
-                        )
-                    new_blk = torch.where(transfer_blk, x0_blk, x[:, s:e])
-                    x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
+                logits = out.logits
+
+                # Token transfer for current block. Logits cover the full
+                # sequence; we restrict transfer to the current block by
+                # zeroing out `global_mask_index` outside [..., e).
+                global_mask_index = (x == mask_id)
+                global_mask_index[:, e:] = False
+                if factor is not None:
+                    x0, transfer_index = _get_transfer_index_dynamic(
+                        logits, temperature, remasking, global_mask_index, x,
+                        factor=factor,
+                    )
+                else:
+                    quota = (
+                        None if threshold is not None
+                        else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                    )
+                    x0, transfer_index = _get_transfer_index(
+                        logits, temperature, remasking, global_mask_index, x,
+                        quota, threshold,
+                    )
+                x = torch.where(transfer_index, x0, x)
 
                 if recorded_passes < max_iter:
                     h_per_pass.append(hook_state["latest"])

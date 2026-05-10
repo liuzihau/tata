@@ -19,40 +19,41 @@ existing cache was built before the fix and is poisoned. **All training
 results to date are uninterpretable.** Sequential recovery plan, ~5–8 h
 total wall time. Run on the cluster, in this order:
 
-### 1. Verify the fix end-to-end (~30 s, GPU + Fast-dLLM)
+### 1. Verify the fix is in place (~30 s, GPU + Fast-dLLM)
 
 ```bash
 python -m delta_model.sanity.test_partial_full_forward_equivalence \
     --fast_dllm_path external/Fast-dLLM/v1
 ```
 
-T4 runs the broken pre-fix path (B1) and the new `replace_position`-based
-path (B3) and compares each to the full forward.
-
-Expected output after the §3.1 fix:
+T4 documents the §3.1 bug by running both partial-forward paths against
+a full forward. **Expected output on this Fast-dLLM v1 build:**
 
 ```
 [sanity] Path B1 — pre-§3.1 collect path (sliced cache, auto-derive RoPE):
-[sanity] ✗ B1 vs A (full): max=6.0e+00 ...   ← still broken (expected; documents the bug)
+[sanity] ✗ B1 vs A (full): max=6.0e+00 ...   ← divergent (expected — documents the bug)
 
 [sanity] Path B3 — replace_position pattern (Fast-dLLM's intended API):
-[sanity] ✓ B3 vs A (full): max=~1e-3 ...     ← fix recovers full-forward equivalence
+[sanity] ✗ B3 vs A (full): max=~8e+00 ...    ← also divergent (expected — Fast-dLLM v1's API doesn't fix mid-sequence decoding)
 
-[sanity] ✓ FIX VERIFIED — the pre-§3.1 path (B1) diverges, but the
-`replace_position` pattern (B3) recovers full-forward equivalence.
+[sanity] ✓ EXPECTED — both partial-forward paths diverge from the full
+forward, consistent with the §3.1 bug in this Fast-dLLM v1 build (LLaDA
+modeling assumes new tokens are at the tail of the sequence). collect_llada.py
+correctly uses a full-forward fallback at every iter, which guarantees
+correctness at the cost of ~30% recollect time.
 ```
 
-If you see this, the fix in `collect_llada.py` is correct — proceed to
-step 2.
+T4 exits 0 in this case — both partial paths failing is the *expected*
+outcome and confirms the modeling bug exists. The actual fix in
+`collect_llada.py` is to do a full forward at every iter (no partial
+forward, no cache reuse beyond pass 0's prefix-KV extraction).
 
-If **B3 also fails**: STOP and report. The `replace_position` API isn't
-behaving as the modeling source suggests it should; we'd investigate
-before sinking 7 hours into a recollect. (Possible follow-ups: re-run
-the inspector for the inner `LLaDAModel.forward` body or the attention
-class to see if cache rotation actually happens elsewhere.)
+If T4 instead reports `⚠ NOTABLE`, it means a future LLaDA upgrade has
+fixed the partial-forward bug. We could re-enable partial forwards for
+faster recollect, but it's optional — the full-forward path keeps working.
 
-If you see `TypeError`: a stale `__pycache__` may be loading the old test
-version. Clear it:
+If you see `TypeError`: a stale `__pycache__` may be loading old code.
+Clear it:
 ```bash
 rm -rf delta_model/sanity/__pycache__ delta_model/data/__pycache__
 ```
@@ -87,7 +88,11 @@ python -m delta_model.sanity.test_collect_roundtrip \
 
 Pass: roundtrip prints `5 OK, 0 bad.`
 
-### 4. Real recollect (~4–7 h on a single A100/H100)
+### 4. Real recollect (~5–9 h on a single A100/H100)
+
+> Slower than the original 4–7 h estimate because the §3.1 fix uses
+> full-forward at every iter instead of the partial-forward optimization.
+> ~30% overhead is the cost of correctness on this LLaDA build.
 
 ```bash
 python -m delta_model.data.collect_llada \

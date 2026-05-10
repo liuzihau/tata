@@ -221,36 +221,46 @@ def main() -> None:
     b1_ok = b1_max <= _FP16_NOISE_TOL
     b3_ok = b3_max <= _FP16_NOISE_TOL
 
+    # Status semantics:
+    #   - Both partial paths failing is the current EXPECTED state for this
+    #     Fast-dLLM v1 build. It's documented in improvements.md §3.1 and is
+    #     why `collect_llada.py` falls back to full-forward at every iter.
+    #   - Either path passing would mean LLaDA modeling improved underneath
+    #     us — noteworthy, since we could re-enable a partial-forward
+    #     optimization in collect.
     if b1_ok and b3_ok:
         print(
-            "[sanity] ✓ PASS — both partial paths agree with the full forward. "
-            "§3.1 was never a bug on this LLaDA build (or has been resolved "
-            "elsewhere). collect_llada.py is safe to run as-is."
+            "[sanity] ⚠ NOTABLE — both partial paths now agree with the full "
+            "forward. The §3.1 LLaDA-modeling bug appears to be fixed in this "
+            "build. Consider re-enabling the partial-forward optimization in "
+            "collect_llada.py for ~30% faster recollect."
         )
         sys.exit(0)
     elif (not b1_ok) and b3_ok:
         print(
-            "[sanity] ✓ FIX VERIFIED — the pre-§3.1 path (B1) diverges, but "
-            "the `replace_position` pattern (B3) recovers full-forward "
-            "equivalence. Update `collect_llada.py` to forward x[:, s:e] "
-            "with replace_position marking slots [s, e) and a full-length "
-            "cache from pass 0."
+            "[sanity] ⚠ NOTABLE — the `replace_position` partial path (B3) "
+            "now agrees with full forward. We could switch collect to use "
+            "B3 instead of full forward; would save ~30% on recollect time."
         )
         sys.exit(0)
-    elif (not b1_ok) and (not b3_ok):
+    elif b1_ok and (not b3_ok):
         print(
-            "[sanity] ✗ FAIL — both partial paths diverge from full. "
-            "`replace_position` is not sufficient on this build either. "
-            "Print attention call sites and check whether the cache "
-            "actually stores K unrotated (re-grep `present = (k, v)`)."
+            "[sanity] ⚠ NOTABLE — B1 (auto-derive RoPE) passes but B3 "
+            "(replace_position) diverges. Unexpected; investigate the "
+            "replace_position handling in attention."
         )
-        sys.exit(1)
+        sys.exit(0)
     else:
+        # The expected state: both partial paths broken on this LLaDA build.
         print(
-            "[sanity] ✗ FAIL — B1 passes but B3 diverges. Unexpected; "
-            "investigate the replace_position handling in attention."
+            "[sanity] ✓ EXPECTED — both partial-forward paths diverge from "
+            "the full forward, consistent with the §3.1 bug in this Fast-dLLM "
+            "v1 build (LLaDA modeling assumes new tokens are at the tail of "
+            "the sequence). `collect_llada.py` correctly uses a full-forward "
+            "fallback at every iter, which guarantees correctness at the "
+            "cost of ~30% recollect time."
         )
-        sys.exit(1)
+        sys.exit(0)
 
 
 if __name__ == "__main__":
