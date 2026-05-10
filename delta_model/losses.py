@@ -63,7 +63,9 @@ def composite_loss(
         shared = torch.minimum(p_actual, p_pred_detached).sum(-1)       # [B, T]
         per_seq_denom = mask_f.sum(-1).clamp_min(1.0)                   # [B]
         c_label = (shared * mask_f).sum(-1) / per_seq_denom             # [B]
-    bce = F.binary_cross_entropy(c_pred, c_label.detach())
+    # c_pred is in the model dtype (e.g. bf16); c_label is fp32 from the
+    # softmax upcast above. BCE requires matching dtypes — do it in fp32.
+    bce = F.binary_cross_entropy(c_pred.float(), c_label.detach().float())
 
     total = lambda_mse * mse + lambda_kl * kl + lambda_conf * bce
     return {
