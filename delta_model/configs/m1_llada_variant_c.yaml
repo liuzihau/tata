@@ -21,9 +21,9 @@ data:
   manifest:        cache_v1/llada/manifest.json
   val_frac:        0.10                        # of the train split → held-out validation
   shuffle_seed:    42
-  num_workers:     4
+  num_workers:     0     # container /dev/shm is 64 MiB — workers SIGBUS; main-proc loader avoids shm entirely
   batch_size:      256
-  pin_memory:      true
+  pin_memory:      false
   mask_token_id:   126336
 
 model:

@@ -16,6 +16,7 @@ Yields tensors that the VariantC model + composite_loss expect:
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -24,6 +25,9 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 
 from . import schema as S
+
+
+_SAMPLE_LRU_MAX = 4  # per-worker cache of loaded sample files
 
 
 class TataDeltaDataset(Dataset):
@@ -56,6 +60,7 @@ class TataDeltaDataset(Dataset):
 
         self.token_embed   = token_embed
         self.mask_token_id = mask_token_id
+        self._sample_cache: "OrderedDict[int, dict]" = OrderedDict()
 
         # Pre-build the (sample, block, i_ref, i_target) flat index.
         # Each sample's manifest tells us n_passes_actual per block; we read
@@ -76,13 +81,25 @@ class TataDeltaDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
+    def _get_sample(self, s_idx: int) -> dict:
+        cache = self._sample_cache
+        if s_idx in cache:
+            cache.move_to_end(s_idx)
+            return cache[s_idx]
+        # No mmap: SIGBUS observed on shared HPC filesystems when many
+        # mappings accumulate in long-lived workers. Full-load is ~16 MiB
+        # per file and the LRU below amortizes repeat hits.
+        sample = torch.load(
+            self.sample_paths[s_idx], map_location="cpu", weights_only=False,
+        )
+        cache[s_idx] = sample
+        if len(cache) > _SAMPLE_LRU_MAX:
+            cache.popitem(last=False)
+        return sample
+
     def __getitem__(self, idx: int) -> dict:
         s_idx, b, i_ref, i_tgt = self.index[idx]
-        # mmap=True keeps memory low when many workers read in parallel.
-        sample = torch.load(
-            self.sample_paths[s_idx], map_location="cpu",
-            mmap=True, weights_only=False,
-        )
+        sample = self._get_sample(s_idx)
         block = sample["blocks"][b]
 
         h_ref    = block["h_per_pass"][i_ref].to(torch.float32)        # [32, d]
@@ -104,7 +121,7 @@ class TataDeltaDataset(Dataset):
             "h_ref":       h_ref,
             "h_target":    h_target,
             "prev_emb":    prev_emb,
-            "prefix_kv":   prefix_kv.clone(),       # decouple from mmap
+            "prefix_kv":   prefix_kv,
             "mask_tgt":    mask_tgt,
             "i_ref":       i_ref,
             "i_target":    i_tgt,
