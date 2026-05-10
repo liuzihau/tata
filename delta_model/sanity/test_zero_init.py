@@ -33,7 +33,8 @@ def main() -> None:
     d_head = 64
 
     model = VariantC(
-        d_model=d_model, n_heads=4, n_layers=2, d_ff=512,
+        d_model=d_model, n_heads=4, n_layers=2, d_ff_inner=512,
+        max_seq_len=512,
     )
 
     # Stub final_norm + lm_head with random frozen weights.
@@ -48,13 +49,14 @@ def main() -> None:
     prefix_kv = torch.randn(B, 2, n_kv_heads, S.PREFIX_WINDOW, d_head,
                               dtype=torch.float16)
 
-    # Force d_model alignment: VariantC._pack_prefix_kv expects
-    # n_kv_heads * d_head == d_model.
+    # n_kv_heads * d_head must equal d_model so prefix_kv K/V flow into
+    # cross-attn directly without reshaping.
     assert n_kv_heads * d_head == d_model, "test config: kv_heads*d_head must equal d_model"
 
     mask_tgt = torch.ones(B, S.BLOCK_LENGTH, dtype=torch.bool)
+    block_start_pos = torch.tensor([64, 96], dtype=torch.long)  # arbitrary in-range positions
 
-    delta_h, c_pred = model(h_ref, prev_emb, prefix_kv)
+    delta_h, c_pred = model(h_ref, prev_emb, prefix_kv, block_start_pos)
     print(f"delta_h.abs().max() = {delta_h.abs().max().item():.6e}")
     assert delta_h.abs().max().item() == 0.0, "Δh head not zero-initialized"
 

@@ -10,6 +10,22 @@ sibling `peft_project/` tree. The only external code dependency is
 
 ---
 
+## Picking up after the §1 model+IO refactor
+
+If you've just landed §1.1–§1.6 from `improvements.md`, here's what's
+required vs. optional before the next training run:
+
+| | required? | command |
+|---|---|---|
+| **Re-collect data** | **No** — the on-disk cache schema is unchanged. Existing `cache_v1/llada/{train,test}/sample_*.pt` works as-is. | (skip) |
+| **Re-run zero-init sanity** | **Yes** — exercises the new RoPE / RMSNorm / SwiGLU / `block_start_pos` plumbing. | `python -m delta_model.sanity.test_zero_init` |
+| **Discard old checkpoints** | **Yes** — VariantC's state_dict shape changed (RMSNorm keys, SwiGLU keys, dropped `pos_emb` / `prefix_proj`). Don't `--resume_from` an M1-pre-§1.5 ckpt. | (delete or move aside) |
+| **Repack into shards** | Optional — only worth it if the `[time]` line shows `data` dominates. | `python -m delta_model.data.repack --cache_root cache_v1/llada` |
+| **Update config** | Already done in this repo: `d_ff: 16384` → `d_ff_inner: 10944`. | (none) |
+| **Audit collect for §3.1** | Recommended before trusting any e2e number. Verify the partial-forward `position_ids` (see `improvements.md` §3.1). If broken → re-collect. | (separate check) |
+
+---
+
 ## The cwd convention (read this first)
 
 All commands below assume your working directory is **the root of
@@ -39,6 +55,7 @@ the cwd. If you want to run from a different cwd, do
 | 2. Zero-init sanity | no | no | no | ~5 s |
 | 3. Smoke test (built-in prompts) | **yes** | no | **yes** | ~2-5 min |
 | 4. Real collect (Nemotron) | **yes** | **yes** | **yes** | 4-7 h |
+| 4b. Shard repack (optional) | no | no | no | ~5 min |
 | 5. Train | **yes** | no | **yes**¹ | 3-4 h |
 | 6. Eval | **yes** | no | **yes** | depends on N |
 
@@ -113,6 +130,7 @@ python3 -m py_compile \
     delta_model/data/schema.py \
     delta_model/data/collect_llada.py \
     delta_model/data/dataset.py \
+    delta_model/data/repack.py \
     delta_model/llada_runtime.py \
     delta_model/models/heads.py \
     delta_model/models/variant_c.py \
@@ -130,15 +148,24 @@ Pass criterion: prints `OK` (no syntax errors).
 
 ### 2) Zero-init sanity (CPU-only, no Fast-dLLM, no LLaDA)
 
-Confirms the model + loss invariants before sinking any GPU time.
+Confirms the model + loss invariants before sinking any GPU time. Also
+exercises the §1.5/§1.6 plumbing: RoPE on absolute positions, RMSNorm,
+SwiGLU FFN, and the new `block_start_pos` argument.
 
 ```bash
 python -m delta_model.sanity.test_zero_init
 ```
 
-Pass criterion: prints `✓ zero-init sanity passed`. The MSE term must
-equal `((h_target - h_ref) ** 2).mean()` exactly (the "h_ref reuse"
-baseline) and KL must be ≥ 0.
+Pass criteria:
+- prints `delta_h.abs().max() = 0.000000e+00` (Δh head is still zero-init).
+- prints `✓ zero-init sanity passed`.
+- The MSE term must equal `((h_target - h_ref) ** 2).mean()` exactly
+  (the "h_ref reuse" baseline) and KL must be ≥ 0.
+
+If this fails after the §1.5/§1.6 refactor, the most likely culprits
+are: RoPE buffer dtype getting downcast (we recompute fp32 on the fly to
+avoid this), `block_start_pos` shape mismatch, or `_split_prefix_kv`
+expecting `n_kv_heads * d_head == d_model`.
 
 ### 3) Smoke test (GPU + Fast-dLLM, no HF login)
 
@@ -209,6 +236,50 @@ Optional knobs:
 
 Storage: ~80 GB at default 5800 samples (5000 train + 800 test).
 
+### 4b) Shard repack — optional, cuts data-loader latency
+
+Run this only if the `[time] step=…` line printed during training shows
+`data` dominating (typically >50%). Per-sample mode reads one ~16 MiB
+.pt per `__getitem__` LRU miss; sharding into ~50 samples per file lets
+a 4-shard LRU keep ~200 samples (24K indices) hot in RAM.
+
+```bash
+python -m delta_model.data.repack \
+    --cache_root cache_v1/llada \
+    --shard_size 50 \
+    --output_subdir shards
+```
+
+Outputs:
+- `cache_v1/llada/shards/{train,test}/shard_NNNNN.pt` — packed shards.
+- `cache_v1/llada/shards_manifest.json` — index the dataset uses to
+  discover shards. The dataset auto-detects this file at startup and
+  switches to shard mode (no code change needed). Delete the manifest
+  to revert to per-sample mode.
+
+Non-destructive: the original per-sample files are kept. Shard build is
+single-pass, ~5 min on a fast disk.
+
+Verify after repack (no GPU needed):
+
+```bash
+python -c "
+import json, torch
+m = json.load(open('cache_v1/llada/shards_manifest.json'))
+print(f'{len(m[\"shards\"])} shards, sizes:',
+      sorted({r[\"n_samples\"] for r in m[\"shards\"]}))
+s = torch.load(sorted(__import__('glob').glob('cache_v1/llada/shards/train/shard_*.pt'))[0],
+               weights_only=False)
+print('shard_meta:', s['shard_meta'])
+print('samples in first shard:', len(s['samples']))
+print('first sample keys:', list(s['samples'][0].keys()))
+"
+```
+
+Expect: shard count ≈ ceil(N_samples / shard_size), `n_samples` mostly
+== shard_size with one tail shard ≤ shard_size, and per-sample keys
+matching the un-sharded format.
+
 ### 5) Train (GPU, ~3 h on A100/H100 for 20k steps)
 
 ```bash
@@ -238,6 +309,11 @@ python -m delta_model.train \
     --resume_from ckpts/m1_llada_variant_c/step_0010000.pt
 ```
 
+> ⚠️ **After §1.5 + §1.6**: VariantC's state_dict shape changed (RMSNorm
+> keys, SwiGLU keys, dropped `pos_emb` / `prefix_proj`, added RoPE
+> module). Pre-§1.5 checkpoints WILL NOT load. Start a fresh run and
+> only resume from checkpoints saved on or after the refactor.
+
 What to watch in wandb (project `tata-delta-model`, group `M1-llada`):
 - `train/loss` decreasing from step 0 onward.
 - `train/c_label_mean` rising from ~0.5 baseline toward 0.9+ as the
@@ -245,6 +321,19 @@ What to watch in wandb (project `tata-delta-model`, group `M1-llada`):
 - `val/mse_by_gap_{1..5}` — gap=1 should be much lower than gap=5.
 - `gsm8k/accuracy_delta` — held-out subset every `gsm8k_every` steps;
   target by step 20000 is within 5pp of vanilla baseline.
+
+Per-step timing breakdown is also printed every `log_every` step:
+
+```
+[time] step=  500 data:120.4ms(80%) fwd: 12.3ms( 8%) bwd: 8.5ms( 5%) loss: 5.2ms( 3%) h2d: 3.1ms( 2%) opt: 1.8ms( 1%)
+```
+
+Sections: `data` (loader/disk), `h2d` (host→device + GPU embed lookup),
+`fwd` (variantc forward), `loss` (composite_loss), `bwd` (backward +
+grad clip), `opt` (lr update + optimizer step), and `val` when
+validation runs. Numbers are CUDA-synced means since the previous
+`[time]` line. If `data` dominates → run §4b (shard repack) and/or get
+`/dev/shm` raised so workers can come back (see `improvements.md` §2.1).
 
 Halt criteria (from `implementation_plan.md` §12):
 - Step 5000: GSM8K subset accuracy ≥ 0.5 × vanilla. Below 0.3 →
@@ -318,10 +407,27 @@ thing, but couldn't verify without GPU access. Check on first run.
    it preserves the boundary-bump quirk at `top_i ∈ {0, M-1}` so
    committed-token counts match the reference impl.
 
-4. **`prefix_proj` dim assumption.** `delta_model/models/variant_c.py`
-   assumes `n_kv_heads * d_head == d_model`. True for LLaDA (no GQA).
-   Dream (GQA factor 8) needs a small change to expand the KV bank
-   or project from a different size; flagged for M3.
+4. **Cross-attn head shapes.** `delta_model/models/variant_c.py` now
+   passes `prefix_kv` K/V directly into cross-attn (no re-projection,
+   no re-rotation — see §1.5). This requires `n_kv_heads * d_head == d_model`,
+   which holds for LLaDA (no GQA). Dream (GQA factor 8) would need to
+   either expand the KV bank or add a `kv_proj` before cross-attn;
+   flagged for M3.
+
+5. **RoPE theta surfaced from config.** `_load_backbone_components`
+   reads `model.config.rope_theta` and `model.config.layer_norm_eps`
+   off the loaded LLaDA and forwards them into VariantC. Look for the
+   `[train] backbone hyperparams: {…}` line at startup; if it prints
+   defaults (`rope_theta=1e6`, `rms_eps=1e-5`) instead of LLaDA's
+   actual values, the wrapper class doesn't expose those attrs and
+   needs adjusting.
+
+6. **`block_start_pos` dataset field.** `dataset.py:__getitem__`
+   computes `block_start_pos = sample["prompt_len"] + b * BLOCK_LENGTH`.
+   This depends on the cache having `prompt_len` recorded per sample
+   (which `collect_llada` does). If you're feeding a custom dataset
+   without `prompt_len`, you'll need to compute it some other way or
+   patch the dataset.
 
 ---
 
@@ -331,13 +437,15 @@ thing, but couldn't verify without GPU access. Check on first run.
 tata/
   scoping.md                                 — design + locked decisions
   implementation_plan.md                     — file layout, shapes, M2 hooks
+  improvements.md                            — perf / correctness / data-collection backlog
   usage.md                                   — this file
   delta_model/                               — the importable package
     llada_runtime.py                         — LLaDA + Fast-dLLM helpers (self-contained)
     data/
       schema.py                              — constants used everywhere
-      collect_llada.py                       — cache builder
-      dataset.py                             — TataDeltaDataset
+      collect_llada.py                       — cache builder (per-sample .pt files)
+      dataset.py                             — TataDeltaDataset (per-sample OR shard mode)
+      repack.py                              — converts per-sample .pt → multi-sample shards (§1.4)
       sample_prompts.txt                     — built-in smoke-test prompts
     models/
       heads.py                               — Δh head (zero-init), conf head
@@ -370,6 +478,10 @@ tata/
 | OOM during collect | LLaDA + cache snapshots peak | reduce concurrent samples / restart, or rebuild with a more-aggressive decoding setting (`--factor 1.5` or `--threshold 0.85`) so blocks finish in fewer passes |
 | Eval and collect disagree on `n_passes_actual` distribution | train/eval decoding-mode mismatch | check `manifest.json` → `decoding`. Cache must be rebuilt with the same mode (`factor` or `threshold`) that eval will use |
 | GSM8K mid-train eval fails | usually a rollback path bug under bf16 dtype mismatch | logged + skipped (training continues), check the printed traceback in the run log |
+| `RuntimeError: Error(s) in loading state_dict for VariantC: Missing key(s) in state_dict: ".../weight"` | resuming a pre-§1.5 checkpoint into the new architecture | start fresh; the model definition changed (RMSNorm + SwiGLU + RoPE) and old shapes don't fit |
+| `KeyError: 'block_start_pos'` in train loop | dataset built before §1.5 (cached `__pycache__`) | clear `delta_model/data/__pycache__/` and re-run |
+| `[time]` shows `data:>50%` consistently | per-sample I/O is the bottleneck | run §4b shard repack, and/or get `/dev/shm` bumped so workers can prefetch (see `improvements.md` §2.1) |
+| Bus error in DataLoader after running fine for many steps | cluster `/dev/shm` is too small for any worker IPC at all | already fixed by `num_workers: 0` in the default config; if you flipped it back without a shm bump, revert |
 
 ## Cleanup / partial-data scenarios
 

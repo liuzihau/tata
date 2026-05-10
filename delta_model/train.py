@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,49 @@ from .data.dataset import (
 )
 from .losses import composite_loss
 from .models.variant_c import VariantC
+
+
+# ---------------------------------------------------------------------------
+# Wallclock timers (debug / bottleneck hunting)
+# ---------------------------------------------------------------------------
+
+class StepTimers:
+    """Cumulative section timers with CUDA-sync correctness.
+
+    Use the `time(tag)` contextmanager to wrap a code section. Call
+    `summary_and_reset()` periodically to get a one-line breakdown and
+    zero out the accumulators.
+    """
+
+    def __init__(self, sync_cuda: bool = True):
+        self.acc: dict[str, float] = defaultdict(float)
+        self.cnt: dict[str, int] = defaultdict(int)
+        self.sync_cuda = sync_cuda and torch.cuda.is_available()
+
+    @contextmanager
+    def time(self, tag: str):
+        if self.sync_cuda:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self.sync_cuda:
+                torch.cuda.synchronize()
+            self.acc[tag] += time.perf_counter() - t0
+            self.cnt[tag] += 1
+
+    def summary_and_reset(self) -> str:
+        total = sum(self.acc.values()) or 1e-9
+        order = sorted(self.acc.items(), key=lambda kv: -kv[1])
+        parts = []
+        for k, v in order:
+            mean_ms = 1000.0 * v / max(1, self.cnt[k])
+            pct     = 100.0 * v / total
+            parts.append(f"{k}:{mean_ms:5.1f}ms({pct:2.0f}%)")
+        out = " ".join(parts)
+        self.acc.clear(); self.cnt.clear()
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +121,16 @@ def _load_config(path: str, overrides: list[str]) -> _Cfg:
 # Backbone components
 # ---------------------------------------------------------------------------
 
-def _load_backbone_components(model_type: str, fast_dllm_path: str | None
-                               ) -> tuple[nn.Embedding, nn.Module, nn.Linear]:
-    """Returns (token_embed, final_norm, lm_head) — all frozen, on CUDA."""
+def _load_backbone_components(
+    model_type: str, fast_dllm_path: str | None,
+    *, device: torch.device | str, dtype: torch.dtype,
+) -> tuple[nn.Embedding, nn.Module, nn.Linear]:
+    """Returns (token_embed, final_norm, lm_head) — all frozen, on `device`.
+
+    Token embed is now GPU-resident (the dataset no longer needs it; lookups
+    happen once per batch on GPU in the train/val loop). Held in `dtype`
+    (typically bf16) to save VRAM.
+    """
     if model_type == "llada":
         from .llada_runtime import load_llada
         model, _tok = load_llada(fast_dllm_path=fast_dllm_path)
@@ -91,23 +142,34 @@ def _load_backbone_components(model_type: str, fast_dllm_path: str | None
     #   model.model.transformer.ln_f     → final norm
     #   model.model.transformer.ff_out   → lm_head (weight-tied to wte in LLaDA)
     transformer = model.model.transformer
-    token_embed = transformer.wte
-    final_norm  = transformer.ln_f
-    lm_head     = transformer.ff_out  # nn.Linear-like
+    src_token_embed = transformer.wte
+    final_norm     = transformer.ln_f
+    lm_head        = transformer.ff_out  # nn.Linear-like
 
     for p in model.parameters():
         p.requires_grad_(False)
 
-    # Detach a CPU-resident copy of the token embed for dataloader workers
-    # (avoids a CUDA fork-safety footgun and keeps dataloader CPU-only).
-    cpu_embed = nn.Embedding(token_embed.weight.shape[0],
-                              token_embed.weight.shape[1])
-    cpu_embed.weight.data.copy_(token_embed.weight.data.detach().cpu())
-    cpu_embed.weight.requires_grad_(False)
+    # Build a GPU embedding for fast post-batch lookups. Copy weights before
+    # the source `model` falls out of scope and gets GC'd.
+    vocab_size, d_model = src_token_embed.weight.shape
+    token_embed = nn.Embedding(vocab_size, d_model).to(device, dtype=dtype)
+    with torch.no_grad():
+        token_embed.weight.data.copy_(
+            src_token_embed.weight.data.detach().to(device=device, dtype=dtype)
+        )
+    token_embed.weight.requires_grad_(False)
 
-    final_norm = final_norm.cuda()
-    lm_head    = lm_head.cuda()
-    return cpu_embed, final_norm, lm_head
+    final_norm = final_norm.to(device)
+    lm_head    = lm_head.to(device)
+
+    # Surface backbone hyperparams that variantc needs to stay in the same
+    # numerical regime (RoPE theta, RMSNorm eps, max position).
+    bb_cfg = {
+        "rope_theta":     float(getattr(model.config, "rope_theta", 1e6)),
+        "rms_eps":        float(getattr(model.config, "layer_norm_eps", 1e-5)),
+        "max_seq_len":    int(getattr(model.config, "max_sequence_length", 8192)),
+    }
+    return token_embed, final_norm, lm_head, bb_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +193,9 @@ def _lr_schedule(step: int, *, warmup: int, total: int, base_lr: float,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def run_val(model, val_dl, final_norm, lm_head, *, lambda_mse, lambda_kl,
-            lambda_conf, bins_gap, bins_reveal, max_batches: int = 50,
+def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
+            lambda_mse, lambda_kl, lambda_conf, bins_gap, bins_reveal,
+            max_batches: int = 50,
             device="cuda", dtype=torch.bfloat16) -> dict:
     """Compute val loss components + per-bin breakdowns."""
     model.eval()
@@ -149,8 +212,10 @@ def run_val(model, val_dl, final_norm, lm_head, *, lambda_mse, lambda_kl,
             else (v.to(device) if isinstance(v, torch.Tensor) else v)
             for k, v in batch.items()
         }
+        prev_emb = token_embed(batch_dev["substituted_ids"])
         delta_h, c_pred = model(
-            batch_dev["h_ref"], batch_dev["prev_emb"], batch_dev["prefix_kv"],
+            batch_dev["h_ref"], prev_emb, batch_dev["prefix_kv"],
+            batch_dev["block_start_pos"],
         )
         loss_dict = composite_loss(
             delta_h, c_pred,
@@ -245,20 +310,22 @@ def main() -> None:
               "fp32": torch.float32}[cfg.optim.precision]
 
     print("[train] loading backbone components …", flush=True)
-    token_embed, final_norm, lm_head = _load_backbone_components(
+    token_embed, final_norm, lm_head, bb_cfg = _load_backbone_components(
         cfg.backbone.model, cfg.backbone.fast_dllm_path,
+        device=device, dtype=dtype,
     )
+    print(f"[train] backbone hyperparams: {bb_cfg}", flush=True)
 
     print("[train] building Datasets …", flush=True)
     train_filter, val_filter = make_train_val_filter(
         cfg.data.val_frac, seed=cfg.data.shuffle_seed,
     )
     train_ds = TataDeltaDataset(
-        cfg.data.cache_root, token_embed, split="train",
+        cfg.data.cache_root, split="train",
         mask_token_id=cfg.data.mask_token_id, index_filter=train_filter,
     )
     val_ds = TataDeltaDataset(
-        cfg.data.cache_root, token_embed, split="train",
+        cfg.data.cache_root, split="train",
         mask_token_id=cfg.data.mask_token_id, index_filter=val_filter,
     )
     print(f"[train] train pairs={len(train_ds)}  val pairs={len(val_ds)}",
@@ -282,8 +349,12 @@ def main() -> None:
     print("[train] building model …", flush=True)
     model = VariantC(
         d_model=cfg.model.d_model, n_heads=cfg.model.n_heads,
-        n_layers=cfg.model.n_layers, d_ff=cfg.model.d_ff,
+        n_layers=cfg.model.n_layers,
+        d_ff_inner=getattr(cfg.model, "d_ff_inner", None),
         dropout=cfg.model.dropout,
+        rope_theta=bb_cfg["rope_theta"],
+        rms_eps=bb_cfg["rms_eps"],
+        max_seq_len=bb_cfg["max_seq_len"],
     ).to(device, dtype=dtype)
 
     opt = torch.optim.AdamW(
@@ -306,45 +377,58 @@ def main() -> None:
     print("[train] starting", flush=True)
     t0 = time.time()
     train_iter = iter(train_dl)
+    timers = StepTimers()
     pbar = tqdm(
         total=cfg.optim.max_steps, initial=step,
         desc="train", dynamic_ncols=True,
     )
     while step < cfg.optim.max_steps:
-        try:
-            batch = next(train_iter)
-        except StopIteration:
-            train_iter = iter(train_dl)
-            batch = next(train_iter)
+        with timers.time("data"):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_dl)
+                batch = next(train_iter)
 
-        batch_dev = {
-            k: v.to(device, dtype=dtype) if isinstance(v, torch.Tensor)
-                                            and v.dtype.is_floating_point
-            else (v.to(device) if isinstance(v, torch.Tensor) else v)
-            for k, v in batch.items()
-        }
-        delta_h, c_pred = model(
-            batch_dev["h_ref"], batch_dev["prev_emb"], batch_dev["prefix_kv"],
-        )
-        loss_dict = composite_loss(
-            delta_h, c_pred,
-            batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
-            final_norm, lm_head,
-            lambda_mse=cfg.loss.lambda_mse,
-            lambda_kl=cfg.loss.lambda_kl,
-            lambda_conf=cfg.loss.lambda_conf,
-        )
-        loss_dict["loss"].backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
+        with timers.time("h2d"):
+            batch_dev = {
+                k: v.to(device, dtype=dtype) if isinstance(v, torch.Tensor)
+                                                and v.dtype.is_floating_point
+                else (v.to(device) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items()
+            }
+            with torch.no_grad():
+                prev_emb = token_embed(batch_dev["substituted_ids"])
 
-        lr = _lr_schedule(
-            step, warmup=cfg.optim.warmup_steps,
-            total=cfg.optim.max_steps, base_lr=cfg.optim.lr,
-            kind=cfg.optim.scheduler,
-        )
-        for g in opt.param_groups:
-            g["lr"] = lr
-        opt.step(); opt.zero_grad()
+        with timers.time("fwd"):
+            delta_h, c_pred = model(
+                batch_dev["h_ref"], prev_emb, batch_dev["prefix_kv"],
+                batch_dev["block_start_pos"],
+            )
+
+        with timers.time("loss"):
+            loss_dict = composite_loss(
+                delta_h, c_pred,
+                batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
+                final_norm, lm_head,
+                lambda_mse=cfg.loss.lambda_mse,
+                lambda_kl=cfg.loss.lambda_kl,
+                lambda_conf=cfg.loss.lambda_conf,
+            )
+
+        with timers.time("bwd"):
+            loss_dict["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.optim.grad_clip)
+
+        with timers.time("opt"):
+            lr = _lr_schedule(
+                step, warmup=cfg.optim.warmup_steps,
+                total=cfg.optim.max_steps, base_lr=cfg.optim.lr,
+                kind=cfg.optim.scheduler,
+            )
+            for g in opt.param_groups:
+                g["lr"] = lr
+            opt.step(); opt.zero_grad()
 
         pbar.set_postfix(
             loss=f"{float(loss_dict['loss'].item()):.3e}",
@@ -363,22 +447,25 @@ def main() -> None:
             )
             wandb.log(payload, step=step)
             t0 = time.time()
+            pbar.write(f"[time] step={step:6d} {timers.summary_and_reset()}")
         elif step % cfg.log.log_every == 0:
             pbar.write(
                 f"[train] step={step:6d} lr={lr:.2e} "
                 + " ".join(f"{k}={float(loss_dict[k].item()):.4e}" for k in log_keys),
             )
+            pbar.write(f"[time] step={step:6d} {timers.summary_and_reset()}")
 
         if step > 0 and step % cfg.log.val_every == 0:
-            val_metrics = run_val(
-                model, val_dl, final_norm, lm_head,
-                lambda_mse=cfg.loss.lambda_mse,
-                lambda_kl=cfg.loss.lambda_kl,
-                lambda_conf=cfg.loss.lambda_conf,
-                bins_gap=cfg.log.bins_gap,
-                bins_reveal=cfg.log.bins_reveal,
-                device=device, dtype=dtype,
-            )
+            with timers.time("val"):
+                val_metrics = run_val(
+                    model, val_dl, token_embed, final_norm, lm_head,
+                    lambda_mse=cfg.loss.lambda_mse,
+                    lambda_kl=cfg.loss.lambda_kl,
+                    lambda_conf=cfg.loss.lambda_conf,
+                    bins_gap=cfg.log.bins_gap,
+                    bins_reveal=cfg.log.bins_reveal,
+                    device=device, dtype=dtype,
+                )
             if wandb is not None:
                 wandb.log({f"val/{k}": v for k, v in val_metrics.items()},
                           step=step)

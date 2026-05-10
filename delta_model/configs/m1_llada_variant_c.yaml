@@ -31,7 +31,9 @@ model:
   d_model:         4096
   n_heads:         32
   n_layers:        2
-  d_ff:            16384
+  # SwiGLU FFN inner dim. ≈ 8/3·d_model keeps total FFN params close to
+  # the previous GELU 4·d_model budget. Set to null to auto-pick.
+  d_ff_inner:      10944
   dropout:         0.0
 
 optim:
@@ -46,9 +48,9 @@ optim:
   precision:       bf16                        # bf16 | fp16 | fp32
 
 loss:
-  lambda_mse:      1.0
-  lambda_kl:       0.1
-  lambda_conf:     0.1
+  lambda_mse:      0.1
+  lambda_kl:       1.0
+  lambda_conf:     1.0
 
 log:
   framework:       wandb
