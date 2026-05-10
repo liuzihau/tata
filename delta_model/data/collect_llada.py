@@ -199,7 +199,7 @@ def collect_one_sample(
 ) -> dict | None:
     """Run prefix-cache generation on one prompt and return the cache dict
     described in `data/schema.py`. Returns None if the prompt is too short
-    (< PREFIX_WINDOW tokens) — those samples are dropped.
+    (< COLLECT_PREFIX_WINDOW tokens) — those samples are dropped.
 
     Decoding mode is controlled by exactly one of:
       - `threshold` (float in (0,1]): commit positions with confidence ≥ thr.
@@ -214,8 +214,9 @@ def collect_one_sample(
         )
     prompt_ids = _format_prompt_llada(tokenizer, prompt_text)
     prompt_len = int(prompt_ids.shape[1])
-    if prompt_len < S.PREFIX_WINDOW:
-        # Can't take last-32 of prefix at block 0 if the prompt itself is < 32.
+    if prompt_len < S.COLLECT_PREFIX_WINDOW:
+        # Can't take the last-`COLLECT_PREFIX_WINDOW` prefix slice at block 0
+        # if the prompt itself is shorter than that.
         return None
 
     num_blocks = gen_length // block_length
@@ -311,9 +312,13 @@ def collect_one_sample(
                     # this is the right content for variantc's cross-attn
                     # K/V passthrough (which expects backbone-RoPE'd K — see
                     # §1.5 in improvements.md).
-                    last_K = past_key_values[-1][0][0, :, s - S.PREFIX_WINDOW:s, :]
-                    last_V = past_key_values[-1][1][0, :, s - S.PREFIX_WINDOW:s, :]
-                    prefix_kv_last32 = torch.stack(
+                    # Capture the last COLLECT_PREFIX_WINDOW (64) tokens of
+                    # prefix KV. Training reads only the last `PREFIX_WINDOW`
+                    # (32); the extra is headroom for window-size ablations
+                    # without re-collecting.
+                    last_K = past_key_values[-1][0][0, :, s - S.COLLECT_PREFIX_WINDOW:s, :]
+                    last_V = past_key_values[-1][1][0, :, s - S.COLLECT_PREFIX_WINDOW:s, :]
+                    prefix_kv = torch.stack(
                         [last_K, last_V], dim=0,
                     ).to("cpu", dtype=S.DTYPE_KV, copy=True)
                 else:
@@ -359,9 +364,9 @@ def collect_one_sample(
                 reveal_per_pass.append(reveal_per_pass[-1].clone())
 
             blocks_out.append({
-                "prefix_kv_last32": prefix_kv_last32,                 # [2, n_kv_heads, 32, d_head]
-                "h_per_pass":       torch.stack(h_per_pass, dim=0),    # [MAX_ITER, 32, d_model]
-                "reveal_per_pass":  torch.stack(reveal_per_pass, dim=0),  # [MAX_ITER, 32]
+                "prefix_kv":        prefix_kv,                          # [2, n_kv_heads, COLLECT_PREFIX_WINDOW, d_head]
+                "h_per_pass":       torch.stack(h_per_pass, dim=0),     # [MAX_ITER, 32, d_model]
+                "reveal_per_pass":  torch.stack(reveal_per_pass, dim=0),# [MAX_ITER, 32]
                 "n_passes_actual":  int(n_passes_actual),
             })
 

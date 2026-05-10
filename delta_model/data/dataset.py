@@ -259,7 +259,12 @@ class TataDeltaDataset(Dataset):
         # Stay in fp16 — caller casts to model dtype (bf16) on GPU.
         h_ref      = block["h_per_pass"][i_ref]
         h_target   = block["h_per_pass"][i_tgt]
-        prefix_kv  = block["prefix_kv_last32"]
+        # `prefix_kv` is stored at COLLECT_PREFIX_WINDOW (default 64); slice
+        # down to the last `PREFIX_WINDOW` (32) for what training/inference
+        # actually uses. This lets us keep collect-time headroom without
+        # re-collecting if we later want to ablate larger windows.
+        prefix_kv_full = block["prefix_kv"]                    # [2, KV_H, W, d_head], W ≥ PREFIX_WINDOW
+        prefix_kv      = prefix_kv_full[:, :, -S.PREFIX_WINDOW:, :]   # [2, KV_H, 32, d_head]
         reveal_tgt = block["reveal_per_pass"][i_tgt]
         mask_tgt   = ~reveal_tgt
 

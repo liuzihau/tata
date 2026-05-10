@@ -93,6 +93,13 @@ Pass: roundtrip prints `5 OK, 0 bad.`
 > Slower than the original 4–7 h estimate because the §3.1 fix uses
 > full-forward at every iter instead of the partial-forward optimization.
 > ~30% overhead is the cost of correctness on this LLaDA build.
+>
+> Storage also grew because collect now records a 64-token prefix-KV
+> window (`COLLECT_PREFIX_WINDOW`, see §3.4) instead of 32, so the cache
+> has headroom for future window-size ablations without re-collecting.
+> Per-sample size goes from ~16 MiB to ~20 MiB; total cache ~80 GiB →
+> ~120 GiB at 5000 train + 800 test. Schema version bumps to 2; v1
+> caches will fail T3.
 
 ```bash
 python -m delta_model.data.collect_llada \

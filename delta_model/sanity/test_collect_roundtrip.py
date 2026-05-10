@@ -56,10 +56,10 @@ def check_one(path: Path) -> list[str]:
                 )
 
         # dtype checks
-        if b["prefix_kv_last32"].dtype != S.DTYPE_KV:
+        if b["prefix_kv"].dtype != S.DTYPE_KV:
             errs.append(
-                f"block {b_idx} prefix_kv_last32 dtype "
-                f"{b['prefix_kv_last32'].dtype}, expected {S.DTYPE_KV}"
+                f"block {b_idx} prefix_kv dtype "
+                f"{b['prefix_kv'].dtype}, expected {S.DTYPE_KV}"
             )
         if b["h_per_pass"].dtype != S.DTYPE_HIDDEN:
             errs.append(
