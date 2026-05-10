@@ -20,7 +20,8 @@ required vs. optional before the next training run:
 | **Re-collect data** | **No** — the on-disk cache schema is unchanged. Existing `cache_v1/llada/{train,test}/sample_*.pt` works as-is. | (skip) |
 | **Re-run zero-init sanity** | **Yes** — exercises the new RoPE / RMSNorm / SwiGLU / `block_start_pos` plumbing. | `python -m delta_model.sanity.test_zero_init` |
 | **Discard old checkpoints** | **Yes** — VariantC's state_dict shape changed (RMSNorm keys, SwiGLU keys, dropped `pos_emb` / `prefix_proj`). Don't `--resume_from` an M1-pre-§1.5 ckpt. | (delete or move aside) |
-| **Repack into shards** | Optional — only worth it if the `[time]` line shows `data` dominates. | `python -m delta_model.data.repack --cache_root cache_v1/llada` |
+| **Repack into shards** | Optional — pure shard repack alone does NOT fix random-shuffle data thrash; consider `data.preload: true` (default, see below) instead, or pair shards with a locality-aware sampler. | `python -m delta_model.data.repack --cache_root cache_v1/llada` |
+| **Use `data.preload: true`** | **Yes** — already the default in the config. Loads all samples into RAM at startup; eliminates per-step disk I/O. Needs ~80 GiB RAM at default cache size. Set `data.preload: false` only if RAM-constrained. | (no command — just leave the config alone) |
 | **Update config** | Already done in this repo: `d_ff: 16384` → `d_ff_inner: 10944`. | (none) |
 | **Audit collect for §3.1** | Recommended before trusting any e2e number. Verify the partial-forward `position_ids` (see `improvements.md` §3.1). If broken → re-collect. | (separate check) |
 
@@ -236,12 +237,24 @@ Optional knobs:
 
 Storage: ~80 GB at default 5800 samples (5000 train + 800 test).
 
-### 4b) Shard repack — optional, cuts data-loader latency
+### 4b) Shard repack — usually NOT what you want
 
-Run this only if the `[time] step=…` line printed during training shows
-`data` dominating (typically >50%). Per-sample mode reads one ~16 MiB
-.pt per `__getitem__` LRU miss; sharding into ~50 samples per file lets
-a 4-shard LRU keep ~200 samples (24K indices) hot in RAM.
+Important context first: with `batch_size=256` and shuffled access across
+thousands of samples / hundreds of shards, **a batch touches ~250 unique
+files no matter the layout**. An LRU of any practical size hits almost
+nothing, so shard packing on its own doesn't fix data-load thrash. The
+fix that actually works on big-RAM nodes is `data.preload: true` (the
+default in this repo) — see Step 5's note about the `[dataset] preloaded
+N/M samples` line at startup.
+
+Shard repack is still recorded here for two cases where it does help:
+1. cache larger than RAM, so preload isn't feasible — shards reduce
+   per-file syscall / inode overhead and let `torch.load` do bigger
+   sequential reads;
+2. paired with a locality-aware sampler that keeps consecutive batches
+   reading from the same shard.
+
+If you've decided one of those applies, run:
 
 ```bash
 python -m delta_model.data.repack \
@@ -322,18 +335,32 @@ What to watch in wandb (project `tata-delta-model`, group `M1-llada`):
 - `gsm8k/accuracy_delta` — held-out subset every `gsm8k_every` steps;
   target by step 20000 is within 5pp of vanilla baseline.
 
+At startup with `data.preload: true` you should see, before the first
+training step:
+
+```
+[dataset] preloaded 4500/5000 samples into RAM (~72000 MiB) for split='train'
+[dataset] preloaded 500/5000 samples into RAM (~8000 MiB) for split='train'
+```
+
+(Both messages say `split='train'` because the train/val partition is
+applied via `index_filter`, not split name.) If those lines are missing,
+preload is off and you'll hit the disk thrash described above.
+
 Per-step timing breakdown is also printed every `log_every` step:
 
 ```
-[time] step=  500 data:120.4ms(80%) fwd: 12.3ms( 8%) bwd: 8.5ms( 5%) loss: 5.2ms( 3%) h2d: 3.1ms( 2%) opt: 1.8ms( 1%)
+[time] step=  500 data: 18.7ms(11%) fwd: 50.0ms(30%) bwd: 90.0ms(54%) loss:  5.2ms( 3%) h2d:  3.1ms( 2%) opt:  1.8ms( 1%)
 ```
 
 Sections: `data` (loader/disk), `h2d` (host→device + GPU embed lookup),
 `fwd` (variantc forward), `loss` (composite_loss), `bwd` (backward +
 grad clip), `opt` (lr update + optimizer step), and `val` when
 validation runs. Numbers are CUDA-synced means since the previous
-`[time]` line. If `data` dominates → run §4b (shard repack) and/or get
-`/dev/shm` raised so workers can come back (see `improvements.md` §2.1).
+`[time]` line. With preload on, `data` should be small (compute time
+dominates). If `data` is still high (>30%), check that preload is
+actually on at startup and consider getting `/dev/shm` raised so
+workers can come back (see `improvements.md` §2.1).
 
 Halt criteria (from `implementation_plan.md` §12):
 - Step 5000: GSM8K subset accuracy ≥ 0.5 × vanilla. Below 0.3 →

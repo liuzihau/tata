@@ -320,13 +320,16 @@ def main() -> None:
     train_filter, val_filter = make_train_val_filter(
         cfg.data.val_frac, seed=cfg.data.shuffle_seed,
     )
+    preload = bool(getattr(cfg.data, "preload", True))
     train_ds = TataDeltaDataset(
         cfg.data.cache_root, split="train",
         mask_token_id=cfg.data.mask_token_id, index_filter=train_filter,
+        preload=preload,
     )
     val_ds = TataDeltaDataset(
         cfg.data.cache_root, split="train",
         mask_token_id=cfg.data.mask_token_id, index_filter=val_filter,
+        preload=preload,
     )
     print(f"[train] train pairs={len(train_ds)}  val pairs={len(val_ds)}",
           flush=True)

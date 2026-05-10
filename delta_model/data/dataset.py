@@ -2,16 +2,26 @@
 
 One example = one (sample, block_idx, i_ref, i_target) tuple, with
 0 ≤ i_ref < i_target < n_passes_actual ≤ MAX_ITER. We pre-build the index
-at construction time so __getitem__ is a small slice off a per-worker
-LRU-cached sample (or shard, in shard mode).
+at construction time so __getitem__ is a small slice off an in-memory
+dict (preload mode, default) or an LRU-cached load (preload=False).
 
 Storage layouts supported:
   • Per-sample files (legacy):   `cache_root/<split>/sample_<hex>.pt`
   • Multi-sample shards (§1.4):  `cache_root/<shard_subdir>/<split>/shard_NNNNN.pt`
                                   with `cache_root/shards_manifest.json` describing
                                   which shard each sample lives in.
-The dataset auto-detects shard mode via the presence of `shards_manifest.json`
-and switches the LRU to cache shards (larger entries, fewer of them).
+The dataset auto-detects shard mode via the presence of `shards_manifest.json`.
+
+Preload mode (default, `preload=True`):
+  Load every sample/shard the dataset needs at __init__ and pin it in RAM.
+  __getitem__ becomes a pure dict-lookup + tensor slice — no disk I/O on
+  the hot path. With ~5000 train samples × ~16 MiB each ≈ ~80 GiB RAM.
+  This is the right choice on big-RAM nodes (DGX, 256+ GiB) and was added
+  to defeat the random-shuffle locality miss that made the LRU useless.
+
+LRU mode (`preload=False`):
+  Falls back to a small bounded cache. Useful for memory-constrained
+  environments, sequential samplers, or huge caches that don't fit in RAM.
 
 Yields tensors that the VariantC model + composite_loss expect:
     h_ref           [BLOCK_LENGTH, d_model]    fp16
@@ -35,8 +45,7 @@ from torch.utils.data import Dataset
 from . import schema as S
 
 
-# Per-worker LRU sizes. In per-sample mode each cache entry is ~16 MiB; in
-# shard mode each entry is ~`shard_size * 16` MiB (so a much smaller LRU).
+# Bounded-LRU sizes used only when `preload=False`.
 _PER_SAMPLE_LRU_MAX = 32      # ~512 MiB cache in per-sample mode
 _SHARD_LRU_MAX      = 4       # ~3.2 GiB at shard_size=50; tune to RAM budget
 
@@ -49,10 +58,12 @@ class TataDeltaDataset(Dataset):
         split: str = "train",
         mask_token_id: int = S.LLADA_MASK_TOKEN_ID,
         index_filter: Optional[Callable[[tuple], bool]] = None,
+        preload: bool = True,
     ):
         cache_root = Path(cache_root)
         self.cache_root    = cache_root
         self.mask_token_id = mask_token_id
+        self.preload       = preload
 
         shards_manifest = cache_root / "shards_manifest.json"
         if shards_manifest.exists():
@@ -61,7 +72,7 @@ class TataDeltaDataset(Dataset):
             self._init_per_sample_mode(cache_root, split, index_filter)
 
     # ------------------------------------------------------------------
-    # Per-sample mode (legacy, one .pt per prompt)
+    # Per-sample mode
     # ------------------------------------------------------------------
 
     def _init_per_sample_mode(
@@ -87,21 +98,32 @@ class TataDeltaDataset(Dataset):
             )
         self.sample_paths = sample_paths
 
-        # Pre-build the (sample, block, i_ref, i_target) flat index. We
-        # need n_passes_actual per block, so we have to read each file once.
+        # Pre-build the (sample, block, i_ref, i_target) flat index. We have
+        # to read each file once anyway to learn n_passes_actual; in preload
+        # mode we keep the loaded dict if it contributed any indices.
         self.index: list[tuple[int, int, int, int]] = []
-        for s_idx, p in enumerate(sample_paths):
-            sample = torch.load(p, map_location="cpu", weights_only=False)
-            self._extend_index_from_sample(
-                s_idx, sample, index_filter,
-            )
-
-        # Sample LRU.
         self._sample_cache: "OrderedDict[int, dict]" = OrderedDict()
         self._lru_max = _PER_SAMPLE_LRU_MAX
 
+        kept = 0
+        for s_idx, p in enumerate(sample_paths):
+            sample = torch.load(p, map_location="cpu", weights_only=False)
+            n_added = self._extend_index_from_sample(s_idx, sample, index_filter)
+            if self.preload and n_added > 0:
+                self._sample_cache[s_idx] = sample
+                kept += 1
+            # else: sample drops out of scope; GC reclaims it.
+
+        if self.preload:
+            est_mib = kept * 16  # per-sample files are ~16 MiB each
+            print(
+                f"[dataset] preloaded {kept}/{len(sample_paths)} samples "
+                f"into RAM (~{est_mib} MiB) for split={split!r}",
+                flush=True,
+            )
+
     # ------------------------------------------------------------------
-    # Shard mode (multi-sample shards from repack.py)
+    # Shard mode
     # ------------------------------------------------------------------
 
     def _init_shard_mode(
@@ -110,17 +132,13 @@ class TataDeltaDataset(Dataset):
     ) -> None:
         self.mode = "shard"
         manifest = json.loads(shards_manifest_path.read_text())
-        # `manifest["shards"]` is a flat list across all splits; filter to ours.
         shards_for_split = [r for r in manifest["shards"] if r["split"] == split]
         if not shards_for_split:
             raise FileNotFoundError(
                 f"No shards for split={split!r} in {shards_manifest_path}."
             )
 
-        # Map shard manifest entries to absolute paths.
         self.shard_paths: list[Path] = []
-        # Per-(shard_idx, within_idx) → flat sample_idx for the index.
-        # `self.sample_locator[s_idx] = (shard_idx_in_self.shard_paths, within_idx)`.
         self.sample_locator: list[tuple[int, int]] = []
         for r in shards_for_split:
             shard_path = self.cache_root / r["filename"]
@@ -131,17 +149,36 @@ class TataDeltaDataset(Dataset):
             for within in range(r["n_samples"]):
                 self.sample_locator.append((shard_local_idx, within))
 
-        # Build the flat index by walking each sample once. We have to load
-        # each shard once for n_passes_actual; reuse the LRU during this pass
-        # so we don't load the same shard twice.
         self._shard_cache: "OrderedDict[int, dict]" = OrderedDict()
         self._lru_max = _SHARD_LRU_MAX
 
+        # First pass: build flat index across all samples in this split.
+        # In preload mode we load each shard exactly once and keep it; the
+        # LRU eviction is bypassed by the unbounded `_shard_cache` we pin.
         self.index: list[tuple[int, int, int, int]] = []
+        # Per-shard count of indices kept; shards with zero contribution
+        # are evicted to save RAM.
+        per_shard_kept: dict[int, int] = {}
         for s_idx, (shard_idx, within) in enumerate(self.sample_locator):
-            shard = self._get_shard(shard_idx)
+            shard = self._get_shard(shard_idx, force_pin=self.preload)
             sample = shard["samples"][within]
-            self._extend_index_from_sample(s_idx, sample, index_filter)
+            n_added = self._extend_index_from_sample(s_idx, sample, index_filter)
+            per_shard_kept[shard_idx] = per_shard_kept.get(shard_idx, 0) + n_added
+
+        if self.preload:
+            for shard_idx, n in list(per_shard_kept.items()):
+                if n == 0:
+                    self._shard_cache.pop(shard_idx, None)
+            kept_shards = len(self._shard_cache)
+            est_mib = sum(
+                self.shard_paths[i].stat().st_size
+                for i in self._shard_cache
+            ) / (1024 * 1024)
+            print(
+                f"[dataset] preloaded {kept_shards}/{len(self.shard_paths)} "
+                f"shards into RAM (~{est_mib:.0f} MiB) for split={split!r}",
+                flush=True,
+            )
 
     # ------------------------------------------------------------------
     # Common helpers
@@ -150,7 +187,8 @@ class TataDeltaDataset(Dataset):
     def _extend_index_from_sample(
         self, s_idx: int, sample: dict,
         index_filter: Optional[Callable[[tuple], bool]],
-    ) -> None:
+    ) -> int:
+        n_added = 0
         for b in range(S.NUM_BLOCKS):
             n_actual = int(sample["blocks"][b].get("n_passes_actual", S.MAX_ITER))
             if n_actual < 2:
@@ -160,6 +198,8 @@ class TataDeltaDataset(Dataset):
                     tup = (s_idx, b, i_ref, i_tgt)
                     if index_filter is None or index_filter(tup):
                         self.index.append(tup)
+                        n_added += 1
+        return n_added
 
     def __len__(self) -> int:
         return len(self.index)
@@ -169,14 +209,22 @@ class TataDeltaDataset(Dataset):
             return self._get_sample_per_sample(s_idx)
         else:
             shard_idx, within = self.sample_locator[s_idx]
-            shard = self._get_shard(shard_idx)
+            shard = self._get_shard(shard_idx, force_pin=False)
             return shard["samples"][within]
 
     def _get_sample_per_sample(self, s_idx: int) -> dict:
         cache = self._sample_cache
         if s_idx in cache:
-            cache.move_to_end(s_idx)
+            if not self.preload:
+                cache.move_to_end(s_idx)
             return cache[s_idx]
+        if self.preload:
+            # Should not happen: every sample contributing to self.index was
+            # pinned at __init__. If we ever get here it means index/cache
+            # are out of sync.
+            raise KeyError(
+                f"sample s_idx={s_idx} not preloaded — index/cache out of sync"
+            )
         sample = torch.load(
             self.sample_paths[s_idx], map_location="cpu", weights_only=False,
         )
@@ -185,16 +233,17 @@ class TataDeltaDataset(Dataset):
             cache.popitem(last=False)
         return sample
 
-    def _get_shard(self, shard_idx: int) -> dict:
+    def _get_shard(self, shard_idx: int, *, force_pin: bool) -> dict:
         cache = self._shard_cache
         if shard_idx in cache:
-            cache.move_to_end(shard_idx)
+            if not (self.preload or force_pin):
+                cache.move_to_end(shard_idx)
             return cache[shard_idx]
         shard = torch.load(
             self.shard_paths[shard_idx], map_location="cpu", weights_only=False,
         )
         cache[shard_idx] = shard
-        if len(cache) > self._lru_max:
+        if not (self.preload or force_pin) and len(cache) > self._lru_max:
             cache.popitem(last=False)
         return shard
 
