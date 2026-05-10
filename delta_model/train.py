@@ -216,6 +216,7 @@ def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
         delta_h, c_pred = model(
             batch_dev["h_ref"], prev_emb, batch_dev["prefix_kv"],
             batch_dev["block_start_pos"],
+            prefix_kv_pad_mask=batch_dev.get("prefix_kv_pad_mask"),
         )
         loss_dict = composite_loss(
             delta_h, c_pred,
@@ -407,6 +408,7 @@ def main() -> None:
             delta_h, c_pred = model(
                 batch_dev["h_ref"], prev_emb, batch_dev["prefix_kv"],
                 batch_dev["block_start_pos"],
+                prefix_kv_pad_mask=batch_dev.get("prefix_kv_pad_mask"),
             )
 
         with timers.time("loss"):

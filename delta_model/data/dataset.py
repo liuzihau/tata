@@ -24,13 +24,14 @@ LRU mode (`preload=False`):
   environments, sequential samplers, or huge caches that don't fit in RAM.
 
 Yields tensors that the VariantC model + composite_loss expect:
-    h_ref           [BLOCK_LENGTH, d_model]    fp16
-    h_target        [BLOCK_LENGTH, d_model]    fp16
-    prefix_kv       [2, n_kv_heads, PREFIX_WINDOW, d_head]  fp16
-    substituted_ids [BLOCK_LENGTH]             int64  (caller does GPU embed lookup)
-    mask_tgt        [BLOCK_LENGTH]             bool
-    block_start_pos int                        absolute block start in original seq
-    i_ref / i_target / reveal_frac             scalars (for binning)
+    h_ref              [BLOCK_LENGTH, d_model]    fp16
+    h_target           [BLOCK_LENGTH, d_model]    fp16
+    prefix_kv          [2, n_kv_heads, PREFIX_WINDOW, d_head]  fp16
+    prefix_kv_pad_mask [PREFIX_WINDOW]            bool   True=real, False=front-padded
+    substituted_ids    [BLOCK_LENGTH]             int64  (caller does GPU embed lookup)
+    mask_tgt           [BLOCK_LENGTH]             bool
+    block_start_pos    int                        absolute block start in original seq
+    i_ref / i_target / reveal_frac                scalars (for binning)
 """
 from __future__ import annotations
 
@@ -265,6 +266,14 @@ class TataDeltaDataset(Dataset):
         # re-collecting if we later want to ablate larger windows.
         prefix_kv_full = block["prefix_kv"]                    # [2, KV_H, W, d_head], W ≥ PREFIX_WINDOW
         prefix_kv      = prefix_kv_full[:, :, -S.PREFIX_WINDOW:, :]   # [2, KV_H, 32, d_head]
+        # Pad mask: True = real prefix slot, False = front-padded zero.
+        # Older v2 caches (built before pad-and-mask) won't have this field;
+        # default to all-True since those caches always had full prefixes.
+        mask_full = block.get("prefix_kv_pad_mask")
+        if mask_full is None:
+            prefix_kv_pad_mask = torch.ones(S.PREFIX_WINDOW, dtype=torch.bool)
+        else:
+            prefix_kv_pad_mask = mask_full[-S.PREFIX_WINDOW:]
         reveal_tgt = block["reveal_per_pass"][i_tgt]
         mask_tgt   = ~reveal_tgt
 
@@ -278,15 +287,16 @@ class TataDeltaDataset(Dataset):
         block_start_pos = int(sample["prompt_len"]) + b * S.BLOCK_LENGTH
 
         return {
-            "h_ref":           h_ref,
-            "h_target":        h_target,
-            "prefix_kv":       prefix_kv,
-            "substituted_ids": substituted_ids,
-            "mask_tgt":        mask_tgt,
-            "block_start_pos": block_start_pos,
-            "i_ref":           i_ref,
-            "i_target":        i_tgt,
-            "reveal_frac":     float(reveal_tgt.float().mean().item()),
+            "h_ref":              h_ref,
+            "h_target":           h_target,
+            "prefix_kv":          prefix_kv,
+            "prefix_kv_pad_mask": prefix_kv_pad_mask,
+            "substituted_ids":    substituted_ids,
+            "mask_tgt":           mask_tgt,
+            "block_start_pos":    block_start_pos,
+            "i_ref":              i_ref,
+            "i_target":           i_tgt,
+            "reveal_frac":        float(reveal_tgt.float().mean().item()),
         }
 
 

@@ -76,6 +76,13 @@ Uses 5 built-in prompts; no HuggingFace auth needed. Cheap insurance that
 the fixed `collect_llada.py` doesn't crash and produces well-formed cache
 files.
 
+> **Note:** the built-in `sample_prompts.txt` contains short prompts
+> (~37 tokens after chat-template formatting). With pad-and-mask (§3.5)
+> these no longer get skipped — at the default `--prefix_window 64`,
+> collect front-pads the prefix-KV tensor and emits a `prefix_kv_pad_mask`,
+> so all 5 prompts are kept. You can still pass `--prefix_window 32` if
+> you want a smaller stored window; either works at training time.
+
 ```bash
 python -m delta_model.data.collect_llada \
     --prompts_file delta_model/data/sample_prompts.txt \
@@ -86,7 +93,11 @@ python -m delta_model.sanity.test_collect_roundtrip \
     "cache_v1/llada_smoke_post_fix/test/sample_*.pt"
 ```
 
-Pass: roundtrip prints `5 OK, 0 bad.`
+Pass: roundtrip prints `5 OK, 0 bad.` and you should see all 5 prompts
+collected (none `skipped (prompt too short)`). T3 reads the per-cache
+`prefix_window` from its meta, so it accepts 32-stored smoke caches and
+64-stored real caches indistinguishably; the optional `prefix_kv_pad_mask`
+field is validated for shape/dtype if present.
 
 ### 4. Real recollect (~5–9 h on a single A100/H100)
 

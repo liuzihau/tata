@@ -153,7 +153,9 @@ class _SelfAttnRoPE(nn.Module):
 
 class _CrossAttnRoPE(nn.Module):
     """Cross-attention into externally-supplied K/V (already RoPE-rotated by
-    backbone). Only Q gets RoPE applied here."""
+    backbone). Only Q gets RoPE applied here. Optional `attn_mask` masks out
+    front-padded prefix slots when the prompt was shorter than the cached
+    prefix window."""
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
         super().__init__()
@@ -174,12 +176,16 @@ class _CrossAttnRoPE(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 k_external: torch.Tensor, v_external: torch.Tensor,
-                rope: _RoPE, q_positions: torch.Tensor) -> torch.Tensor:
+                rope: _RoPE, q_positions: torch.Tensor,
+                attn_mask: torch.Tensor | None = None) -> torch.Tensor:
         # x: [B, T_q, D]; k_external/v_external: [B, n_heads, T_k, head_dim]
+        # attn_mask (if given): bool, broadcastable to [B, n_heads, T_q, T_k];
+        # True = attend, False = don't.
         q = self._split_q(self.q_proj(x))
         q = rope.apply(q, q_positions)
         out = F.scaled_dot_product_attention(
             q, k_external, v_external,
+            attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
         return self.o_proj(self._merge(out))
@@ -206,10 +212,12 @@ class _DeltaBlock(nn.Module):
                 k_external: torch.Tensor, v_external: torch.Tensor,
                 rope: _RoPE,
                 self_positions: torch.Tensor, q_positions: torch.Tensor,
+                cross_attn_mask: torch.Tensor | None = None,
                 ) -> torch.Tensor:
         x = x + self.self_attn(self.norm_self(x),  rope, self_positions)
         x = x + self.cross_attn(self.norm_cross(x), k_external, v_external,
-                                 rope, q_positions)
+                                 rope, q_positions,
+                                 attn_mask=cross_attn_mask)
         x = x + self.ffn(self.norm_ffn(x))
         return x
 
@@ -267,10 +275,11 @@ class VariantC(nn.Module):
 
     def forward(
         self,
-        h_ref:           torch.Tensor,   # [B, 32, d_model]
-        prev_emb:        torch.Tensor,   # [B, 32, d_model]
-        prefix_kv:       torch.Tensor,   # [B, 2, n_kv_heads, 32, d_head]
-        block_start_pos: torch.Tensor,   # [B] long, abs start pos of this block
+        h_ref:               torch.Tensor,             # [B, 32, d_model]
+        prev_emb:            torch.Tensor,             # [B, 32, d_model]
+        prefix_kv:           torch.Tensor,             # [B, 2, n_kv_heads, 32, d_head]
+        block_start_pos:     torch.Tensor,             # [B] long, abs start pos of this block
+        prefix_kv_pad_mask:  torch.Tensor | None = None,  # [B, 32] bool — True = real, False = padded
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, BL, D = h_ref.shape
         device = h_ref.device
@@ -294,9 +303,19 @@ class VariantC(nn.Module):
         # Cast prefix_kv to the same dtype as x and split into K, V.
         K_ext, V_ext = self._split_prefix_kv(prefix_kv.to(x.dtype))
 
+        # Build the cross-attn key-padding mask, broadcastable to
+        # [B, n_heads, T_q, T_k] inside SDPA. None → no mask, attend to all
+        # prefix slots (legacy caches without pad masks).
+        if prefix_kv_pad_mask is not None:
+            cross_attn_mask = prefix_kv_pad_mask.to(device).bool()      # [B, T_k]
+            cross_attn_mask = cross_attn_mask[:, None, None, :]         # [B, 1, 1, T_k]
+        else:
+            cross_attn_mask = None
+
         for layer in self.layers:
             x = layer(x, K_ext, V_ext, self.rope,
-                      positions_full, positions_full)
+                      positions_full, positions_full,
+                      cross_attn_mask=cross_attn_mask)
         x = self.final_norm(x)
 
         feats   = x[:, BL:, :]                                        # prev_emb half

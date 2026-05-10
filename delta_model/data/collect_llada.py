@@ -191,6 +191,7 @@ def collect_one_sample(
     gen_length: int = S.GEN_LENGTH,
     block_length: int = S.BLOCK_LENGTH,
     max_iter: int = S.MAX_ITER,
+    prefix_window: int = S.COLLECT_PREFIX_WINDOW,
     threshold: float | None = None,
     factor: float | None = 1.0,
     temperature: float = 0.0,
@@ -198,8 +199,15 @@ def collect_one_sample(
     mask_id: int = S.LLADA_MASK_TOKEN_ID,
 ) -> dict | None:
     """Run prefix-cache generation on one prompt and return the cache dict
-    described in `data/schema.py`. Returns None if the prompt is too short
-    (< COLLECT_PREFIX_WINDOW tokens) — those samples are dropped.
+    described in `data/schema.py`. Returns None only for empty prompts.
+
+    `prefix_window` is the number of last-prefix slots cached per block.
+    Default = `S.COLLECT_PREFIX_WINDOW` (64) so we have headroom over the
+    training-time `S.PREFIX_WINDOW` (32). When the prompt is shorter than
+    `prefix_window`, the prefix_kv tensor is zero-padded at the front and
+    `prefix_kv_pad_mask` records which slots are real — so short prompts
+    are no longer dropped. The dataset slices to the last `S.PREFIX_WINDOW`
+    of both tensors and the model's cross-attention applies the mask.
 
     Decoding mode is controlled by exactly one of:
       - `threshold` (float in (0,1]): commit positions with confidence ≥ thr.
@@ -212,11 +220,15 @@ def collect_one_sample(
             "collect_one_sample: pass exactly one of `threshold` or `factor` "
             f"(got threshold={threshold!r}, factor={factor!r})"
         )
+    if prefix_window < S.PREFIX_WINDOW:
+        raise ValueError(
+            f"prefix_window ({prefix_window}) must be ≥ S.PREFIX_WINDOW "
+            f"({S.PREFIX_WINDOW}); training slices to the last {S.PREFIX_WINDOW} "
+            "tokens of the stored prefix_kv."
+        )
     prompt_ids = _format_prompt_llada(tokenizer, prompt_text)
     prompt_len = int(prompt_ids.shape[1])
-    if prompt_len < S.COLLECT_PREFIX_WINDOW:
-        # Can't take the last-`COLLECT_PREFIX_WINDOW` prefix slice at block 0
-        # if the prompt itself is shorter than that.
+    if prompt_len < 1:
         return None
 
     num_blocks = gen_length // block_length
@@ -312,15 +324,27 @@ def collect_one_sample(
                     # this is the right content for variantc's cross-attn
                     # K/V passthrough (which expects backbone-RoPE'd K — see
                     # §1.5 in improvements.md).
-                    # Capture the last COLLECT_PREFIX_WINDOW (64) tokens of
-                    # prefix KV. Training reads only the last `PREFIX_WINDOW`
-                    # (32); the extra is headroom for window-size ablations
-                    # without re-collecting.
-                    last_K = past_key_values[-1][0][0, :, s - S.COLLECT_PREFIX_WINDOW:s, :]
-                    last_V = past_key_values[-1][1][0, :, s - S.COLLECT_PREFIX_WINDOW:s, :]
+                    # Capture up to `prefix_window` last-prefix-token KV.
+                    # When `s < prefix_window` (very short prompt at block 0),
+                    # we have only `s` valid tokens; front-pad the rest with
+                    # zeros and record validity in `prefix_kv_pad_mask`.
+                    valid_len = min(s, prefix_window)
+                    pad_len   = prefix_window - valid_len
+                    last_K_v = past_key_values[-1][0][0, :, s - valid_len:s, :]   # [KV_H, valid_len, d_head]
+                    last_V_v = past_key_values[-1][1][0, :, s - valid_len:s, :]
+                    if pad_len > 0:
+                        # F.pad signature for [KV_H, T, d_head]: pads last dims first.
+                        # (0, 0) on d_head, (pad_len, 0) on T = front-pad.
+                        last_K = F.pad(last_K_v, (0, 0, pad_len, 0))
+                        last_V = F.pad(last_V_v, (0, 0, pad_len, 0))
+                    else:
+                        last_K = last_K_v
+                        last_V = last_V_v
                     prefix_kv = torch.stack(
                         [last_K, last_V], dim=0,
                     ).to("cpu", dtype=S.DTYPE_KV, copy=True)
+                    prefix_kv_pad_mask = torch.zeros(prefix_window, dtype=torch.bool)
+                    prefix_kv_pad_mask[pad_len:] = True
                 else:
                     out = model(x)
 
@@ -364,10 +388,11 @@ def collect_one_sample(
                 reveal_per_pass.append(reveal_per_pass[-1].clone())
 
             blocks_out.append({
-                "prefix_kv":        prefix_kv,                          # [2, n_kv_heads, COLLECT_PREFIX_WINDOW, d_head]
-                "h_per_pass":       torch.stack(h_per_pass, dim=0),     # [MAX_ITER, 32, d_model]
-                "reveal_per_pass":  torch.stack(reveal_per_pass, dim=0),# [MAX_ITER, 32]
-                "n_passes_actual":  int(n_passes_actual),
+                "prefix_kv":          prefix_kv,                          # [2, n_kv_heads, prefix_window, d_head]
+                "prefix_kv_pad_mask": prefix_kv_pad_mask,                 # [prefix_window] bool — True = real, False = padded
+                "h_per_pass":         torch.stack(h_per_pass, dim=0),     # [MAX_ITER, 32, d_model]
+                "reveal_per_pass":    torch.stack(reveal_per_pass, dim=0),# [MAX_ITER, 32]
+                "n_passes_actual":    int(n_passes_actual),
             })
 
     finally:
@@ -389,6 +414,7 @@ def collect_one_sample(
             "gen_length":     gen_length,
             "block_length":   block_length,
             "max_iter":       max_iter,
+            "prefix_window":  prefix_window,
             "fast_dllm_mode": "prefix_cache",
             "decoding": (
                 {"mode": "factor",    "factor":    factor}    if factor is not None
@@ -451,6 +477,18 @@ def main() -> None:
              "(neither flag) is --factor 1.0.",
     )
     p.add_argument(
+        "--prefix_window", type=int, default=S.COLLECT_PREFIX_WINDOW,
+        help=(
+            "Number of last-prefix tokens whose K/V we record per block. "
+            f"Default {S.COLLECT_PREFIX_WINDOW} (= S.COLLECT_PREFIX_WINDOW). "
+            f"Must be ≥ S.PREFIX_WINDOW ({S.PREFIX_WINDOW}). Drop to 32 for "
+            "smoke testing on prompts shorter than 64 tokens — the dataset "
+            "always slices to the last S.PREFIX_WINDOW regardless of stored "
+            "size, so as long as `prefix_window >= S.PREFIX_WINDOW`, the "
+            "training pipeline reads the cache correctly."
+        ),
+    )
+    p.add_argument(
         "--start_index", type=int, default=0,
         help="Resume from this index in the (combined train+test) record list.",
     )
@@ -479,6 +517,12 @@ def main() -> None:
         f"[collect] decoding mode: "
         + (f"factor={decoding_factor}" if decoding_factor is not None
            else f"threshold={decoding_threshold}"),
+        flush=True,
+    )
+    print(
+        f"[collect] prefix_window={args.prefix_window} "
+        f"(training reads last {S.PREFIX_WINDOW}); "
+        f"prompts shorter than {args.prefix_window} tokens will be skipped.",
         flush=True,
     )
 
@@ -518,6 +562,7 @@ def main() -> None:
         "n_test":   len(test_records),
         "shuffle_seed": args.shuffle_seed,
         "schema_version": S.SCHEMA_VERSION,
+        "prefix_window": args.prefix_window,
         "decoding": (
             {"mode": "factor",    "factor":    decoding_factor}
             if decoding_factor is not None
@@ -549,6 +594,7 @@ def main() -> None:
             t0 = time.time()
             data = collect_one_sample(
                 model, tokenizer, rec["prompt"],
+                prefix_window=args.prefix_window,
                 threshold=decoding_threshold, factor=decoding_factor,
             )
             if data is None:

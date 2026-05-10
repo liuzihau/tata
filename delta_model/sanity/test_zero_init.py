@@ -55,8 +55,13 @@ def main() -> None:
 
     mask_tgt = torch.ones(B, S.BLOCK_LENGTH, dtype=torch.bool)
     block_start_pos = torch.tensor([64, 96], dtype=torch.long)  # arbitrary in-range positions
+    # All-True pad mask for the synthetic prefix_kv (no padding in this test).
+    prefix_kv_pad_mask = torch.ones(B, S.PREFIX_WINDOW, dtype=torch.bool)
 
-    delta_h, c_pred = model(h_ref, prev_emb, prefix_kv, block_start_pos)
+    delta_h, c_pred = model(
+        h_ref, prev_emb, prefix_kv, block_start_pos,
+        prefix_kv_pad_mask=prefix_kv_pad_mask,
+    )
     print(f"delta_h.abs().max() = {delta_h.abs().max().item():.6e}")
     assert delta_h.abs().max().item() == 0.0, "Δh head not zero-initialized"
 

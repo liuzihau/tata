@@ -162,11 +162,20 @@ def generate_with_delta(
                 block_start_pos_t = torch.tensor(
                     [s], dtype=torch.long, device=device,
                 )
+                # At inference, the prefix is always taken from a full
+                # backbone forward at positions [s-PREFIX_WINDOW, s), which
+                # exist whenever the prompt is at least PREFIX_WINDOW tokens
+                # — a precondition for hybrid_runner to make sense at all.
+                # Pass an all-True mask so the model signature matches train.
+                prefix_kv_pad_mask = torch.ones(
+                    (1, S.PREFIX_WINDOW), dtype=torch.bool, device=device,
+                )
                 delta_h, c_pred = delta_model(
                     h_ref.to(delta_model.delta_head.proj.weight.dtype),
                     prev_emb.to(delta_model.delta_head.proj.weight.dtype),
                     prefix_kv_slice.to(torch.float16),
                     block_start_pos_t,
+                    prefix_kv_pad_mask=prefix_kv_pad_mask,
                 )
                 stats["delta_forwards"] += 1
 

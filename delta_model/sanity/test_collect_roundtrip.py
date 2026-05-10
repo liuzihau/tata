@@ -37,11 +37,13 @@ def check_one(path: Path) -> list[str]:
         errs.append(f"expected {S.NUM_BLOCKS} blocks, got {len(s.get('blocks', []))}")
         return errs
 
-    n_kv_heads = meta.get("n_kv_heads", S.N_KV_HEADS_LLADA)
-    d_head     = meta.get("d_head",     S.D_HEAD_LLADA)
-    d_model    = meta.get("d_model",    S.D_MODEL_LLADA)
+    n_kv_heads    = meta.get("n_kv_heads",    S.N_KV_HEADS_LLADA)
+    d_head        = meta.get("d_head",        S.D_HEAD_LLADA)
+    d_model       = meta.get("d_model",       S.D_MODEL_LLADA)
+    prefix_window = meta.get("prefix_window", S.COLLECT_PREFIX_WINDOW)
     expected = S.expected_block_shapes(
         n_kv_heads=n_kv_heads, d_head=d_head, d_model=d_model,
+        prefix_window=prefix_window,
     )
 
     for b_idx, b in enumerate(s["blocks"]):
@@ -61,6 +63,20 @@ def check_one(path: Path) -> list[str]:
                 f"block {b_idx} prefix_kv dtype "
                 f"{b['prefix_kv'].dtype}, expected {S.DTYPE_KV}"
             )
+        # `prefix_kv_pad_mask` is optional for older v2 caches. If present,
+        # must be bool of length `prefix_window`.
+        m = b.get("prefix_kv_pad_mask")
+        if m is not None:
+            if m.dtype != torch.bool:
+                errs.append(
+                    f"block {b_idx} prefix_kv_pad_mask dtype "
+                    f"{m.dtype}, expected torch.bool"
+                )
+            if tuple(m.shape) != (prefix_window,):
+                errs.append(
+                    f"block {b_idx} prefix_kv_pad_mask shape "
+                    f"{tuple(m.shape)}, expected ({prefix_window},)"
+                )
         if b["h_per_pass"].dtype != S.DTYPE_HIDDEN:
             errs.append(
                 f"block {b_idx} h_per_pass dtype "

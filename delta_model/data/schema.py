@@ -52,8 +52,12 @@ def expected_block_shapes(
     what's actually written to disk. Pass `prefix_window=PREFIX_WINDOW` to
     validate post-slicing dataset output instead.
     """
+    # `prefix_kv_pad_mask` (shape `(prefix_window,)`, bool) is also written
+    # by collect_llada but is OPTIONAL for legacy caches and validated
+    # separately in `test_collect_roundtrip` so older v2 caches (built
+    # before pad-and-mask) don't fail T3.
     return {
-        "prefix_kv":        (2, n_kv_heads, prefix_window, d_head),
-        "h_per_pass":       (MAX_ITER, BLOCK_LENGTH, d_model),
-        "reveal_per_pass":  (MAX_ITER, BLOCK_LENGTH),
+        "prefix_kv":          (2, n_kv_heads, prefix_window, d_head),
+        "h_per_pass":         (MAX_ITER, BLOCK_LENGTH, d_model),
+        "reveal_per_pass":    (MAX_ITER, BLOCK_LENGTH),
     }
