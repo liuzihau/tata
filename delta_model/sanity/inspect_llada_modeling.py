@@ -107,12 +107,24 @@ def main() -> None:
         _print_source(type(block).forward,
                       f"{type(block).__name__}.forward", max_lines=200)
 
-        # 4b. Attention sub-module (where RoPE is actually called).
+        # 4b. Attention call site. `block.attention` here is a bound method
+        # on LLaDALlamaBlock (not a submodule), so we print the method itself.
         attn = getattr(block, "attention", None)
         if attn is not None:
-            print(f"\n[inspect] attention class: {type(attn).__name__}")
-            _print_source(type(attn).forward,
-                          f"{type(attn).__name__}.forward", max_lines=200)
+            print(f"\n[inspect] block.attention type: {type(attn).__name__}")
+            try:
+                if callable(attn) and hasattr(attn, "__func__"):
+                    # Bound method: source the underlying function.
+                    _print_source(attn.__func__,
+                                  f"{type(block).__name__}.attention",
+                                  max_lines=200)
+                elif callable(attn):
+                    # Plain submodule: source its forward.
+                    _print_source(type(attn).forward,
+                                  f"{type(attn).__name__}.forward",
+                                  max_lines=200)
+            except Exception as e:
+                print(f"  could not source block.attention: {e}")
 
     # ----- 5. Modeling file path + targeted greps -----
     print("\n=== modeling file path ===")
