@@ -26,39 +26,37 @@ python -m delta_model.sanity.test_partial_full_forward_equivalence \
     --fast_dllm_path external/Fast-dLLM/v1
 ```
 
-T4 runs both paths and reports each.
+T4 runs the broken pre-fix path (B1) and the new `replace_position`-based
+path (B3) and compares each to the full forward.
 
-> **Note (2026-05-11 update):** in this Fast-dLLM v1 build, neither
-> `LLaDAModelLM.forward()` nor the inner `LLaDAModel.forward()` accept a
-> `position_ids` kwarg, so the previous post-fix path raises `TypeError`.
-> Until we land an alternative position-offset injection (see step 1b),
-> `collect_llada.py` falls back to the partial-forward call **without**
-> `position_ids` — i.e. the cache is still poisoned. **Do not run step 4
-> (recollect) until step 1b is done.**
+Expected output after the §3.1 fix:
 
-If T4 raises `TypeError: ... got an unexpected keyword argument 'position_ids'`,
-proceed to **step 1b**.
+```
+[sanity] Path B1 — pre-§3.1 collect path (sliced cache, auto-derive RoPE):
+[sanity] ✗ B1 vs A (full): max=6.0e+00 ...   ← still broken (expected; documents the bug)
 
-If T4 prints `✓ FIX VERIFIED — both paths agree` (i.e. step 1b has already
-landed), proceed to step 2.
+[sanity] Path B3 — replace_position pattern (Fast-dLLM's intended API):
+[sanity] ✓ B3 vs A (full): max=~1e-3 ...     ← fix recovers full-forward equivalence
 
-### 1b. Diagnose Fast-dLLM modeling to plan the position-offset injection (~30 s)
-
-Captures the actual `RotaryEmbedding.forward` and attention-block forward
-source from the loaded model, plus forward signatures and the on-disk
-modeling-file path. Output is what we need to write a precise patch.
-
-```bash
-python -m delta_model.sanity.inspect_llada_modeling \
-    --fast_dllm_path external/Fast-dLLM/v1 \
-    > inspect.txt 2>&1
-cat inspect.txt
+[sanity] ✓ FIX VERIFIED — the pre-§3.1 path (B1) diverges, but the
+`replace_position` pattern (B3) recovers full-forward equivalence.
 ```
 
-Paste the output back into the chat. The patch (probably a forward-pre-hook
-on every RotaryEmbedding instance that overrides positions based on a
-stashed offset) will land in `delta_model/llada_runtime.py`. Once it's in
-place and T4 reports both paths agree, return to step 1.
+If you see this, the fix in `collect_llada.py` is correct — proceed to
+step 2.
+
+If **B3 also fails**: STOP and report. The `replace_position` API isn't
+behaving as the modeling source suggests it should; we'd investigate
+before sinking 7 hours into a recollect. (Possible follow-ups: re-run
+the inspector for the inner `LLaDAModel.forward` body or the attention
+class to see if cache rotation actually happens elsewhere.)
+
+If you see `TypeError`: a stale `__pycache__` may be loading the old test
+version. Clear it:
+```bash
+rm -rf delta_model/sanity/__pycache__ delta_model/data/__pycache__
+```
+and re-run.
 
 ### 2. Move the broken artifacts aside (5 s)
 

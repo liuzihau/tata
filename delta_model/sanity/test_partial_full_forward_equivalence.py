@@ -142,39 +142,60 @@ def main() -> None:
         out_full = model(x, use_cache=True)
         h_full_seq = capture["latest"]                                # [1, Lp+GL, d_model]
         h_full_block = h_full_seq[:, s:e, :].clone()                  # [1, BL, d_model]
-        past_key_values = out_full.past_key_values
 
-        # Slice prefix KV to keep only [:s] — same op collect_llada does.
+        # Make independent copies of past_key_values for each downstream path
+        # — `replace_position` mutates `past_key`/`past_value` in place inside
+        # the attention layer.
+        past_full_b1 = [
+            tuple(t.clone() for t in pkv) for pkv in out_full.past_key_values
+        ]
+        past_full_b3 = [
+            tuple(t.clone() for t in pkv) for pkv in out_full.past_key_values
+        ]
         past_to_s = [
-            tuple(t[:, :, :s, :] for t in pkv) for pkv in past_key_values
+            tuple(t[:, :, :s, :] for t in pkv) for pkv in past_full_b1
         ]
 
-        # ---- Path B1: partial forward WITHOUT position_ids (the broken path
-        # that collect_llada used pre-§3.1 fix). Reproduces the original bug.
+        # ---- Path B1: pre-§3.1 collect path. Forward x[:, s:] (length GL)
+        # with cache sliced to [:s]. Auto-derive RoPE positions. Confirmed
+        # divergent on this build.
         capture["latest"] = None
         _ = model(x[:, s:], past_key_values=past_to_s, use_cache=True)
         h_b1_seq = capture["latest"]
         h_b1_block = h_b1_seq[:, :BL, :].clone()
 
-        # ---- Path B2: partial forward WITH explicit position_ids. The outer
-        # `LLaDAModelLM` doesn't accept `position_ids`, so we go one level
-        # down to `model.model` (the inner LLaDAModel), which does.
-        position_ids = torch.arange(
-            s, x.shape[1], device=device,
-        ).unsqueeze(0)
-        capture["latest"] = None
-        _ = model.model(
-            input_ids=x[:, s:], past_key_values=past_to_s, use_cache=True,
-            position_ids=position_ids,
+        # ---- Path B3: Fast-dLLM's intended `replace_position` pattern.
+        # Forward only the block tokens (length BL), pass full-length cache,
+        # and use `replace_position` to mark which positions the new tokens
+        # occupy. Attention's special replace path triggers a RoPE call with
+        # `block_end_index = e`, which rotates Q at [e - BL, e) = [s, e).
+        replace_position = torch.zeros(
+            1, x.shape[1], dtype=torch.long, device=device,
         )
-        h_b2_seq = capture["latest"]
-        h_b2_block = h_b2_seq[:, :BL, :].clone()
+        replace_position[0, s:e] = 1
+        capture["latest"] = None
+        _ = model(
+            input_ids=x[:, s:e],
+            past_key_values=past_full_b3,
+            use_cache=True,
+            replace_position=replace_position,
+        )
+        # The hook captures the last-block output for these BL queries; output
+        # shape is already [1, BL, d_model].
+        h_b3_block = capture["latest"].clone()
     finally:
         handle.remove()
 
     base_max = float(h_full_block.abs().max().item())
 
-    def _report(tag: str, h_other: torch.Tensor) -> tuple[float, float]:
+    def _report(tag: str, h_other: torch.Tensor) -> float:
+        # Tolerate shape diffs in the worst case (shouldn't happen).
+        if h_other.shape != h_full_block.shape:
+            print(
+                f"[sanity] ✗ {tag}: shape mismatch "
+                f"{tuple(h_other.shape)} vs {tuple(h_full_block.shape)}"
+            )
+            return float("inf")
         diff = (h_full_block.float() - h_other.float()).abs()
         max_d  = float(diff.max().item())
         mean_d = float(diff.mean().item())
@@ -185,50 +206,49 @@ def main() -> None:
             f"[sanity] {marker} {tag}: max={max_d:.4e}  mean={mean_d:.4e}  "
             f"relative={rel:.4e}"
         )
-        return max_d, mean_d
+        return max_d
 
     print(f"[sanity] |h_full_block|.max = {base_max:.4e}")
     print(f"[sanity] tolerance = {_FP16_NOISE_TOL:.0e}")
     print()
-    print("[sanity] Path B1 — partial forward, NO position_ids (collect-pre-fix path):")
-    b1_max, _ = _report("B1 vs A (full)", h_b1_block)
+    print("[sanity] Path B1 — pre-§3.1 collect path (sliced cache, auto-derive RoPE):")
+    b1_max = _report("B1 vs A (full)", h_b1_block)
     print()
-    print("[sanity] Path B2 — partial forward, WITH position_ids (collect-post-fix path):")
-    b2_max, _ = _report("B2 vs A (full)", h_b2_block)
+    print("[sanity] Path B3 — replace_position pattern (Fast-dLLM's intended API):")
+    b3_max = _report("B3 vs A (full)", h_b3_block)
     print()
 
     b1_ok = b1_max <= _FP16_NOISE_TOL
-    b2_ok = b2_max <= _FP16_NOISE_TOL
+    b3_ok = b3_max <= _FP16_NOISE_TOL
 
-    if b1_ok and b2_ok:
+    if b1_ok and b3_ok:
         print(
-            "[sanity] ✓ PASS — both partial-forward paths agree with the full "
-            "forward. §3.1 was never a bug on this LLaDA build."
+            "[sanity] ✓ PASS — both partial paths agree with the full forward. "
+            "§3.1 was never a bug on this LLaDA build (or has been resolved "
+            "elsewhere). collect_llada.py is safe to run as-is."
         )
         sys.exit(0)
-    elif (not b1_ok) and b2_ok:
+    elif (not b1_ok) and b3_ok:
         print(
-            "[sanity] ✓ FIX VERIFIED — without position_ids the partial forward "
-            "is broken (B1 diverges), but passing position_ids=arange(s, len) "
-            "recovers full-forward equivalence (B2 within tolerance)."
-        )
-        print(
-            "[sanity]   Action: confirm collect_llada.py passes position_ids "
-            "to the partial forward, then re-collect the cache from scratch."
+            "[sanity] ✓ FIX VERIFIED — the pre-§3.1 path (B1) diverges, but "
+            "the `replace_position` pattern (B3) recovers full-forward "
+            "equivalence. Update `collect_llada.py` to forward x[:, s:e] "
+            "with replace_position marking slots [s, e) and a full-length "
+            "cache from pass 0."
         )
         sys.exit(0)
-    elif (not b1_ok) and (not b2_ok):
+    elif (not b1_ok) and (not b3_ok):
         print(
-            "[sanity] ✗ FAIL — both partial paths diverge from full. position_ids "
-            "alone does not fix it; LLaDA's modeling code likely needs deeper "
-            "audit (cache_position kwarg? attention_mask? layer_past slicing?)."
+            "[sanity] ✗ FAIL — both partial paths diverge from full. "
+            "`replace_position` is not sufficient on this build either. "
+            "Print attention call sites and check whether the cache "
+            "actually stores K unrotated (re-grep `present = (k, v)`)."
         )
         sys.exit(1)
     else:
         print(
-            "[sanity] ✗ FAIL — B1 (no position_ids) passes but B2 (with position_ids) "
-            "diverges. Unexpected; LLaDA may interpret position_ids differently. "
-            "Print q/k positions in the RoPE module to investigate."
+            "[sanity] ✗ FAIL — B1 passes but B3 diverges. Unexpected; "
+            "investigate the replace_position handling in attention."
         )
         sys.exit(1)
 

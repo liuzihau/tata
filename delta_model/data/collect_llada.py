@@ -289,19 +289,20 @@ def collect_one_sample(
 
                 if i == 0:
                     out = model(x, use_cache=True)
+                    # KEEP past_key_values FULL-LENGTH. Pre-§3.1 we sliced it
+                    # to [:s] and then called partial forward without explicit
+                    # position info, which silently rotated new K at the wrong
+                    # absolute positions (verified in T4). Fast-dLLM's intended
+                    # API for partial decoding is `replace_position` against a
+                    # full-length cache (see iter ≥ 1 branch below).
                     past_key_values = out.past_key_values
                     logits = out.logits
 
-                    # Slice prefix KV to keep only the prefix region.
-                    new_pkv = []
-                    for li in range(len(past_key_values)):
-                        new_pkv.append(tuple(
-                            past_key_values[li][j][:, :, :s, :]
-                            for j in range(len(past_key_values[li]))
-                        ))
-                    past_key_values = new_pkv
-
-                    # Capture last-32 prefix KV from the last layer.
+                    # Capture last-32 prefix KV from the last layer at the
+                    # block-prefix positions [s-32, s). Cache stores K/V
+                    # *unrotated* (`present` is captured before RoPE in
+                    # Fast-dLLM's attention), so this is the same content the
+                    # delta model's prefix_kv input expects.
                     last_K = past_key_values[-1][0][0, :, s - S.PREFIX_WINDOW:s, :]
                     last_V = past_key_values[-1][1][0, :, s - S.PREFIX_WINDOW:s, :]
                     prefix_kv_last32 = torch.stack(
@@ -329,47 +330,51 @@ def collect_one_sample(
                     x = torch.where(transfer_index, x0, x)
 
                 else:
-                    # CRITICAL: pass position_ids explicitly. LLaDA's RoPE
-                    # module rotates K at positions [0, key_len) when no
-                    # position_ids is given, so the new tokens (x[:, s:])
-                    # would be rotated as if they start at absolute position
-                    # 0 instead of `s`. That silently corrupts every
-                    # `h_per_pass[i ≥ 1]` we record. Verified by
-                    # `delta_model/sanity/test_partial_full_forward_equivalence.py`.
+                    # §3.1 fix: use Fast-dLLM's `replace_position` API for
+                    # partial decoding. Forward ONLY the block tokens (length
+                    # `block_length`) plus a [1, full_len] `replace_position`
+                    # mask marking the absolute slots [s, e). Inside attention,
+                    # this triggers an in-place replacement of past_key/value
+                    # at those slots, then RoPE is called with
+                    # `block_end_index = e` so Q rotates at [e - BL, e) = [s, e)
+                    # and K rotates at [0, full_len) over the unrotated cache.
+                    # Both are the same positions the full forward at pass 0
+                    # used → equivalent hidden states. Verified by T4
+                    # (delta_model/sanity/test_partial_full_forward_equivalence.py).
                     #
-                    # The outer `LLaDAModelLM.forward()` doesn't accept
-                    # `position_ids` (Fast-dLLM v1's wrapper signature),
-                    # so we go one level down to the inner LLaDAModel which
-                    # does. It returns the same `.logits` we need here.
-                    position_ids = torch.arange(
-                        s, x.shape[1], device=x.device,
-                    ).unsqueeze(0)
-                    out = model.model(
-                        input_ids=x[:, s:],
+                    # Side effect: replace_position MUTATES past_key_values in
+                    # place. That's what we want — successive passes within
+                    # this block see the previous pass's updated K/V.
+                    replace_position = torch.zeros(
+                        1, x.shape[1], dtype=torch.long, device=x.device,
+                    )
+                    replace_position[0, s:e] = 1
+                    out = model(
+                        input_ids=x[:, s:e],
                         past_key_values=past_key_values,
                         use_cache=True,
-                        position_ids=position_ids,
+                        replace_position=replace_position,
                     )
+                    # logits shape: [1, block_length, V] — only the block tokens.
                     logits = out.logits
 
-                    mask_index_blk = (x[:, s:] == mask_id)
-                    mask_index_blk[:, block_length:] = False
+                    mask_index_blk = (x[:, s:e] == mask_id)            # [1, BL]
                     if factor is not None:
-                        x0_full, transfer_full = _get_transfer_index_dynamic(
+                        x0_blk, transfer_blk = _get_transfer_index_dynamic(
                             logits, temperature, remasking, mask_index_blk,
-                            x[:, s:], factor=factor,
+                            x[:, s:e], factor=factor,
                         )
                     else:
                         quota = (
                             None if threshold is not None
                             else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
                         )
-                        x0_full, transfer_full = _get_transfer_index(
+                        x0_blk, transfer_blk = _get_transfer_index(
                             logits, temperature, remasking, mask_index_blk,
-                            x[:, s:], quota, threshold,
+                            x[:, s:e], quota, threshold,
                         )
-                    new_blk = torch.where(transfer_full, x0_full, x[:, s:])
-                    x = torch.cat([x[:, :s], new_blk], dim=1)
+                    new_blk = torch.where(transfer_blk, x0_blk, x[:, s:e])
+                    x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
 
                 if recorded_passes < max_iter:
                     h_per_pass.append(hook_state["latest"])
