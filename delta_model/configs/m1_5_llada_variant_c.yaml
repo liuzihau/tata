@@ -1,0 +1,103 @@
+# M1.5 Tier-1 config — LLaDA-8B + VariantC + 5000 train samples + 800 stable test.
+#
+# Three changes vs `m1_llada_variant_c.yaml` (the trial-2 baseline):
+#   T1 (loss.mse_space, loss.lambda_mse) — MSE in post-`final_norm` space,
+#       λ_mse rescaled 0.1 → 1.0 because post-norm MSE sits at O(1) vs
+#       raw-h MSE at O(10²). Aligns the MSE gradient with the directions
+#       `lm_head` actually reads. See engineering.md §3.2.
+#   T2 (data.ref0_weight_multiplier) — i_ref-biased WeightedRandomSampler
+#       (3.0 → ~60% P(i_ref=0)). Closes the train-inference distribution
+#       mismatch. See engineering.md §3.4.
+#   T3 (model.dropout) — 0.0 → 0.1. ~500M params on ~600k pairs is clear
+#       over-capacity; trial-2 train-val gap on KL was ~4×. See §2.5.
+#
+# Reuses the trial-2 cache (cache_v1/llada) — no recollect needed.
+# Lands in a SEPARATE checkpoint dir + wandb group so the two trials don't
+# overwrite each other's history. Knobs of interest:
+#   - data.ref0_weight_multiplier   (1.0 = off, 3.0 = 60%, 8.0 = 80%)
+#   - loss.mse_space                ("raw" restores trial-2 loss exactly)
+#   - loss.lambda_mse               (1.0 with final_norm; 0.1 with raw)
+#   - model.dropout                 (0.0 disables T3 cleanly)
+#
+# Resume / overrides via train.py --override "key=value" (dot notation).
+
+run_name:          m1_5_tier1_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada                       # llada | dream
+  fast_dllm_path:  null                        # falls back to env / external/Fast-dLLM/v1
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1/llada
+  manifest:        cache_v1/llada/manifest.json
+  val_frac:        0.10                        # of the train split → held-out validation
+  shuffle_seed:    42
+  num_workers:     0     # container /dev/shm is 64 MiB — workers SIGBUS; main-proc loader avoids shm entirely
+  batch_size:      256
+  pin_memory:      false
+  # When true, the dataset preloads every sample/shard it needs into RAM at
+  # __init__ and __getitem__ becomes a pure dict lookup. ~80 GiB at 5000
+  # samples × 16 MiB; turn off only if RAM-constrained.
+  preload:         true
+  mask_token_id:   126336
+  # T2: bias training toward i_ref=0 pairs to close the train-inference
+  # distribution mismatch. With 5/15 i_ref=0 pairs per block:
+  #   1.0 = uniform (trial-2 baseline; 33% P(i_ref=0))
+  #   3.0 = M1.5 default (60% P(i_ref=0))
+  #   8.0 ≈ inference's actual rate (~80% P(i_ref=0); rollback-rate dependent)
+  ref0_weight_multiplier: 3.0
+
+model:
+  variant:         C                           # C (M1) | B | A
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2
+  # SwiGLU FFN inner dim. ≈ 8/3·d_model keeps total FFN params close to
+  # the previous GELU 4·d_model budget. Set to null to auto-pick.
+  d_ff_inner:      10944
+  # T3: 500M params on 600k pairs → over-capacity. 0.1 dropout closes the
+  # ~4× train-val KL gap seen at trial 2. Set to 0.0 to disable T3.
+  dropout:         0.1
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.01
+  betas:           [0.9, 0.95]
+  warmup_steps:    500
+  max_steps:       20000
+  scheduler:       cosine                      # cosine | linear
+  grad_clip:       1.0
+  precision:       bf16                        # bf16 | fp16 | fp32
+
+loss:
+  # T1: MSE in post-`final_norm` space aligns the MSE gradient with the
+  # directions `lm_head` reads. Post-norm MSE sits at O(1) instead of O(10²),
+  # so λ_mse rescaled 0.1 → 1.0 to keep MSE on the same order as KL+BCE.
+  # To exactly restore trial-2 loss: mse_space=raw, lambda_mse=0.1.
+  mse_space:       final_norm                  # raw | final_norm
+  lambda_mse:      1.0
+  lambda_kl:       1.0
+  lambda_conf:     1.0
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M1.5-tier1-llada             # separate from M1-llada
+  log_every:       50
+  val_every:       500
+  gsm8k_every:     5000
+  gsm8k_subset:    50
+  # T4 (eval-time per_pos_threshold sweep) on the trial-2 checkpoint may
+  # produce a better default than 0.85; override via --override
+  # log.gsm8k_per_pos_threshold=<winner> if so.
+  gsm8k_per_pos_threshold: 0.85
+  bins_gap:        [1, 2, 3, 4, 5]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  keep_last:       3
+  out_dir:         ckpts/m1_5_tier1_llada_variant_c

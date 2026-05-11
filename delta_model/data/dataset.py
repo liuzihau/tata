@@ -300,6 +300,41 @@ class TataDeltaDataset(Dataset):
         }
 
 
+    # ------------------------------------------------------------------
+    # Sampling weights (T2; engineering.md §3.4)
+    # ------------------------------------------------------------------
+
+    def compute_index_weights(
+        self, *, ref0_weight_multiplier: float,
+    ) -> torch.Tensor:
+        """Per-index sampling weight for use with WeightedRandomSampler.
+
+        Pairs with `i_ref == 0` get weight `ref0_weight_multiplier`; all
+        others get `1.0`. The standard `WeightedRandomSampler` normalizes
+        these to a probability distribution, so absolute scale doesn't
+        matter — only the ratio.
+
+        Why: at inference, `h_ref` is captured at pass 0 and refreshed
+        only via rollback, so ~80–95% of delta forwards have `i_ref = 0`.
+        At training, only 5/15 = 33% of enumerated pairs have `i_ref = 0`.
+        This sampler closes that train-inference distribution mismatch.
+
+        Returns `torch.Tensor[float32]` of shape `(len(self.index),)`.
+        """
+        if ref0_weight_multiplier <= 0:
+            raise ValueError(
+                "ref0_weight_multiplier must be > 0; "
+                f"got {ref0_weight_multiplier!r}"
+            )
+        weights = torch.ones(len(self.index), dtype=torch.float32)
+        if ref0_weight_multiplier == 1.0:
+            return weights
+        for k, (_s, _b, i_ref, _i_tgt) in enumerate(self.index):
+            if i_ref == 0:
+                weights[k] = float(ref0_weight_multiplier)
+        return weights
+
+
 def make_train_val_filter(val_frac: float, seed: int = 42) -> tuple[Callable, Callable]:
     """Return (train_filter, val_filter) that partition by sample index hash.
 

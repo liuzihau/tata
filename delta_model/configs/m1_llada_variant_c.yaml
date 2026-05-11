@@ -1,4 +1,9 @@
-# M1 default config — LLaDA-8B + VariantC + 5000 train samples + 800 stable test.
+# M1 trial-2 baseline config — LLaDA-8B + VariantC + 5000 train samples + 800 stable test.
+#
+# This file is the *trial-2 baseline of record* (GSM8K 0.28 → 0.44 result).
+# For the M1.5 Tier-1 trial (T1 final_norm MSE + T2 i_ref-biased sampler +
+# T3 dropout), use `m1_5_llada_variant_c.yaml` instead — separate run_name /
+# wandb group / checkpoint dir so the two trials don't collide.
 #
 # Knobs the user is likely to tune:
 #   - data.subset_ratios       chat/math/code/stem mix
@@ -29,6 +34,9 @@ data:
   # samples × 16 MiB; turn off only if RAM-constrained.
   preload:         true
   mask_token_id:   126336
+  # ref0_weight_multiplier: omitted → uniform sampling (i.e. 1.0). Tier-1
+  # config (m1_5_llada_variant_c.yaml) sets this to 3.0 to bias toward
+  # i_ref=0 pairs; this baseline keeps the trial-2 uniform sampler.
 
 model:
   variant:         C                           # C (M1) | B | A
@@ -52,6 +60,9 @@ optim:
   precision:       bf16                        # bf16 | fp16 | fp32
 
 loss:
+  # Trial-2 baseline: raw-h MSE, λ_mse=0.1. Tier-1 trial switches to
+  # final_norm-space MSE with λ_mse=1.0 (see m1_5_llada_variant_c.yaml).
+  mse_space:       raw                         # raw | final_norm
   lambda_mse:      0.1
   lambda_kl:       1.0
   lambda_conf:     1.0

@@ -194,10 +194,17 @@ def _lr_schedule(step: int, *, warmup: int, total: int, base_lr: float,
 
 @torch.no_grad()
 def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
-            lambda_mse, lambda_kl, lambda_conf, bins_gap, bins_reveal,
+            lambda_mse, lambda_kl, lambda_conf, mse_space,
+            bins_gap, bins_reveal,
             max_batches: int = 50,
             device="cuda", dtype=torch.bfloat16) -> dict:
-    """Compute val loss components + per-bin breakdowns."""
+    """Compute val loss components + per-bin breakdowns.
+
+    Per-bin MSE is computed in the *same* space as the loss (`mse_space`)
+    so the binned diagnostic stays comparable to `val/mse`. When
+    `mse_space="final_norm"` this means computing one extra RMSNorm
+    forward on `h_pred` / `h_target` per batch — cheap.
+    """
     model.eval()
     sums = defaultdict(float); counts = defaultdict(int)
     bin_sums = defaultdict(lambda: defaultdict(float))
@@ -223,17 +230,24 @@ def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
             batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
             final_norm, lm_head,
             lambda_mse=lambda_mse, lambda_kl=lambda_kl, lambda_conf=lambda_conf,
+            mse_space=mse_space,
         )
         for k, v in loss_dict.items():
             sums[k]   += float(v.item())
             counts[k] += 1
 
-        # Per-(gap, reveal_bin) sums of MSE per row.
+        # Per-(gap, reveal_bin) sums of MSE per row, in the loss's space.
         gap = (batch["i_target"] - batch["i_ref"]).numpy()              # [B]
         reveal = batch["reveal_frac"].numpy()                            # [B]
         with torch.no_grad():
-            row_mse = ((delta_h - (batch_dev["h_target"] - batch_dev["h_ref"]))
-                        ** 2).mean(dim=(1, 2))                           # [B]
+            if mse_space == "final_norm":
+                h_pred_v   = batch_dev["h_ref"] + delta_h
+                fn_pred_v  = final_norm(h_pred_v)
+                fn_tgt_v   = final_norm(batch_dev["h_target"])
+                row_mse    = ((fn_pred_v - fn_tgt_v) ** 2).mean(dim=(1, 2))   # [B]
+            else:
+                row_mse = ((delta_h - (batch_dev["h_target"] - batch_dev["h_ref"]))
+                            ** 2).mean(dim=(1, 2))                           # [B]
             row_mse_np = row_mse.float().cpu().numpy()
         for r_idx in range(len(gap)):
             g = int(gap[r_idx])
@@ -335,11 +349,38 @@ def main() -> None:
     print(f"[train] train pairs={len(train_ds)}  val pairs={len(val_ds)}",
           flush=True)
 
-    train_dl = DataLoader(
-        train_ds, batch_size=cfg.data.batch_size, shuffle=True,
-        num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
-        drop_last=True, persistent_workers=cfg.data.num_workers > 0,
-    )
+    # Optional i_ref-biased sampler (T2; engineering.md §3.4). When the
+    # multiplier is 1.0 (off), fall back to the standard random-shuffle
+    # loader. When > 1, build a WeightedRandomSampler that up-weights
+    # pairs with i_ref == 0 toward the inference distribution.
+    ref0_mult = float(getattr(cfg.data, "ref0_weight_multiplier", 1.0))
+    if ref0_mult != 1.0:
+        weights = train_ds.compute_index_weights(
+            ref0_weight_multiplier=ref0_mult,
+        )
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights, num_samples=len(train_ds), replacement=True,
+        )
+        train_dl = DataLoader(
+            train_ds, batch_size=cfg.data.batch_size,
+            sampler=sampler, shuffle=False,
+            num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
+            drop_last=True, persistent_workers=cfg.data.num_workers > 0,
+        )
+        n_ref0 = int((weights == ref0_mult).sum().item())
+        n_other = len(weights) - n_ref0
+        p_ref0 = (n_ref0 * ref0_mult) / (n_ref0 * ref0_mult + n_other)
+        print(
+            f"[train] i_ref-biased sampler: ref0_weight_multiplier={ref0_mult} "
+            f"→ P(i_ref=0) ≈ {p_ref0:.2f} ({n_ref0} ref0 pairs, {n_other} others)",
+            flush=True,
+        )
+    else:
+        train_dl = DataLoader(
+            train_ds, batch_size=cfg.data.batch_size, shuffle=True,
+            num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
+            drop_last=True, persistent_workers=cfg.data.num_workers > 0,
+        )
     # Mirror the training loader's worker count exactly: if cfg.data.num_workers
     # is 0 (e.g. constrained /dev/shm), val must also be 0, otherwise the first
     # val pass spawns a worker and SIGBUSes on shm.
@@ -419,6 +460,7 @@ def main() -> None:
                 lambda_mse=cfg.loss.lambda_mse,
                 lambda_kl=cfg.loss.lambda_kl,
                 lambda_conf=cfg.loss.lambda_conf,
+                mse_space=getattr(cfg.loss, "mse_space", "raw"),
             )
 
         with timers.time("bwd"):
@@ -467,6 +509,7 @@ def main() -> None:
                     lambda_mse=cfg.loss.lambda_mse,
                     lambda_kl=cfg.loss.lambda_kl,
                     lambda_conf=cfg.loss.lambda_conf,
+                    mse_space=getattr(cfg.loss, "mse_space", "raw"),
                     bins_gap=cfg.log.bins_gap,
                     bins_reveal=cfg.log.bins_reveal,
                     device=device, dtype=dtype,

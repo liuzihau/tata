@@ -1,196 +1,382 @@
-# Intra-block delta model — research idea
+# tata — intra-block delta model for masked-diffusion LMs
 
-Brainstorm note. Informed by `intra_block_drift_findings.md` and the
-`prediction_overlap` panel from `probe_runner`. Recorded here so the
-direction isn't lost while the T3 axis-3 work wraps up.
-
-> **Indexing convention in this doc.** "Pass 1" = the *first* think forward
-> of a block (what T3 caches as `talk_rps`). "Pass 2, 3, …" = the
-> subsequent parallel-decode forwards within the same block. In the
-> probe_runner code these correspond to `pass_idx = 0, 1, 2, …`, but the
-> human-friendly 1-indexed numbering is used here.
+A research note in the style of an informal short paper. Audience: a
+reader who's never seen this project and wants to understand *why* it
+exists and what we're aiming for. For implementation status and code
+contracts, see `engineering.md`. For how to actually run things, see
+`usage.md`.
 
 ---
 
-## Empirical anchor
+## 1 · Problem and motivation
 
-LM-head shared probability mass between **pass 1** and a **later pass within
-the same block**, measured per-position then averaged:
+Masked diffusion language models like LLaDA-8B and Dream-7B generate
+text in **blocks**, with each block decoded over multiple **iterations**.
+At each iteration the model runs a full forward pass over the entire
+sequence, picks a few high-confidence positions to commit, and leaves
+the rest masked for the next iteration. With `block_length = 32` and
+up to `max_iter = 6` iterations per block, an 8-block / 256-token
+generation takes up to 48 full backbone forwards. Fast-dLLM
+(Niu et al. 2025; `external/Fast-dLLM/v1/llada/generate.py:132`)
+amortizes this by caching the prefix KV at each block's pass-1
+forward — but the in-block forwards themselves are still
+backbone-sized.
 
-```
-shared_mass(p_1, p_i) = Σ_x min( softmax(lm_head(ln_f(h_1)))(x),
-                                 softmax(lm_head(ln_f(h_i)))(x) )
-```
+**Question.** Inside a single block, how different are the per-pass
+hidden states from each other? Specifically, between pass 1 (the first
+forward of a block) and pass `i` (a later iteration), how much do the
+model's final-layer outputs actually change?
+
+**Answer (from the `probe_runner` measurement).** LM-head shared
+probability mass — the speculative-decoding acceptance rate metric of
+Leviathan et al. 2023 and Chen et al. 2023, defined as
+`Σ_x min(p_pass1(x), p_passi(x))` — between pass 1 and pass `i`,
+averaged per position:
 
 | pair | shared mass |
-|------|------------:|
+|---|---:|
 | pass 1 → pass 2 | ~0.80 |
 | pass 1 → pass 3 | ~0.62 |
 | pass 1 → pass 4 | ~0.60 |
 | pass 1 → pass 5 | ~0.58 |
 
-The pattern is consistent across **LLaDA-8B** and **Dream-7B**. Sharp drop
-between pass 2 and pass 3, then near-plateau in the high-50s / low-60s.
+Consistent across LLaDA-8B and Dream-7B. There's a sharp drop between
+pass 2 and pass 3, then a near-plateau in the high-50s / low-60s.
 
-This is the same metric used as the speculative-decoding acceptance rate in
-Leviathan et al. 2023 / Chen et al. 2023 — i.e. if pass 1 were used as a
-draft and pass-`i` as the target, we'd accept ~80%, ~62%, ~60%, ~58% of
-positions.
-
----
-
-## Why this validates that T3's talk model works at all
-
-T3's talk model consumes `talk_rps` *cached at pass 1* and is asked to
-denoise across many subsequent passes within the same block. The empirical
-floor of **~58–60% LM-head overlap** between pass 1 and any later pass
-means the pass-1 representation is not random — it already encodes most of
-what the eventual prediction will be. The talk model only needs to recover
-the residual ~40%.
-
-That's the regime in which a small follow-up model can plausibly succeed:
-the draft-vs-target overlap is high enough that the task becomes
-*correction*, not *prediction-from-scratch*.
+**The implication.** Most of what pass `i` produces is already encoded
+in pass 1. If we could approximate the *delta* from pass 1 to pass `i`
+with a much smaller network, we'd save N-1 full backbone forwards per
+block at the cost of one small-network forward each.
 
 ---
 
-## Where T3's specific design leaves quality on the table
+## 2 · Idea: a lightweight delta predictor
 
-(All four critiques are about retaining the original think model's
-quality. Speed/size discussion is deferred.)
+Train a small model `f_Δ` that, given the pass-1 hidden state `h_ref`
+(the most recent backbone forward in this block) and the current
+revealed-token pattern, predicts the **delta** `Δh` such that
+`h_ref + Δh ≈ h_target`, where `h_target` is what the backbone *would*
+have produced at some later iteration `i_target`. Reconstruct the
+final-layer hidden via `h_predicted = h_ref + Δh`, pass it through the
+frozen `lm_head(final_norm(·))`, and use the resulting logits to commit
+tokens via the standard Fast-dLLM transfer rule.
 
-1. **Fuses three layer outputs.** T3's `talk_rps` is the EAGLE3-style
-   concatenation of layers `0`, `1`, and `last`. The fusion may be a good
-   choice but it hasn't been carefully ablated — different layer triples
-   could be better.
-2. **Prunes the last two transformer layers** of the think backbone before
-   feeding the talk side. The intra-block drift plots show the last few
-   layers are precisely the ones that recover prediction-level
-   overlap; pruning them likely costs quality the talk model has to make
-   up.
-3. **Iteratively updates the hidden representation** fed to the talk
-   model. Each denoise step modifies `talk_rps`, which then feeds the
-   next step. Errors at one step propagate into the next — classic
-   accumulation problem.
-4. **Generates a brand-new hidden representation** at every denoise step
-   rather than predicting a *correction* to the existing one. A fresh
-   prediction has to be right in absolute terms; a correction has a
-   stable baseline (the think backbone's last-layer output) and only has
-   to capture what changes.
+At inference, the backbone runs once at the start of each block (pass 0)
+and refreshes h_ref via a partial-forward rollback only when a
+confidence head says the prediction is suspect. The delta model handles
+all other in-block iterations.
 
-Issues (1)–(3) are observations on the existing architecture. Issue (4)
-is what motivates the alternative below.
+### Why this might work
 
----
+- **Anchored prediction beats from-scratch prediction.** The delta model
+  doesn't have to reconstruct the residual stream; it only has to
+  correct a baseline that's already 60-80% right (per shared-mass
+  numbers above). Strong inductive prior.
+- **No error accumulation across iterations.** Every iteration's
+  prediction is computed from the *same* h_ref captured at pass 1 — the
+  delta model never reads its own output. Compare against approaches
+  that iteratively update a draft representation (e.g. T3's talk-model
+  loop), which suffer from compounding drift.
+- **Zero-init friendly.** With the Δh projection initialized to zero
+  (ControlNet / Flamingo recipe), the model at step 0 emits `Δh = 0`,
+  i.e. `h_predicted = h_ref`. That's exactly the "reuse pass-1 output
+  for all later passes" baseline. Training can only do better.
 
-## Proposed direction: a lightweight delta model
+### Inputs to `f_Δ`
 
-Replace the current talk model with one trained to predict the
-**deviation** between the pass-1 final-layer hidden state and the
-eventual pass-`i` final-layer hidden state. Add the deviation back to
-the cached pass-1 representation; pass the result through the original
-LM head.
+| input | provenance |
+|---|---|
+| `h_ref` ∈ ℝ^{32 × d_model} | backbone's last-layer hidden state at the block, from pass 1 (or a rollback) |
+| `prev_emb` ∈ ℝ^{32 × d_model} | per-position token embedding of the *current* x state — revealed tokens use their actual ID, unrevealed positions use the mask-token embedding |
+| `prefix_kv` ∈ ℝ^{2 × n_kv_heads × W × d_head} | cached K/V at the last layer for the W tokens just before the block (W = 32 at train, up to 64 stored) |
+| `block_start_pos` ∈ ℤ | absolute position of the block's first token in the sequence; used to drive RoPE at training-aligned positions |
 
-### Inputs
+### Outputs
 
-- **Prefix-token KV cache** — from the original think model's pass-1
-  forward (the prompt + already-decoded blocks; same KV the original
-  model would attend to at pass `i`).
-- **Pass-1 last-layer hidden state**, `h_1`, treated as another KV-like
-  input the delta model attends to (cross-attention-style conditioning,
-  not a residual stream).
-- **Embedded tokens decoded during the previous iteration** — the only
-  thing in `x` that's changed since the last forward, and therefore the
-  signal the delta model needs to predict the new gap.
-
-### Output
-
-```
-Δh  ∈  ℝ^{block_length × d_model}
-```
-
-A per-position correction at the **last layer's resolution** of the
-think model.
+- `Δh` ∈ ℝ^{32 × d_model} — per-position correction added to `h_ref`.
+- `c_pos` ∈ (0,1)^{32} — per-position confidence. At inference, a
+  position commits only if Fast-dLLM's transfer rule selects it AND
+  `c_pos[i] ≥ per_pos_threshold` ("agreement decoding"; §4 below).
 
 ### Reconstruction
 
 ```
-h_i_predicted   = h_1 + Δh
-logits_i        = lm_head(final_norm(h_i_predicted))
+h_predicted = h_ref + Δh
+logits      = lm_head(final_norm(h_predicted))
 ```
 
 ### Training target
 
-Run the original think model for `i` iterations under the standard
-Fast-dLLM dual-cache + parallel-decoding protocol; capture the actual
-last-layer hidden state `h_i_actual`. Train the delta model to predict
-`Δh = h_i_actual − h_1`. Loss: probably MSE on `Δh`, possibly with an
-auxiliary KL on the LM-head logit distribution (matches the metric
-that ultimately matters for accuracy).
+Run the backbone for up to `max_iter = 6` iterations under Fast-dLLM's
+prefix-cache decoding protocol; cache `h_per_pass[1..6]` and the
+per-iter reveal patterns. For each `(i_ref, i_target)` pair with
+`1 ≤ i_ref < i_target ≤ 6`, supervise:
 
-### Inference loop (block-internal)
+```
+L = λ_mse · MSE(Δh_pred, h_target − h_ref)
+  + λ_kl  · KL(p_actual ‖ p_predicted) at mask positions
+  + λ_conf · BCE(c_pos, shared_mass(p_actual, p_predicted)) at mask positions
+```
 
-1. Run the original think model **once** at pass 1. Cache:
-   - prefix KV (prompt + earlier blocks),
-   - last-layer hidden state `h_1` for the current block.
-2. For iterations 2, 3, …:
-   - Embed the tokens revealed in the previous iteration.
-   - Feed `(prefix KV, h_1, prev-iter token embeddings)` to the delta
-     model → get `Δh`.
-   - Compute `h_i_predicted = h_1 + Δh`.
-   - Compute `logits_i = lm_head(final_norm(h_i_predicted))`.
-   - Reveal new tokens by the standard Fast-dLLM
-     confidence-thresholded transfer rule.
-3. Repeat until the block is fully decoded.
-
-The think backbone is **never re-run within a block** — only the delta
-model runs at iterations 2+. That's where the speed win lives. Quality
-is preserved (or at least bounded) because the prediction is anchored
-to `h_1` rather than reconstructed from scratch.
+where `p_actual = softmax(lm_head(final_norm(h_target)))` and similarly
+for `p_predicted`. MSE preserves hidden-state magnitude; KL preserves
+the distribution that ultimately matters (small Δh errors at
+high-confidence positions can blow up into large logit errors); the
+confidence-head loss trains a per-position gate for inference.
 
 ---
 
-## How this addresses the four T3 critiques
+## 3 · Locked design (M1)
 
-| # | T3 issue | Delta-model response |
+| axis | choice | rationale |
 |---|---|---|
-| 1 | Fuses three layer outputs (untrained-curated layer choice) | Δh is added to **one** layer (the last). No fusion choice to ablate. |
-| 2 | Prunes last two transformer layers | Uses the **full** think backbone for pass 1; no layers pruned. The delta model sits *next to* the backbone, not in place of its tail. |
-| 3 | Iteratively updates the rps that feeds itself (error accumulation) | Predictions at all iterations are anchored to the **fixed** pass-1 hidden state `h_1`. The delta model never reads its own previous output, so errors cannot compound across iterations. |
-| 4 | Outputs a from-scratch representation | Outputs a **correction** Δh, not a full representation. The model has a strong baseline (h_1, ~60–80% LM-head overlap with truth) and only has to learn the residual. |
+| Per-base-model | LLaDA-8B and Dream-7B trained separately | No cross-model transfer goal yet. |
+| Block size | 32 (Fast-dLLM default) | Matches the baseline. |
+| Δh resolution | every block position (32) | CC (already-committed) positions learn Δh ≈ 0 organically. |
+| Conditioning layer | last layer only | M1 simplification. Multi-layer fusion (EAGLE-3) deferred to M2. |
+| Prefix-KV scope | last layer, last `W = 32` tokens (stored up to 64) | Limits cache size; compensates with strong `h_ref` (carries earlier context via bidirectional attention). |
+| Δh head init | zero-init | At step 0, model = "reuse h_ref" baseline. |
+| Model size | 2 transformer layers, d_model matched to backbone | Scale up only if M1 plateaus. |
+| Iteration-index embedding | **none** | `Δh` is deterministic given `h_ref` + reveal pattern. |
+| Decoding mode | `factor = 1.0` (Fast-dLLM dynamic per-rank threshold) | Paper-recommended; must match between collect and eval. |
+| Sampling at training | uniform over `(i_ref, i_target)` pairs | No curriculum unless v0 plateaus. |
+
+Loss weights at M1: `λ_mse = 0.1`, `λ_kl = 1.0`, `λ_conf = 1.0`. (See
+§2.4 of `engineering.md` for the back-of-envelope that motivates this
+balance.)
 
 ---
 
-## Open questions before scoping an implementation
+## 4 · Architecture variants
 
-1. **Is `Δh` learnable in practice?** Distribution of `h_i − h_1` needs
-   to be characterised first — magnitude, anisotropy, correlation with
-   simple features (last-iter revealed tokens, position-in-block, layer
-   index).
-2. **What input feature set is enough?** Prefix KV alone may
-   underdetermine `Δh`. The previous-iteration revealed tokens are the
-   obvious candidate. Whether `h_1` itself needs to be a cross-attention
-   key/value bank or just a residual baseline is open.
+All three share: 2 transformer layers, d_model = backbone d_model,
+n_heads matched to backbone, zero-init Δh head, per-position confidence
+head. They differ in how `h_ref` and `prev_emb` are combined.
+
+| variant | mechanism | rationale |
+|---|---|---|
+| **C** (M1 default) | concat `h_ref ⊕ prev_emb` along the sequence axis (length 2·32); segment embed distinguishes the two halves; self-attn + cross-attn into prefix_kv at each layer; take the prev_emb half for the Δh head | Simplest. If A/B don't beat this, the conditioning style isn't doing work. |
+| **B** (M2 candidate) | `prev_emb` is the residual stream; `h_ref` pooled to predict per-layer AdaLN-Zero `(γ, β)` | Param-efficient. Lit hint: AdaLN-Zero wins at low-dim conditioning. |
+| **A** (M2 candidate) | `prev_emb` as residual stream; `h_ref` as frozen K/V bank for gated cross-attention (Flamingo-style) | Lit's default for high-dim conditioning. Closest match to "h_ref is the anchor; prev_emb is the perturbation." |
+
+Implementation order: C → B → A (cheapest debug → richest model).
+
+---
+
+## 5 · Alignment chain (collect ↔ baseline ↔ inference)
+
+This is load-bearing: the delta model's training-target distribution
+must equal what the inference baseline produces, or comparisons lose
+meaning.
+
+| stage | pass 0 of block | iter ≥ 1 within block | "redo" within block |
+|---|---|---|---|
+| baseline `generate_with_prefix_cache` | full forward | partial forward w/ cached prefix | n/a |
+| collect (`collect_llada.py`) | full forward + prefix_kv extraction + cache_to_s | partial forward w/ cache_to_s, capture h_per_pass[i] | n/a |
+| inference (`hybrid_runner.py`) | full forward, capture h_ref + prefix_kv + cache_to_s | delta forward (no backbone) | partial forward w/ pass-0 cache (rollback) |
+
+All three paths use the same `model(x[:, s:], past_key_values=past_to_s, use_cache=True)` call whenever they need a backbone hidden state for an in-block update. h_per_pass[i] (training target), baseline h, and rollback-refreshed h_ref are all from the same distribution.
+
+This alignment surfaced two real bugs and one false alarm during
+development; the full postmortem lives in `engineering.md` §6.
+
+---
+
+## 6 · Milestones
+
+- **M0 — characterization (done, lives in `probe_runner`).** Measure
+  Δh = h_i − h_1 distribution from cached probe data. Decision gate:
+  if Δh is too high-variance or unstructured, redesign loss before
+  spending compute. Result: distribution is structured; proceed.
+- **M1 — variant C end-to-end, LLaDA-8B, 5000 prompts.** Loss curve
+  drops; zero-init invariant holds at step 0; mid-train GSM8K stays
+  within ε of vanilla `generate_with_prefix_cache`.
+  - Trial 1: GSM8K 0.72 baseline → 0.10 at 15k (post-mortem in §3.1
+    / §3.2 of `engineering.md`).
+  - Trial 2 (after BCE fix, agreement decoding, alignment audit):
+    GSM8K 0.28 → **0.44** at later checkpoint. Real progress; still
+    0.28 short of baseline 0.72.
+- **M1.5 — Tier 1 fixes (loss-space + sampler + dropout).** From the
+  trial-2 diagnosis: train-val KL gap is ~4× while MSE gap is ~1.2×,
+  i.e. MSE has saturated at the fp16 noise floor while KL still
+  generalizes poorly. That, plus the fact that MSE consumes 76% of
+  weighted training gradient, says the dominant lever is **loss-space
+  misallocation**, not capacity or architecture. Three changes
+  shipped together:
+  - **T1 (= M1.5 A) — MSE in `final_norm` space.** Replace
+    `MSE(Δh_pred, h_target − h_ref)` with
+    `MSE(final_norm(h_ref + Δh_pred), final_norm(h_target))`.
+    Aligns MSE gradient with the subspace `lm_head` actually reads.
+    Rescale `λ_mse` from 0.1 to ~1.0 (post-norm MSE sits at O(1)
+    instead of O(10²)).
+  - **T2 — i_ref-biased sampler.** Training currently sees only 33%
+    of pairs with `i_ref = 0` (5/15 per block); inference is ~80-95%
+    `i_ref = 0`. Use `WeightedRandomSampler` with `ref0` weight
+    multiplier (default 3 → 60% `i_ref = 0`, tunable).
+  - **T3 — dropout 0.1 in the delta model.** ~500M params trained on
+    ~600k pairs → over-capacity. Config-only knob; closes the
+    train-val gap.
+- **M1.6 — Loss simplification ablation (M1.5 B).** After T1 lands a
+  stable baseline, ablate `λ_mse = 0`. If GSM8K within ε, ship the
+  simpler 2-term loss (KL + BCE) per the LeWM "fewer terms beat
+  heuristics" recipe. If worse, T1 keeps MSE.
+- **M2 — Tier 2 + variants A and B, LLaDA-8B.** Larger experiments
+  conditioned on Tier 1 outcomes:
+  - **T5 — scale data (5000 → 15000–20000 prompts).** Closes the
+    residual train-val KL gap. Pure collect cost (no code change).
+  - **T6 — multi-layer hidden fusion (EAGLE-3 hint).** Requires
+    recollect; only attempt if Tier 1 + T5 plateau below 0.65.
+  - **Variants A (cross-attn anchor) / B (AdaLN-Zero).** Compare on
+    val-shared-mass and swap-in GSM8K accuracy, binned by gap and
+    reveal-fraction.
+  - **T8 (= old C) — sliced 1-D distribution-matching regularizer**
+    on `h_pred` vs `h_target`. SIGReg's projection-based mechanism,
+    retargeted from anti-collapse to anti-drift. Gate: only attack
+    if per-bin val diagnostic shows late-iter / high-reveal degradation
+    after Tier 1 lands.
+- **M3 — replicate winning variant on Dream-7B.** Confirms the recipe
+  is base-model-portable in methodology (separate trained delta
+  models, same architecture).
+
+### Out-of-tier eval action
+
+**T4 — `per_pos_threshold` sweep at the current checkpoint.** The
+0.85 default at `gsm8k_per_pos_threshold` was picked at design time,
+not tuned. Hybrid GSM8K accuracy is non-monotone in threshold (low =
+bad commits, high = unnecessary rollbacks). Run the existing eval
+harness's sweep over {0.70, 0.80, 0.85, 0.90, 0.95} before any
+retraining. Could surface a 0.44 → 0.50+ at zero cost. Command in
+`usage.md`.
+
+---
+
+## 7 · Open research questions
+
+1. **Is Δh learnable in practice?** M0 said yes, but the eventual M1
+   GSM8K curve is the real answer.
+2. **What feature set suffices?** Prefix KV alone might
+   underdetermine Δh. `prev_emb` is the obvious extra signal. Whether
+   `h_ref` itself wants a cross-attention bank or just a residual
+   baseline is the A-vs-C question.
 3. **How small can the delta model be?** EAGLE / EAGLE-3 scale
-   (~4–6 transformer layers, ~700M params on a 7B target) is one
-   reasonable anchor.
-4. **Does it transfer across base models?** A delta model trained for
-   LLaDA-8B may or may not transfer to Dream / Qwen. Need a
-   transferability ablation early.
-5. **What's the right loss?** Pure MSE on `Δh` may be insufficient if
-   small `Δh` errors get amplified by `lm_head` into large logit /
-   distribution errors at high-confidence positions. Auxiliary
-   distribution-level loss (KL on LM-head softmax, or `1 − shared_mass`)
-   probably needed.
-6. **Does it preserve the speculative-decoding-style acceptance gain?**
-   I.e. when we replace the second-pass forward with `h_1 + Δh`, do we
-   recover the prediction-overlap floor we measured? If yes, the delta
-   model is doing its job; if no, the residual we're failing to predict
-   is what costs accuracy.
+   (4–6 transformer layers, ~700M params on a 7B target) is one
+   reasonable anchor. M1 starts at 2 layers.
+4. **Does it transfer across base models?** A delta trained for
+   LLaDA-8B may or may not transfer to Dream-7B. M3 tests this — we
+   expect *no* transfer (architectures differ in subtle ways), but the
+   methodology should transfer.
+5. **Right loss balance?** Pure MSE on Δh is insufficient when small
+   Δh errors amplify into large logit errors at high-confidence
+   positions. The KL term addresses this. Whether the per-position
+   BCE confidence loss helps in practice is the M1 trial-2 question.
+6. **Does it preserve the speculative-decoding acceptance gain?** If
+   we replace pass `i`'s backbone with `h_1 + Δh`, do we recover the
+   measured shared-mass floor (~58–80%)? If yes, the delta model is
+   doing its job. If no, the residual we're failing to predict is
+   what costs accuracy.
+7. **What is the right loss space?** MSE in `losses.py` operates on
+   raw h (every coordinate weighted equally), but `lm_head` reads via
+   RMSNorm + a linear that weights directions very unevenly — some
+   h-coordinates contribute nothing to the logits, so MSE gradient on
+   them is wasted. Is post-`final_norm` MSE strictly better? Is MSE
+   necessary at all once KL is in place? M1.5 (T1) and M1.6 (B) test
+   these. LeWM (arXiv:2603.19312) makes the analogous point on its
+   end: the LN'd CLS embedding is the wrong space for their
+   anti-collapse regularizer, fixed by a learned post-LN projector.
+   Trial-2 evidence supports T1 directly: train-val gap is ~4× on KL
+   (post-`lm_head` space) but only ~1.2× on MSE (raw-h space), i.e.
+   MSE has saturated at the fp16 noise floor while KL is still
+   learning generalizable structure.
+8. **Train-inference distribution mismatch in `i_ref`.** The dataset
+   enumerates all `(i_ref, i_target)` pairs with `i_ref < i_target`;
+   only 5/15 = 33% have `i_ref = 0`. At inference, `h_ref` is captured
+   at pass 0 and refreshed only via rollback, so the inference
+   distribution is ~80–95% `i_ref = 0` (rate-of-rollback-dependent).
+   The model spends ⅔ of its gradient on pairs it almost never sees
+   at inference. M1.5 (T2) addresses this with a weighted sampler.
+   Open: what's the *actual* inference `i_ref` distribution per
+   rollback rate? Diagnostic to land in M1.5 trial.
 
 ---
 
-## Status
+## 8 · How this relates to T3 and prior work
 
-Brainstorm. Recorded here while T3 axis 3 finishes. Discussion welcome —
-this is intentionally open-ended.
+Closest prior work: **EAGLE-1** (arXiv:2401.15077) — predicts
+hidden-state corrections for speculative decoding on autoregressive
+LMs. We take the same shape of idea (lightweight head predicts a hidden
+correction; reconstruct logits via the frozen LM head) but apply it to
+the diffusion-decoding regime, where the structure is "many iterations
+of the same block" rather than "many tokens of an autoregressive
+sequence."
+
+Design hints from elsewhere:
+- **ControlNet / Flamingo** — zero-init the output projection so the
+  base behavior is preserved at step 0.
+- **DiT (AdaLN-Zero)** — variant B's modulation recipe.
+- **EAGLE-3** — multi-layer hidden fusion. Deferred to M2.
+- **LeWM (arXiv:2603.19312, Maes et al. 2026).** A JEPA world model
+  whose two-term loss (next-embedding prediction + an anti-collapse
+  SIGReg term) yielded three transferable lessons:
+  **(A)** compute the regression loss in a space the downstream
+  consumer actually reads (their LN-escape projector → our
+  `final_norm`-aligned MSE, M1.5);
+  **(B)** fewer well-chosen loss terms beat many heuristics (their
+  2-term recipe → our `λ_mse = 0` ablation, M1.5);
+  **(C)** SIGReg's sliced-projection mechanism (random unit
+  directions + a 1-D distribution-matching statistic + Cramér–Wold)
+  is reusable beyond Gaussian targets — we retarget it from
+  anti-collapse to anti-drift, matching `h_pred`'s batch-marginal
+  distribution to `h_target`'s (M2).
+  The bulk of LeWM's machinery (SIGReg's N(0, I) target, end-to-end
+  encoder training, no-stop-grad / no-EMA stability tricks) doesn't
+  port because we are supervised with a frozen encoder — collapse is
+  not our failure mode. Only the loss-space lessons and the
+  random-projection mechanism transfer.
+
+T3 (this repo's earlier "Think-Then-Talk" line) has a "talk model" that
+denoises an EAGLE-3-style fused hidden representation. The four design
+critiques that motivated the delta-model proposal:
+
+1. T3 fuses three layer outputs without ablating which triple is best.
+   The delta model uses one layer (last) — no fusion choice to defend.
+2. T3 prunes the last two transformer layers of the think backbone.
+   Empirically those layers are where prediction-overlap recovers.
+   The delta model attaches *beside* the full backbone, prunes nothing.
+3. T3 iteratively updates the representation that feeds itself,
+   accumulating errors. The delta model is anchored to a fixed h_ref
+   per block — errors cannot compound across iterations.
+4. T3 outputs a from-scratch representation. The delta model outputs
+   a *correction*, leveraging a strong baseline.
+
+---
+
+## 9 · Status snapshot (2026-05-12)
+
+M0 done. M1 trial 1 reproduced an alarming GSM8K decline
+(0.72 baseline → 0.10 at step 15k). M1 trial 2 landed with the
+following fixes: BCE-target clamp (fp32-softmax roundoff),
+agreement decoding via the per-position confidence head, alignment
+audit of the rollback path. Result: **GSM8K 0.28 → 0.44** at later
+checkpoint, real progress, but still 0.28 short of baseline 0.72.
+
+Trial-2 diagnosis:
+
+- **Train-val gap is concentrated on KL (~4×), not MSE (~1.2×).**
+  Loss-space misallocation: MSE on raw h has saturated at the fp16
+  noise floor while KL is still learning. Yet MSE consumes 76% of
+  weighted training gradient because λ_mse=0.1, MSE~14 vs λ_kl=1.0,
+  KL~0.07. Direct evidence that **T1 (M1.5 A; final_norm-space MSE)
+  is the dominant lever**.
+- **Train-inference `i_ref` mismatch.** Training is 33% `i_ref = 0`;
+  inference is ~80–95%. Two-thirds of training gradient is spent on
+  pairs almost never seen at inference. Addressed by T2 (weighted
+  sampler).
+- **Over-capacity for current data.** ~500M params, ~600k training
+  pairs, ~8.5 epochs. Dropout=0 in the delta model. T3 turns dropout
+  up to 0.1; T5 scales data in M2 if Tier 1 plateaus.
+
+Next concrete action (M1.5, **current focus**): land T1 + T2 + T3
+together, retrain on existing cache, measure GSM8K and the train-val
+KL gap. T4 (eval-time threshold sweep on the current checkpoint) is
+free and should be run alongside as a sanity gate. See `usage.md`
+Tier 1 recipe.
