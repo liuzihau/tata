@@ -64,9 +64,15 @@ def composite_loss(
     kl         = (kl_per_pos * mask_f).sum() / mask_denom
 
     # Per-position shared-mass label (detached — only c_pos trains).
+    # Clamp guards against fp32-softmax roundoff: p_actual.sum() and
+    # p_pred.sum() each drift from exactly 1.0 by ~1e-7, so the sum-of-min
+    # can land at 1+ε. F.binary_cross_entropy's CUDA kernel hard-asserts
+    # `target ∈ [0, 1]`, aborting the whole step.
     with torch.no_grad():
         p_pred_detached = log_p_pred.exp()
-        c_label_per_pos = torch.minimum(p_actual, p_pred_detached).sum(-1)   # [B, T]
+        c_label_per_pos = (
+            torch.minimum(p_actual, p_pred_detached).sum(-1).clamp_(0.0, 1.0)
+        )   # [B, T]
 
     # Per-position BCE, masked to mask positions only. c_pos is in the
     # model dtype (bf16); c_label_per_pos is fp32 from the softmax upcast
