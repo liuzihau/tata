@@ -82,6 +82,7 @@ def run_gsm8k_eval(
     seed: int = 42,
     threshold: float | None = None,
     factor: float | None = 1.0,
+    inner_loop_max_iter: int | None = None,
 ) -> dict:
     """Run hybrid + vanilla on the same GSM8K slice. Returns metrics dict.
 
@@ -141,6 +142,8 @@ def run_gsm8k_eval(
     hits_hybrid = hits_vanilla = 0
     rollbacks: list[int] = []
     backbone_calls: list[int] = []
+    revealed_at_finish: list[float] = []     # block_length = fully decoded
+    n_blocks_finished:  list[int]  = []      # of NUM_BLOCKS blocks per problem
     t_hybrid = t_vanilla = 0.0
 
     for prob in ds:
@@ -154,6 +157,7 @@ def run_gsm8k_eval(
             prompt_ids,
             per_pos_threshold=per_pos_threshold,
             threshold=threshold, factor=factor,
+            inner_loop_max_iter=inner_loop_max_iter,
         )
         t_hybrid += time.time() - t0
         gen_text_h = tokenizer.decode(
@@ -163,6 +167,14 @@ def run_gsm8k_eval(
         hits_hybrid += int(pred_h is not None and pred_h == gold_num)
         rollbacks.append(stats["rollbacks"])
         backbone_calls.append(stats["backbone_forwards"])
+        # Cascading-failure diagnostic — mean revealed positions per block
+        # (= S.BLOCK_LENGTH iff every block finished cleanly).
+        revealed = stats.get("per_block_revealed_at_finish", [])
+        if revealed:
+            revealed_at_finish.append(float(np.mean(revealed)))
+            n_blocks_finished.append(
+                int(sum(1 for r in revealed if r == S.BLOCK_LENGTH))
+            )
 
         # Vanilla run.
         t0 = time.time()
@@ -180,7 +192,7 @@ def run_gsm8k_eval(
         hits_vanilla += int(pred_v is not None and pred_v == gold_num)
 
     n = len(ds)
-    return {
+    out = {
         "n_problems":            n,
         "accuracy_hybrid":       hits_hybrid / n,
         "accuracy_vanilla":      hits_vanilla / n,
@@ -189,7 +201,18 @@ def run_gsm8k_eval(
         "mean_rollbacks":        float(np.mean(rollbacks)),
         "mean_backbone_calls":   float(np.mean(backbone_calls)),
         "per_pos_threshold":     per_pos_threshold,
+        "inner_loop_max_iter":   inner_loop_max_iter,
     }
+    if revealed_at_finish:
+        # Diagnostic for the cascading-failure mode (mass at block_length =
+        # all blocks finished cleanly; mass below block_length = blocks
+        # hit budget with mask tokens still present → downstream blocks
+        # see corrupted context).
+        out["mean_revealed_per_block"]  = float(np.mean(revealed_at_finish))
+        out["mean_blocks_finished"]     = float(np.mean(n_blocks_finished))
+        out["block_length"]             = S.BLOCK_LENGTH
+        out["num_blocks_per_problem"]   = S.NUM_BLOCKS
+    return out
 
 
 def main() -> None:
@@ -216,6 +239,17 @@ def main() -> None:
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_json", default=None)
+    p.add_argument(
+        "--inner_loop_max_iter", type=int, default=None,
+        help="Hard cap on the agreement-decoding inner while loop. "
+             "Default = None → resolves to 2 * BLOCK_LENGTH (= 64), "
+             "high enough that every block finishes naturally but "
+             "bounded enough to catch degenerate cases. The 6 in collect "
+             "is a recording budget, NOT a loop budget — see "
+             "hybrid_runner.generate_with_delta docstring. To reproduce "
+             "the pre-2026-05-13 behavior of the T4 sweep, pass "
+             "--inner_loop_max_iter 6.",
+    )
     args = p.parse_args()
 
     if args.threshold is not None and args.factor is not None:
@@ -244,6 +278,7 @@ def main() -> None:
             seed=args.seed,
             threshold=decoding_threshold,
             factor=decoding_factor,
+            inner_loop_max_iter=args.inner_loop_max_iter,
         )
         print(json.dumps(m, indent=2), flush=True)
         rows.append(m)

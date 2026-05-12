@@ -60,6 +60,7 @@ def generate_with_delta(
     gen_length: int = S.GEN_LENGTH,
     block_length: int = S.BLOCK_LENGTH,
     max_iter_per_block: int = S.MAX_ITER,
+    inner_loop_max_iter: int | None = None,
     per_pos_threshold: float = 0.85,        # §3.2 — per-position confidence gate
     threshold: float | None = None,         # Fast-dLLM fixed-threshold mode
     factor: float | None = 1.0,             # Fast-dLLM dynamic-threshold mode
@@ -79,10 +80,32 @@ def generate_with_delta(
     (forces rollback every iter — equivalent to backbone-only baseline).
     Useful sweep: {0.7, 0.8, 0.85, 0.9, 0.95}.
 
+    `inner_loop_max_iter` is the hard upper bound on the agreement-decoding
+    inner while loop. `None` (default) resolves to `2 * block_length`
+    (= 64 at block_length=32) — high enough that every block finishes
+    naturally, low enough to bound runtime in degenerate cases (e.g.
+    per_pos_threshold so high that no position ever commits).
+
+    This is intentionally **decoupled** from `max_iter_per_block`. The
+    "6" in collect is a *recording-budget* (cap on how many `h_per_pass`
+    snapshots get stored per block, for storage / training-distribution
+    reasons), not a *loop-budget*: collect's own decoding loop runs
+    until the block is fully decoded (cf. `collect_llada.py`). Inference
+    should match — the delta model has no iter-index input and can't
+    tell whether it's at training-iter-3 or inference-iter-15. To
+    reproduce the old behavior (pre-2026-05-13), pass
+    `inner_loop_max_iter=max_iter_per_block` (= 6).
+
+    `max_iter_per_block` is still used as Fast-dLLM's per-iter transfer
+    quota in `threshold` mode (unchanged).
+
     stats keys: rollbacks (int), backbone_forwards (int), delta_forwards (int),
                 disagreements (int — passes where Fast-dLLM wanted more than
                 the per-pos head agreed to), walltime (float, sec),
-                per_block_passes (list[int]).
+                per_block_passes (list[int]),
+                per_block_revealed_at_finish (list[int] — non-mask positions
+                in each block when its inner loop exited; reaches
+                `block_length` for cleanly-finished blocks).
     """
     if (threshold is None) == (factor is None):
         raise ValueError(
@@ -99,9 +122,21 @@ def generate_with_delta(
     x = torch.full((B, Lp + gen_length), mask_id, dtype=torch.long, device=device)
     x[:, :Lp] = prompt
 
+    # Inner-loop hard cap. None resolves to `2 * block_length` (=64 at
+    # block_length=32) — generous enough that every block finishes
+    # naturally, bounded enough to catch degenerate cases. Decoupled from
+    # `max_iter_per_block` (which is a collect-side recording budget;
+    # see docstring).
+    loop_cap = (
+        int(inner_loop_max_iter)
+        if inner_loop_max_iter is not None
+        else 2 * int(block_length)
+    )
+
     stats = {
         "rollbacks": 0, "backbone_forwards": 0, "delta_forwards": 0,
         "disagreements": 0, "per_block_passes": [],
+        "per_block_revealed_at_finish": [],
     }
     t0 = time.time()
 
@@ -174,9 +209,9 @@ def generate_with_delta(
                 (1, S.PREFIX_WINDOW), dtype=torch.bool, device=device,
             )
 
-            # ---- Passes 1..max_iter_per_block-1: delta + agreement decode ----
+            # ---- Passes 1..loop_cap-1: delta + agreement decode ----
             force_rollback_next = False
-            while n_passes < max_iter_per_block:
+            while n_passes < loop_cap:
                 if (x[:, s:e] == mask_id).sum().item() == 0:
                     break
 
@@ -258,6 +293,9 @@ def generate_with_delta(
                 n_passes += 1
 
             stats["per_block_passes"].append(n_passes)
+            stats["per_block_revealed_at_finish"].append(
+                int((x[:, s:e] != mask_id).sum().item())
+            )
     finally:
         handle.remove()
 

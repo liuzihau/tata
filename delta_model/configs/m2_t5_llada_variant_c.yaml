@@ -109,6 +109,12 @@ log:
   gsm8k_every:     2000
   gsm8k_subset:    50
   gsm8k_per_pos_threshold: 0.85
+  # `inner_loop_max_iter` is now the inference-time safety bound on the
+  # agreement-decoding loop. Default = `None` → 2 * block_length = 64 in
+  # hybrid_runner. Set explicitly here only if you want to override —
+  # e.g. set to 6 to reproduce the pre-2026-05-13 collect-budget-as-
+  # loop-budget behavior, or to higher than 64 for an extreme threshold.
+  # gsm8k_inner_loop_max_iter: 64
   bins_gap:        [1, 2, 3, 4, 5]
   bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 

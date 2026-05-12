@@ -659,6 +659,9 @@ def main() -> None:
                     per_pos_threshold=getattr(
                         cfg.log, "gsm8k_per_pos_threshold", 0.85,
                     ),
+                    inner_loop_max_iter=getattr(
+                        cfg.log, "gsm8k_inner_loop_max_iter", None,
+                    ),
                     seed=cfg.seed,
                 )
                 log_metrics(step, {f"gsm8k/{k}": v for k, v in gsm.items()})
