@@ -1,0 +1,120 @@
+# M2 T5 — data-scale trial (5000 → 20000 prompts).
+#
+# Built on the M1.5 recipe (final_norm MSE, ref0-biased sampler) plus
+# the lessons from M1.6:
+#   - λ_mse 1.0 → 0.5     MSE was acting as a soft regularizer (M1.6's
+#                          λ_mse=0 lost val KL and lowered GSM8K peak).
+#                          But at 1.0 it dominated weighted loss (~60%);
+#                          0.5 keeps it as a co-regularizer without
+#                          owning the gradient.
+#   - dropout 0.1 → 0.2   M1.5's 0.1 narrowed train-val KL gap only
+#                          3.9× → 3.2× — directionally right, too soft.
+#                          Bump now that we also have more data.
+#   - weight_decay 0.01 → 0.05   second regularizer, cheap on Adam.
+#   - gsm8k_every 5000 → 2000    finer-grained peak detection; M1.5
+#                                 peaked at 5k (before its first eval)
+#                                 then declined invisibly to us until
+#                                 step 10k. We need ≤ 2k between evals.
+#   - keep_last 3 (unchanged)   peak is captured by the new
+#                                best-checkpoint tracker
+#                                (best_val_kl_step*.pt and
+#                                 best_gsm8k_step*.pt), so the rolling
+#                                step_* files only need to support
+#                                resumes.
+#
+# Reads `cache_v1_20k/llada/` (the new T5 cache; collect must finish
+# first). Hash-stable test split means the 800 test prompts in
+# `cache_v1_20k/llada/test/` are identical to `cache_v1/llada/test/` —
+# direct A/B vs trial-2/M1.5/M1.6 on the same held-out test prompts.
+#
+# Run:
+#   python -m delta_model.train \
+#       --config delta_model/configs/m2_t5_llada_variant_c.yaml \
+#       --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+
+run_name:          m2_t5_data20k_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada
+  fast_dllm_path:  null
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1_20k/llada           # ← new cache from T5 collect (must be shard-mode!)
+  manifest:        cache_v1_20k/llada/manifest.json
+  val_frac:        0.10
+  shuffle_seed:    42
+  num_workers:     0
+  batch_size:      256
+  pin_memory:      false
+  # 20k samples × ~20 MB = ~400 GB on disk — does NOT fit in 300 GB RAM
+  # at preload=true. The new flow: collect (per-sample) → repack into
+  # shards → train with preload=false. The shard LRU cap (~4 GB) keeps
+  # memory bounded while BlockShardSampler keeps cache hit rate near 1.
+  preload:         false
+  # Locality-aware sampler kicks in automatically when the dataset is in
+  # shard mode AND preload=false. Each shard's data is loaded once and
+  # used for `samples_per_shard_visit` consecutive indices before moving
+  # to the next shard. With batch_size=256 and 4096 per visit, that's
+  # 16 batches per shard load → I/O is ~6% of compute (negligible).
+  # Bump if disk is fast and you want even less stalling; drop if
+  # gradient noise from same-shard correlation seems to hurt training.
+  samples_per_shard_visit: 4096
+  mask_token_id:   126336
+  ref0_weight_multiplier: 3.0                    # T2 weights also flow into BlockShardSampler
+
+model:
+  variant:         C
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2
+  d_ff_inner:      10944
+  # Bumped from 0.1 — M1.5 evidence: 0.1 only narrowed train-val KL gap
+  # 3.93× → 3.19×. Need stronger regularization at this data scale until
+  # the larger cache itself reduces over-capacity.
+  dropout:         0.2
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  # Bumped from 0.01 — second-line regularizer alongside dropout.
+  weight_decay:    0.05
+  betas:           [0.9, 0.95]
+  warmup_steps:    500
+  max_steps:       20000
+  scheduler:       cosine
+  grad_clip:       1.0
+  precision:       bf16
+
+loss:
+  mse_space:       final_norm
+  # 0.5 (not 1.0, not 0): M1.5 had MSE at ~60% of weighted val loss
+  # (dominated). M1.6 with λ=0 lost val KL by 0.02 and GSM8K peak by
+  # 0.04. 0.5 keeps MSE as a co-regularizer at ~42% of weighted loss
+  # without dominating.
+  lambda_mse:      0.5
+  lambda_kl:       1.0
+  lambda_conf:     1.0
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M2-T5-data20k-llada
+  log_every:       50
+  val_every:       500
+  # Bumped from 5000 — M1.5 peaked at 5k (the very first GSM8K eval),
+  # so we had no visibility into whether the peak was at 3k, 4k, or 5k.
+  # At 2000-step intervals we can locate the peak to ±1k.
+  gsm8k_every:     2000
+  gsm8k_subset:    50
+  gsm8k_per_pos_threshold: 0.85
+  bins_gap:        [1, 2, 3, 4, 5]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  # 3 is fine despite the longer peak-window — `best_*_step*.pt`
+  # tracker preserves the peak independent of step_*.pt rotation.
+  keep_last:       3
+  out_dir:         ckpts/m2_t5_data20k_llada_variant_c

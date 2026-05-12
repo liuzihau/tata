@@ -125,11 +125,81 @@ the same held-out test prompts.
 Storage: ~480 GB at n_train=20000 + n_test=800 with prefix_window=64.
 If tight, drop to n_train=15000 (~360 GB).
 
-Once T5 collect lands, the T5 training config is one copy of
-`m1_5_llada_variant_c.yaml` with `data.cache_root: cache_v1_20k/llada`
-and fresh `run_name` / `log.group` / `checkpoint.out_dir`. Not creating
-that config yet — wait for collect to finish so we can pick batch /
-epoch knobs against the actual sample count.
+### Action 3a — Repack into shards (~30 min, one-time)
+
+20k samples × ~20 MB doesn't fit in 300 GB RAM under `preload=true`.
+Solution: pack the per-sample files into ~50-sample shards (~1 GB each)
+and use `preload=false` + `BlockShardSampler`, which keeps the shard
+LRU cache hot through long same-shard runs (engineering.md §3.5).
+
+```bash
+python -m delta_model.data.repack \
+    --cache_root cache_v1_20k/llada \
+    --shard_size 50 \
+    --output_subdir shards
+# Writes cache_v1_20k/llada/shards/{train,test}/shard_NNNNN.pt
+# AND cache_v1_20k/llada/shards_manifest.json (dataset auto-detects this).
+# Non-destructive: original per-sample/ files are kept; delete the
+# `shards/` dir + manifest to revert to per-sample mode.
+```
+
+### Action 3b — T5 training (after collect + repack)
+
+The training config is already drafted: `m2_t5_llada_variant_c.yaml`.
+Tweaks vs M1.5 are documented in its header. Key data knobs:
+`preload: false`, `samples_per_shard_visit: 4096` (16 batches/shard).
+
+```bash
+python -m delta_model.train \
+    --config delta_model/configs/m2_t5_llada_variant_c.yaml \
+    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+```
+
+At startup the train log should print a `[train] BlockShardSampler:`
+line — that confirms the locality sampler is active. If you see
+`[train] i_ref-biased sampler:` instead, the dataset didn't land in
+shard mode (the repack step didn't run or the manifest is missing).
+
+Lands in `ckpts/m2_t5_data20k_llada_variant_c/`, wandb group
+`M2-T5-data20k-llada`. Mid-training GSM8K eval at every 2000 steps
+(was 5000) — peak should now be locatable to ±1k.
+
+Resident RAM during training: ~4 GB for the shard cache (LRU=4) +
+~30 GB for the model and optimizer state + ~4 GB for the val
+dataset. Total ≈ 40 GB, well under the 300 GB bound. (For comparison,
+M1.5/M1.6 at 5000 samples held ~80–100 GB resident for the preloaded
+cache alone.)
+
+### Best-checkpoint files (auto-saved)
+
+Every run from 2026-05-12 onward saves *three* kinds of checkpoint
+to `cfg.checkpoint.out_dir`:
+
+| pattern | when | survives `keep_last` |
+|---|---|---|
+| `step_<NNNNNNN>.pt` | every `cfg.checkpoint.every` steps | no (rotated) |
+| `best_val_kl_step<N>.pt` | when val/kl hits a new running minimum | yes |
+| `best_gsm8k_step<N>.pt` | when gsm8k/accuracy_hybrid hits a new running maximum | yes |
+
+The two `best_*` files are the ones to use for final eval (not the
+last rolling step). Read `<ckpt_dir>/best_metrics.json` for the
+recorded peak value + step:
+
+```bash
+cat ckpts/m2_t5_data20k_llada_variant_c/best_metrics.json
+# {
+#   "val_kl": {"value": 0.21, "step": 8000, "mode": "min"},
+#   "gsm8k":  {"value": 0.52, "step": 10000, "mode": "max"}
+# }
+
+# Final eval on the GSM8K-best checkpoint, with the threshold sweep:
+python -m delta_model.eval.gsm8k_e2e \
+    --delta_ckpt $(ls ckpts/m2_t5_data20k_llada_variant_c/best_gsm8k_step*.pt) \
+    --fast_dllm_path external/Fast-dLLM/v1 \
+    --n_problems 200 \
+    --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
+    --out_json eval_results/m2_t5_best.json
+```
 
 ### Decision tree after these three land
 

@@ -226,20 +226,46 @@ development; the full postmortem lives in `engineering.md` §6.
   block-specific structure with 500M params. By step 20k that's ~128
   block-epochs — too many for the data budget.
 
-- **M1.6 — `λ_mse = 0` ablation.** Test whether MSE is doing any
-  load-bearing work at all. M1.5 val KL was identical to trial-2's
-  despite swapping MSE-space, so MSE's contribution to generalization
-  is suspect. Config-only run on the existing cache; can launch in
-  parallel with M2 collect.
+- **M1.6 — `λ_mse = 0` ablation. Landed 2026-05-12. Verdict: MSE is
+  a weak regularizer, not noise; keep at reduced weight.** Final train
+  MSE/KL/BCE 1.72/0.077/0.33, val 1.59/0.31/0.49 vs M1.5 0.99/0.089/0.34
+  / 1.08/0.29/0.47. **M1.6 fits train KL better (0.077 < 0.089) but
+  val KL slightly worse (0.31 > 0.29)** — textbook regularizer-removed
+  signature. GSM8K peak shifted later but lower: 0.36 @ 10k vs M1.5's
+  0.40 @ 5k; final 0.30 vs 0.28 (mild improvement at end because M1.5's
+  faster overfitting was tempered).
+
+  **Key meta-finding from M1.5 + M1.6: GSM8K accuracy *peaks then
+  declines* in both runs.** Not just val loss — the actual metric we
+  care about. M1.5 hit 0.40 at step 5k then lost 0.12 by step 20k.
+  M1.6 hit 0.36 at step 10k then lost 0.06 by step 20k. The model is
+  running out of generalizable signal at this data scale and starting
+  to memorize. Two infra consequences:
+  - `train.py` now tracks the best-by-metric checkpoint and writes
+    `best_val_kl_step<N>.pt` / `best_gsm8k_step<N>.pt` next to the
+    rolling `step_*.pt` files, so the peak survives `keep_last`
+    rotation.
+  - Default `gsm8k_every` lowered 5000 → 2000 in M2 configs so peak
+    location is observable to within ±1k steps.
 
 - **M2 — Tier 2 (data scaling + capacity + variants).** Now ranked
   with T5 as primary:
-  - **T5 — scale data (5000 → 15000–20000 prompts). PRIMARY.**
+  - **T5 — scale data (5000 → 20000 prompts). PRIMARY.**
     Direct response to the block-as-sampling-unit overfitting
-    signature. Pure collect cost (no code change). Lands in a new
-    cache dir (`cache_v1_20k/llada/`) so it doesn't race with M1.6
-    on the original cache. Hash-stable test split means the 800
-    test prompts are identical to trial-2's.
+    signature and the M1.5/M1.6 GSM8K peak-then-decline. Reads from
+    a new `cache_v1_20k/llada/` so it doesn't race with M1.6 on the
+    original cache. Hash-stable test split means the 800 test
+    prompts are identical to trial-2's.
+
+    T5 training config (`m2_t5_llada_variant_c.yaml`) inherits M1.5's
+    setup with M1.5/M1.6-informed tweaks:
+    - `λ_mse 1.0 → 0.5` (M1.5's MSE dominated; M1.6's zero hurt — split
+      the difference so MSE is a co-regularizer at ~40% weighted loss)
+    - `dropout 0.1 → 0.2` (M1.5's 0.1 was undersized)
+    - `weight_decay 0.01 → 0.05` (second regularizer alongside dropout)
+    - `gsm8k_every 5000 → 2000` (peak detection at ±1k resolution)
+    - Best-checkpoint tracker preserves the peak through `keep_last`
+      rotation.
   - **T7 — deeper delta model (2 → 4 layers).** Only if T5 plateaus
     below 0.60; capacity may need to grow alongside data.
   - **Variants A (cross-attn anchor) / B (AdaLN-Zero).** Compare on
@@ -369,35 +395,43 @@ critiques that motivated the delta-model proposal:
 
 ## 9 · Status snapshot (2026-05-12)
 
-M0 done. M1 trial 1 reproduced an alarming GSM8K decline
-(0.72 baseline → 0.10 at step 15k). M1 trial 2: GSM8K **0.28 → 0.44**
-after BCE clamp + agreement decoding + alignment audit. M1.5 Tier-1
-(T1+T2+T3): val KL identical to trial-2 (0.293 vs 0.295), GSM8K
-**0.40** (within 1σ noise of 0.44).
+M0 done. M1 trial 1: 0.72 → 0.10 at 15k (alignment bugs). M1 trial 2:
+**0.44** at 20k. M1.5 Tier-1: peak **0.40 @ 5k**, final 0.28.
+M1.6 λ_mse=0: peak **0.36 @ 10k**, final 0.30. T4 sweep on M1.5
+ckpt: complete, result pending discussion.
 
-**The diagnosis updated.** The loss-space hypothesis was *good
-reasoning from trial-2 evidence* but is not the binding constraint
-at this data scale. Tier-1's mechanically correct loss reallocation
-did not move val KL, so the bottleneck is upstream — in data
-volume relative to model capacity. Concretely: overfitting onset at
-~1.5k steps corresponds to ~9.6 block-views (384k samples / 40k
-unique blocks), and the 15 pairs per block share enough structure
-(h_per_pass stack, prefix_kv, reveal patterns, substituted_ids
-template) that the **block** is the effective sampling unit. At
-~10 block-epochs a 500M-param network starts memorizing
-block-specific structure faster than it generalizes.
+**Updated diagnosis after M1.5 + M1.6:**
 
-Three concurrent next actions:
+- The loss-space hypothesis was reasonable from trial-2 evidence
+  but is not the binding constraint at this data scale.
+- **GSM8K accuracy peaks then declines** in both Tier-1 runs — not
+  just val loss. M1.5 peaks early-and-high (0.40 @ 5k), M1.6 peaks
+  late-and-low (0.36 @ 10k). MSE is doing useful work as a soft
+  regularizer (M1.6 fits train KL faster, generalizes slightly
+  worse), but at λ=1.0 it dominated the gradient budget at ~60% of
+  weighted loss.
+- The block-as-sampling-unit math (~9.6 block-views at the 1.5k
+  inflection point) explains why: 5000 prompts × 8 blocks is too
+  few independent units for a 500M-parameter network.
 
-1. **T4 sweep on the M1.5 checkpoint** — free, ~30 min, may recover
-   the trial-2 / M1.5 GSM8K delta entirely from a better operating
-   point.
-2. **M1.6 = T6 (`λ_mse = 0` ablation)** — config-only, runs against
-   the *existing* `cache_v1/llada/` cache. Tests whether MSE is
-   load-bearing at all.
-3. **M2 collect for T5** — collect 15000–20000 prompts into a new
-   `cache_v1_20k/llada/` directory. Can run in parallel with M1.6
-   without racing on cache files. The hash-stable test split keeps
-   the same 800 test prompts as trial-2 for direct comparison.
+**Now in progress:**
 
-See `usage.md` Tier-1+ recipe for commands.
+1. **T5 collect (5000 → 20000 prompts)** into a new
+   `cache_v1_20k/llada/` directory. Hash-stable test split keeps the
+   800 test prompts identical to trial-2. Same 800 problems →
+   directly comparable.
+2. **T5 training config** (`m2_t5_llada_variant_c.yaml`) is drafted
+   and ready to launch once collect finishes. Tweaks vs M1.5:
+   `λ_mse 1.0 → 0.5`, `dropout 0.1 → 0.2`, `weight_decay 0.01 → 0.05`,
+   `gsm8k_every 5000 → 2000`, plus the new best-checkpoint tracker.
+
+**Infrastructure landed alongside this milestone:**
+
+- `train.py` now writes `<ckpt_dir>/metrics.jsonl` mirroring every
+  wandb.log call (locally inspectable, plottable via
+  `eval/plot_metrics.py`).
+- `train.py` now tracks best-by-metric and saves
+  `best_val_kl_step<N>.pt` and `best_gsm8k_step<N>.pt` independent
+  of the rolling `step_*.pt` files — peak no longer gets rotated
+  away.
+- `eval/gsm8k_e2e.py` now auto-creates the `--out_json` parent dir.

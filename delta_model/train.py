@@ -36,6 +36,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 from .data import schema as S
 from .data.dataset import (
+    BlockShardSampler,
     TataDeltaDataset,
     make_train_val_filter,
 )
@@ -301,12 +302,86 @@ def _ckpt_save(model, opt, step, cfg, *, out_dir: Path):
         "opt":   opt.state_dict(),
         "cfg":   dict(cfg),
     }, path)
-    # rotate
+    # rotate — NOTE: only touches `step_*.pt`; `best_*.pt` files are preserved.
     ckpts = sorted(out_dir.glob("step_*.pt"))
     keep = cfg.checkpoint.keep_last
     for old in ckpts[:-keep] if keep > 0 else []:
         old.unlink()
     return path
+
+
+class _BestTracker:
+    """Track best-by-metric and persist the corresponding checkpoint.
+
+    For each registered metric we keep exactly one `.pt` file on disk:
+    `<ckpt_dir>/best_<label>_step<NNNN>.pt`. When a new best is observed,
+    the prior file (matching `best_<label>_step*.pt`) is unlinked and a
+    new one is written. The running best is also persisted to a sidecar
+    `best_metrics.json` so resumed runs don't lose history.
+
+    Modes:
+        "min" — lower is better (e.g. val/kl)
+        "max" — higher is better (e.g. gsm8k/accuracy_hybrid)
+    """
+
+    def __init__(self, ckpt_dir: Path, *, log=print):
+        self.ckpt_dir = ckpt_dir
+        self.log = log
+        self.sidecar = ckpt_dir / "best_metrics.json"
+        if self.sidecar.exists():
+            try:
+                self.state = json.loads(self.sidecar.read_text())
+            except json.JSONDecodeError:
+                self.state = {}
+        else:
+            self.state = {}
+
+    def maybe_save(self, *, label: str, value: float | None, mode: str,
+                   step: int, model, opt, cfg) -> bool:
+        """Save a new best-checkpoint if `value` improves on `label`'s prior
+        best. Returns True if a new file was written.
+
+        `label` is the filename tag (e.g. 'gsm8k', 'val_kl') — used in
+        `best_<label>_step<NNNN>.pt`. Whatever string you pass becomes part
+        of the file path, so keep it short and shell-safe.
+        """
+        if value is None or not math.isfinite(value):
+            return False
+        prior = self.state.get(label, {})
+        prior_value = prior.get("value")
+        is_better = (
+            prior_value is None
+            or (mode == "min" and value < prior_value)
+            or (mode == "max" and value > prior_value)
+        )
+        if not is_better:
+            return False
+        # Delete any prior best file for this label (we only keep the latest).
+        for old in self.ckpt_dir.glob(f"best_{label}_step*.pt"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        new_path = self.ckpt_dir / f"best_{label}_step{step}.pt"
+        torch.save({
+            "step": step,
+            "model": model.state_dict(),
+            "opt":   opt.state_dict(),
+            "cfg":   dict(cfg),
+            "best_label": label,
+            "best_value": value,
+            "best_mode":  mode,
+        }, new_path)
+        self.state[label] = {
+            "value": float(value), "step": int(step), "mode": mode,
+        }
+        self.sidecar.write_text(json.dumps(self.state, indent=2))
+        prior_repr = f"{prior_value:.4f}" if isinstance(prior_value, (int, float)) else "—"
+        self.log(
+            f"[best] {label}={value:.4f} @ step {step} (prior {prior_repr})  "
+            f"→  {new_path.name}"
+        )
+        return True
 
 
 def main() -> None:
@@ -350,15 +425,42 @@ def main() -> None:
     print(f"[train] train pairs={len(train_ds)}  val pairs={len(val_ds)}",
           flush=True)
 
-    # Optional i_ref-biased sampler (T2; engineering.md §3.4). When the
-    # multiplier is 1.0 (off), fall back to the standard random-shuffle
-    # loader. When > 1, build a WeightedRandomSampler that up-weights
-    # pairs with i_ref == 0 toward the inference distribution.
+    # Sampler selection. Three modes:
+    #   1. preload=False + shard mode  → BlockShardSampler (locality-aware,
+    #      weighted; keeps the LRU shard cache hot so 20k+ caches don't
+    #      blow RAM). Default for T5+.
+    #   2. preload=True or per-sample  → WeightedRandomSampler when
+    #      ref0_weight_multiplier ≠ 1.0 (T2; engineering.md §3.4).
+    #   3. otherwise → standard shuffle.
     ref0_mult = float(getattr(cfg.data, "ref0_weight_multiplier", 1.0))
-    if ref0_mult != 1.0:
-        weights = train_ds.compute_index_weights(
-            ref0_weight_multiplier=ref0_mult,
+    weights = train_ds.compute_index_weights(ref0_weight_multiplier=ref0_mult)
+    use_block_shard = (train_ds.mode == "shard" and not preload)
+
+    if use_block_shard:
+        spsv = int(getattr(cfg.data, "samples_per_shard_visit", 4096))
+        shard_groups = train_ds.get_shard_groups()
+        gen = torch.Generator(); gen.manual_seed(int(cfg.seed))
+        sampler = BlockShardSampler(
+            shard_groups, weights,
+            samples_per_shard_visit=spsv,
+            num_samples=len(train_ds),       # match nominal epoch length
+            generator=gen,
         )
+        train_dl = DataLoader(
+            train_ds, batch_size=cfg.data.batch_size,
+            sampler=sampler, shuffle=False,
+            num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
+            drop_last=True, persistent_workers=cfg.data.num_workers > 0,
+        )
+        n_shards = len(shard_groups)
+        n_ref0   = int((weights == ref0_mult).sum().item()) if ref0_mult != 1.0 else 0
+        print(
+            f"[train] BlockShardSampler: {n_shards} shards, "
+            f"{spsv} samples/visit ({spsv // cfg.data.batch_size} batches/visit). "
+            f"ref0_mult={ref0_mult} ({n_ref0} ref0 pairs / {len(weights)} total).",
+            flush=True,
+        )
+    elif ref0_mult != 1.0:
         sampler = torch.utils.data.WeightedRandomSampler(
             weights=weights, num_samples=len(train_ds), replacement=True,
         )
@@ -432,6 +534,16 @@ def main() -> None:
         if wandb is not None:
             wandb.log(payload, step=step)
         metrics_fp.write(json.dumps({"step": int(step), **payload}) + "\n")
+
+    # Best-checkpoint tracker. Saves
+    #   best_val_kl_step<N>.pt   (lower is better)
+    #   best_gsm8k_step<N>.pt    (higher is better)
+    # next to the rolling `step_*.pt` files. The peak GSM8K checkpoint
+    # otherwise gets rotated away by `keep_last` (cf. M1.5: peaked at
+    # step 5k, only 16k/18k/20k checkpoints survived to final eval).
+    best_tracker = _BestTracker(ckpt_dir, log=lambda s: print(s, flush=True))
+    if best_tracker.state:
+        print(f"[train] resumed best_metrics: {best_tracker.state}", flush=True)
 
     log_keys = ("loss", "mse", "kl", "bce", "c_label_mean", "c_pred_mean")
     print("[train] starting", flush=True)
@@ -529,6 +641,10 @@ def main() -> None:
                     device=device, dtype=dtype,
                 )
             log_metrics(step, {f"val/{k}": v for k, v in val_metrics.items()})
+            best_tracker.maybe_save(
+                label="val_kl", value=val_metrics.get("kl"), mode="min",
+                step=step, model=model, opt=opt, cfg=cfg,
+            )
             if wandb is None:
                 pbar.write(f"[val ] step={step:6d} {val_metrics}")
 
@@ -546,6 +662,10 @@ def main() -> None:
                     seed=cfg.seed,
                 )
                 log_metrics(step, {f"gsm8k/{k}": v for k, v in gsm.items()})
+                best_tracker.maybe_save(
+                    label="gsm8k", value=gsm.get("accuracy_hybrid"), mode="max",
+                    step=step, model=model, opt=opt, cfg=cfg,
+                )
             except Exception as e:
                 pbar.write(f"[gsm8k] mid-train eval failed (continuing): {e}")
 

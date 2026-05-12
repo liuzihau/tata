@@ -10,14 +10,12 @@ For *how* to run anything, see `usage.md`.
 
 ---
 
-## Status snapshot (2026-05-12)
+## Status snapshot (2026-05-12, evening)
 
-Current focus: **two parallel runs + one free eval** —
-- T4 sweep on the M1.5 checkpoint (free, ~30 min).
-- M1.6 = T6 (`λ_mse = 0`) on the existing `cache_v1/llada/` cache.
-- M2 T5 collect (5000 → 20000 prompts) into a separate
-  `cache_v1_20k/llada/` directory to avoid racing M1.6 on the
-  manifest.
+Current focus: **T5 (data scale, 5000 → 20000 prompts)** — collect
+in progress, training config (`m2_t5_llada_variant_c.yaml`) drafted
+and ready to launch. M1.6 done (results below). T4 sweep complete,
+pending discussion of results.
 
 | area | state |
 |---|---|
@@ -30,11 +28,18 @@ Current focus: **two parallel runs + one free eval** —
 
 Trial results history:
 - **Trial 1** (pre-3.1 rollback fix, block-aggregate conf): 0.72 baseline → 0.20 at 15k.
-- **Trial 2** (post-3.1 alignment audit, agreement decoding, BCE clamp): GSM8K 0.28 → **0.44**. Train MSE/KL/BCE 12.6/0.054/0.29 vs val 16.1/0.38/0.59 — train-val KL gap ~4× hypothesized to be loss-space misallocation.
-- **M1.5 Tier-1** (T1 final_norm MSE + T2 sampler + T3 dropout): final train MSE/KL/BCE 0.989/0.092/0.348 vs val 1.081/0.293/0.472. **Val KL identical to trial-2 (0.293 vs 0.295)**; KL gap narrowed 3.93× → 3.19× (T3 working, undersized); GSM8K **0.40** (within 1σ of 0.44). Loss-space hypothesis **rejected as primary lever** at this data scale. Overfitting onset at ~1.5k steps = ~9.6 block-views (384k samples / 40k unique blocks); the 15 pairs/block share enough structure that the *block* is the effective sampling unit, putting a 500M-param model at ~10 block-epochs of effective data by 1.5k.
+- **Trial 2** (post-3.1 alignment audit, agreement decoding, BCE clamp): GSM8K **0.44** final. Train MSE/KL/BCE 12.6/0.054/0.29 vs val 16.1/0.38/0.59 — train-val KL gap ~4× hypothesized to be loss-space misallocation.
+- **M1.5 Tier-1** (T1 final_norm MSE + T2 sampler + T3 dropout): final train 0.989/0.092/0.348, val 1.081/0.293/0.472. **GSM8K peak 0.40 @ step 5k, final 0.28 @ step 20k.** Val KL identical to trial-2 (0.293 vs 0.295); KL gap narrowed 3.93× → 3.19× (T3 working, undersized). Loss-space hypothesis **rejected as primary lever**: model peaks fast then memorizes. Overfitting onset at ~1.5k steps = ~9.6 block-views — at this data scale, the 15 pairs/block share enough structure that the *block* is the effective sampling unit, putting a 500M-param model at ~10 block-epochs of effective data by 1.5k.
+- **M1.6 (T6, λ_mse = 0)**: final train 1.72/0.077/0.33, val 1.59/0.31/0.49. **GSM8K peak 0.36 @ step 10k, final 0.30 @ step 20k.** Train KL fits 0.012 better than M1.5, val KL is 0.02 worse — classic regularizer-removed signature, confirming **MSE was a soft regularizer, not noise**. Peak shifted later (10k vs 5k) and lower (0.36 vs 0.40). Decision: keep MSE but reduce weight to `λ_mse = 0.5` in T5 so MSE doesn't dominate (was ~60% of M1.5's weighted val loss).
 
 Recent changes log (most recent first):
 
+- **2026-05-12** `BlockShardSampler` landed in `data/dataset.py` (§3.5). Auto-selected when `preload=False` + shard mode (T5 default). Keeps memory bounded at ~4 GB for the 400-GB T5 cache by visiting one shard for `samples_per_shard_visit` consecutive indices.
+- **2026-05-12** `train.py` gains best-checkpoint tracker (`_BestTracker`); saves `best_val_kl_step<N>.pt` + `best_gsm8k_step<N>.pt` independent of `keep_last` rotation. Sidecar `best_metrics.json` for resume.
+- **2026-05-12** M1.6 result recorded; ranking finalized: T5 unambiguous primary, M1.6 keeps MSE but at half weight.
+- **2026-05-12** `m2_t5_llada_variant_c.yaml` drafted: `λ_mse 0.5`, `dropout 0.2`, `weight_decay 0.05`, `gsm8k_every 2000`, reads `cache_v1_20k/llada/`.
+- **2026-05-12** `eval/plot_metrics.py` added; `train.py` writes JSONL mirror of every wandb.log call to `<ckpt_dir>/metrics.jsonl`.
+- **2026-05-12** `eval/gsm8k_e2e.py` `--out_json` auto-mkdirs.
 - **2026-05-12** M1.5 Tier-1 result recorded; tier ranking updated. T5 (data scaling) promoted to PRIMARY for M2; T6 (`λ_mse = 0`) elevated to runnable parallel ablation (M1.6).
 - **2026-05-12** §3.2 T1 (= M1.5 A) landed: `mse_space="final_norm"` option in `composite_loss`; new config (`m1_5_llada_variant_c.yaml`) rescaled `λ_mse 0.1 → 1.0`.
 - **2026-05-12** §3.4 T2 landed: i_ref-biased `WeightedRandomSampler` (`data.ref0_weight_multiplier`, default 3.0).
@@ -82,8 +87,9 @@ tata/
       inspect_llada_modeling.py                      — diagnostic for the loaded LLaDA modeling code
     configs/
       m1_llada_variant_c.yaml               — M1 trial-2 baseline (raw MSE, dropout 0, uniform sampler)
-      m1_5_llada_variant_c.yaml             — M1.5 Tier-1 (T1+T2+T3) — final_norm MSE, dropout 0.1, ref0-biased sampler
+      m1_5_llada_variant_c.yaml             — M1.5 Tier-1 (T1+T2+T3) — final_norm MSE λ=1, dropout 0.1, ref0-biased sampler
       m1_6_llada_variant_c.yaml             — M1.6 = T6 (λ_mse = 0 ablation) — KL+BCE only loss; rest matches M1.5
+      m2_t5_llada_variant_c.yaml            — M2 T5 (data 20k) — λ_mse 0.5, dropout 0.2, wd 0.05, gsm8k_every 2k
 ```
 
 ---
@@ -199,10 +205,9 @@ improvement log).
 - **§2.1 shm raise** (blocked on cluster admin) — would unlock
   `num_workers ≥ 2` and `pin_memory=True`. After preload landed this is
   a small additional speedup, not load-bearing.
-- **Locality-aware sampler** (proposed, not done) — would let us roll
-  back from preload-everything to per-shard caching if cache grows
-  past RAM. Custom `Sampler` that bursts indices grouped by source
-  sample/shard.
+- **Locality-aware sampler** — landed 2026-05-12 as `BlockShardSampler`
+  (§3.5). Auto-selected when `preload=False` + shard mode. Default for
+  T5+ at 20k samples where the cache no longer fits in RAM.
 
 ---
 
@@ -403,6 +408,60 @@ Resume note: the sampler is rebuilt fresh from `cfg.data.*` at every
 launch — no sampler state in the checkpoint. Reproducibility-wise,
 the sampler uses `torch.manual_seed(cfg.seed)` set at startup.
 
+### 3.5 BlockShardSampler — locality-aware sampling for large caches (T5+)
+
+Motivation: at 5000 prompts the cache fits in RAM (`preload: true` ≈
+80–100 GB resident, well under the 300 GB bound). At T5's 20000
+prompts the cache is ~400 GB on disk — does NOT fit. We need
+`preload: false` + shards, but a *random* shuffle over a shard-mode
+dataset thrashes the LRU because each random batch hits ~B distinct
+shards.
+
+Solution: a sampler that groups consecutive accesses into the same
+shard for `samples_per_shard_visit` indices before moving on. The
+shard LRU (default 4 shards ≈ 4 GB) stays hot through the entire
+visit; disk I/O drops from "1 shard load per batch" to "1 shard load
+per (samples_per_shard_visit ÷ batch_size) batches".
+
+Implementation: `BlockShardSampler` in `data/dataset.py`. Each round:
+
+  1. Permute the shard order (seeded for reproducibility).
+  2. For each shard, draw `samples_per_shard_visit` indices with
+     `torch.multinomial(replacement=True)` using that shard's slice
+     of the per-index weight tensor (so T2 weighting is preserved
+     within each shard).
+  3. Yield each index. Continue until `num_samples` total emitted.
+
+Sampler selection in `train.py:main`:
+
+  - `preload=False` + shard mode    → `BlockShardSampler` (auto)
+  - `preload=True`  OR per-sample   → `WeightedRandomSampler` (if T2 active)
+  - neither                          → standard `shuffle=True`
+
+Config knob: `data.samples_per_shard_visit` (default 4096 = 16
+batches at `batch_size=256`). Trade-off:
+
+| spsv | batches/visit | I/O overhead (est) | gradient correlation |
+|---:|---:|---:|---|
+| 256 (=B) | 1 | ~50% | low (one batch per shard) |
+| 1024 | 4 | ~15% | mild |
+| **4096** | **16** | **~6%** | moderate, recommended default |
+| 8192 | 32 | ~3% | high (long same-shard streaks) |
+
+Note: shard locality and T2 weighting combine cleanly because each
+shard contains roughly the same proportion of `i_ref=0` pairs (5/15
+by structure), so per-shard weighted sampling preserves the global
+target distribution.
+
+End-to-end workflow for T5+:
+
+  1. `collect_llada.py` writes per-sample (existing flow).
+  2. `data/repack.py --shard_size 50` packs into shards + creates
+     `shards_manifest.json`. Dataset auto-detects shard mode.
+  3. Train config sets `data.preload: false`,
+     `data.samples_per_shard_visit: 4096`. `train.py` constructs
+     `BlockShardSampler` automatically.
+
 ---
 
 ## 4 · Training (`train.py`)
@@ -424,24 +483,61 @@ Mid-train GSM8K eval every `cfg.log.gsm8k_every` steps on a small
 subset (`cfg.log.gsm8k_subset` problems), with `per_pos_threshold`
 from `cfg.log.gsm8k_per_pos_threshold` (default 0.85).
 
-### 4.1 Checkpoint format
+### 4.1 Checkpoint format and best-tracking
 
-`{"step": int, "model": state_dict, "opt": state_dict, "cfg": dict}`.
-Saved every `cfg.checkpoint.every` to `cfg.checkpoint.out_dir`; only
-`cfg.checkpoint.keep_last` most recent are kept.
+Two parallel checkpoint streams live in `cfg.checkpoint.out_dir`:
+
+**Rolling** — `step_<NNNNNNN>.pt` files (zero-padded to 7 digits).
+Saved every `cfg.checkpoint.every` steps. Only `cfg.checkpoint.keep_last`
+most recent are kept; older ones get unlinked on the next save.
+Used for resume.
+
+**Best-by-metric** — `best_val_kl_step<N>.pt` and
+`best_gsm8k_step<N>.pt` (step not zero-padded). Maintained by
+`_BestTracker` in `train.py`. At each val pass:
+`val_kl` is compared against the running best (mode `"min"`); if it
+improves, the prior `best_val_kl_step*.pt` is unlinked and a new one
+written at the current step. Same for GSM8K mid-training eval with
+`accuracy_hybrid` (mode `"max"`). NaN / None values are ignored.
+
+The two streams are independent: `keep_last` rotation only touches
+`step_*.pt`, so peaks captured by the best-tracker survive even when
+the run continues into overfitting territory (the M1.5 lesson: peak
+at step 5k got rotated away under `keep_last=3` by step 20k).
+
+Resume semantics: `<ckpt_dir>/best_metrics.json` is a sidecar that
+records the running best per metric (`{label: {value, step, mode}}`).
+Loaded at `_BestTracker.__init__`, so resumes from `--resume_from`
+don't lose history. If a resumed run produces a worse-than-prior
+best, no file is written; if it produces a new best, the prior best
+file is replaced.
+
+Checkpoint dict contents:
+```
+step:        int
+model:       state_dict
+opt:         state_dict
+cfg:         dict
+# best_*.pt files only:
+best_label:  str           # e.g. "val_kl" or "gsm8k"
+best_value:  float
+best_mode:   "min" | "max"
+```
 
 State_dict shapes have changed across §1.5 (RoPE), §1.6 (SwiGLU), §3.2
 (per-pos conf). Pre-§3.2 checkpoints **will not load**; mid-trial resumes
 are fine.
 
-### 4.2 Config — two M1 trials
+### 4.2 Config — four trials side-by-side
 
-Two config files live side-by-side; pick the one matching the trial:
+Four config files live in `configs/`; pick the one matching the trial.
 
-| file | role |
-|---|---|
-| `configs/m1_llada_variant_c.yaml` | M1 trial-2 baseline of record. `mse_space=raw`, `λ_mse=0.1`, `dropout=0.0`, no `ref0_weight_multiplier` (uniform sampler). Lands in `ckpts/m1_llada_variant_c/`, wandb group `M1-llada`. |
-| `configs/m1_5_llada_variant_c.yaml` | M1.5 Tier-1 trial. `mse_space=final_norm`, `λ_mse=1.0`, `dropout=0.1`, `ref0_weight_multiplier=3.0`. Lands in `ckpts/m1_5_tier1_llada_variant_c/`, wandb group `M1.5-tier1-llada`. |
+| file | trial | loss | dropout | wd | ref0 mult | cache |
+|---|---|---|---:|---:|---:|---|
+| `m1_llada_variant_c.yaml` | M1 trial-2 baseline (GSM8K 0.44 final) | `raw`, λ=0.1 | 0.0 | 0.01 | — | `cache_v1/llada` |
+| `m1_5_llada_variant_c.yaml` | M1.5 Tier-1 (peak 0.40 @ 5k, final 0.28) | `final_norm`, λ=1.0 | 0.1 | 0.01 | 3.0 | `cache_v1/llada` |
+| `m1_6_llada_variant_c.yaml` | M1.6 (λ_mse = 0 ablation; peak 0.36 @ 10k, final 0.30) | `final_norm`, λ=0.0 | 0.1 | 0.01 | 3.0 | `cache_v1/llada` |
+| `m2_t5_llada_variant_c.yaml` | M2 T5 (data 20k; in progress) | `final_norm`, λ=0.5 | 0.2 | 0.05 | 3.0 | `cache_v1_20k/llada` |
 
 Shared key knobs:
 
@@ -598,17 +694,21 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blo
 - `[x]` **T3 (M1.5)** `model.dropout = 0.1` (config-only). Reduced
   train-val KL gap 3.93× → 3.19× — directionally right but
   undersized. Try 0.2–0.3 in next round.
-- `[~]` **T4** (eval-only) `per_pos_threshold` sweep on the M1.5
-  checkpoint — `eval/gsm8k_e2e.py` already supports it; no code
-  change. Free; run alongside M1.6 / T5. Command in `usage.md`.
-- `[~]` **M1.6 = T6** `λ_mse = 0` ablation — own config
-  (`m1_6_llada_variant_c.yaml`). Uses existing `cache_v1/llada/`.
-  Parallel to M2 collect. Tests whether MSE is doing any load-bearing
-  work after the M1.5 reallocation didn't move val KL.
-- `[~]` **T5 (M2) — PRIMARY** scale data 5000 → 15000–20000 prompts
-  into `cache_v1_20k/llada/`. Pure collect cost, no code change.
-  Direct response to the block-as-sampling-unit overfitting
-  signature (M1.5 status snapshot).
+- `[x]` **T4** (eval-only) `per_pos_threshold` sweep on the M1.5
+  checkpoint — done, result pending discussion.
+- `[x]` **M1.6 = T6** (`λ_mse = 0` ablation): MSE is a soft
+  regularizer (train fits 0.012 better, val 0.02 worse). Don't drop
+  entirely; T5 uses `λ_mse = 0.5` to keep MSE without dominating.
+- `[x]` Best-checkpoint tracker (`_BestTracker` in `train.py`) —
+  saves `best_val_kl_step<N>.pt` and `best_gsm8k_step<N>.pt` next
+  to rolling `step_*.pt` files. Sidecar `best_metrics.json` for
+  resume. See §4.1.
+- `[x]` Local metrics JSONL mirror — `<ckpt_dir>/metrics.jsonl`,
+  plotted by `eval/plot_metrics.py`. See §4 intro.
+- `[~]` **T5 (M2) — PRIMARY** scale data 5000 → 20000 prompts
+  into `cache_v1_20k/llada/`. Collect in progress. Training config
+  `m2_t5_llada_variant_c.yaml` drafted: `λ_mse=0.5`, `dropout=0.2`,
+  `weight_decay=0.05`, `gsm8k_every=2000`.
 - `[ ]` **T7 (M2)** Deeper delta model (2 → 4 layers). Only if T5
   plateaus below 0.60 and per-bin diagnostic implicates capacity.
 - `[ ]` **T8 = old C (M2)** Sliced 1-D distribution-matching

@@ -1,5 +1,6 @@
 """Training dataset for the tata delta model.
 
+
 One example = one (sample, block_idx, i_ref, i_target) tuple, with
 0 ≤ i_ref < i_target < n_passes_actual ≤ MAX_ITER. We pre-build the index
 at construction time so __getitem__ is a small slice off an in-memory
@@ -301,6 +302,31 @@ class TataDeltaDataset(Dataset):
 
 
     # ------------------------------------------------------------------
+    # Shard groupings for locality-aware sampling
+    # ------------------------------------------------------------------
+
+    def get_shard_groups(self) -> "dict[int, list[int]]":
+        """For shard-mode datasets: return `{shard_id: [k1, k2, ...]}`
+        where each `ki` is an index into `self.index` (the flat list of
+        `(s_idx, b, i_ref, i_target)` tuples).
+
+        Used by `BlockShardSampler` to keep consecutive accesses inside the
+        same shard, so the shard LRU cache stays warm. Raises if called on
+        a per-sample dataset (no shard structure to group by).
+        """
+        if self.mode != "shard":
+            raise RuntimeError(
+                "get_shard_groups() requires shard-mode dataset; "
+                f"this dataset is in {self.mode!r} mode. "
+                "Run `delta_model.data.repack` first."
+            )
+        groups: "dict[int, list[int]]" = {}
+        for k, (s_idx, _b, _ir, _it) in enumerate(self.index):
+            shard_id = self.sample_locator[s_idx][0]
+            groups.setdefault(shard_id, []).append(k)
+        return groups
+
+    # ------------------------------------------------------------------
     # Sampling weights (T2; engineering.md §3.4)
     # ------------------------------------------------------------------
 
@@ -333,6 +359,90 @@ class TataDeltaDataset(Dataset):
             if i_ref == 0:
                 weights[k] = float(ref0_weight_multiplier)
         return weights
+
+
+class BlockShardSampler(torch.utils.data.Sampler):
+    """Locality-aware weighted sampler for shard-mode datasets.
+
+    Why it exists: at 20000-sample scale (T5), the cache is ~400 GB on disk
+    and we can't `preload=True` it into RAM. The dataset's shard LRU
+    (default 4 shards ≈ 4 GB) keeps memory bounded, but a *random* shuffle
+    forces ~B distinct shard loads per batch (cache miss rate ≈ 100%).
+    This sampler keeps consecutive accesses inside one shard for
+    `samples_per_shard_visit` indices before moving on, dropping the I/O
+    cost from "1 shard load per batch" to "1 shard load per
+    (samples_per_shard_visit // batch_size) batches".
+
+    Weighting (T2): per-index weights from
+    `TataDeltaDataset.compute_index_weights(...)` are pre-sliced per shard
+    and used inside each visit via `torch.multinomial(replacement=True)`.
+    Expected sample frequency across all shards stays proportional to
+    weights (each shard is visited the same number of times per round).
+
+    Each "round":
+      1. Permute the shard order (deterministic if `generator` is set).
+      2. For each shard, draw `samples_per_shard_visit` indices with
+         replacement, weighted by that shard's slice of `weights`.
+      3. Yield each index.
+    Rounds continue until `num_samples` indices have been emitted.
+    """
+
+    def __init__(
+        self,
+        shard_groups: "dict[int, list[int]]",
+        weights: torch.Tensor,
+        *,
+        samples_per_shard_visit: int,
+        num_samples: int | None = None,
+        generator: torch.Generator | None = None,
+    ):
+        super().__init__(None)
+        if not shard_groups:
+            raise ValueError("BlockShardSampler: shard_groups is empty")
+        if samples_per_shard_visit <= 0:
+            raise ValueError(
+                f"samples_per_shard_visit must be > 0; got {samples_per_shard_visit}"
+            )
+
+        # Materialize shard slices in a stable order so reruns with the
+        # same generator seed produce the same access pattern.
+        self.shard_ids: list[int] = sorted(shard_groups.keys())
+        self._shard_indices: list[torch.Tensor] = []
+        self._shard_weights: list[torch.Tensor] = []
+        for sid in self.shard_ids:
+            idxs = torch.as_tensor(shard_groups[sid], dtype=torch.long)
+            self._shard_indices.append(idxs)
+            self._shard_weights.append(weights[idxs].clone().float())
+
+        self.samples_per_shard_visit = int(samples_per_shard_visit)
+        if num_samples is None:
+            # Default: one round = each shard visited once.
+            num_samples = len(self.shard_ids) * self.samples_per_shard_visit
+        self.num_samples = int(num_samples)
+        self.generator = generator
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self):
+        n_yielded = 0
+        n_shards  = len(self.shard_ids)
+        while n_yielded < self.num_samples:
+            perm = torch.randperm(n_shards, generator=self.generator)
+            for shard_pos in perm.tolist():
+                idxs = self._shard_indices[shard_pos]
+                w    = self._shard_weights[shard_pos]
+                draw = torch.multinomial(
+                    w, self.samples_per_shard_visit,
+                    replacement=True, generator=self.generator,
+                )
+                # Use indexing + tolist to avoid a Python loop over each draw.
+                picked = idxs[draw].tolist()
+                for k in picked:
+                    yield k
+                    n_yielded += 1
+                    if n_yielded >= self.num_samples:
+                        return
 
 
 def make_train_val_filter(val_frac: float, seed: int = 42) -> tuple[Callable, Callable]:
