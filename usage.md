@@ -11,6 +11,55 @@ sibling `peft_project/` trees. The only external code dependency is
 
 ---
 
+## Local plotting (no wandb cloud needed)
+
+`train.py` writes every metric it logs to wandb into a plain JSONL at
+`<ckpt_dir>/metrics.jsonl` as well. The companion script
+`delta_model/eval/plot_metrics.py` turns one or more of those files
+into matplotlib plots — handy for fast on-machine comparison across
+trials.
+
+```bash
+# Single run, all common metrics, popup window
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl
+
+# Trial-2 vs M1.5 vs M1.6 on a few metrics, saved to PNG
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_llada_variant_c/metrics.jsonl \
+    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl \
+    ckpts/m1_6_lambdamse0_llada_variant_c/metrics.jsonl \
+    --metric train/kl val/kl gsm8k/accuracy_hybrid \
+    --out plots/m1_kl_gsm8k.png
+
+# Smooth noisy single-batch train curves, log scale
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl \
+    --metric "train/.*" --smooth 25 --ylog \
+    --out plots/m1_5_train_smooth.png
+
+# Per-bin val MSE breakdown
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl \
+    --metric "val/mse_by_gap_.*" --out plots/m1_5_val_bins.png
+```
+
+Notes:
+
+- The script accepts exact metric names *or* regexes (`train/.*`,
+  `val/mse_by_gap_[0-9]+`). With no `--metric`, plots all metrics
+  common across the runs you passed.
+- Subplot legend uses the **checkpoint folder name** as the run label
+  (e.g. `m1_5_tier1_llada_variant_c`), so visually distinct configs
+  → visually distinct labels.
+- Trial-2 and M1.5 ran **before** the JSONL mirror landed (2026-05-12),
+  so their `metrics.jsonl` doesn't exist yet — their history lives
+  only in wandb cloud or the local `wandb/run-*/run-*.wandb` binary.
+  M1.6 / T5 / all future runs will have JSONL by default. To get
+  trial-2 / M1.5 into a plot, re-run them, or pull via `wandb.Api()`.
+
+---
+
 ## Quickstart — post-M1.5: T4 sweep + M1.6 + T5 collect, all in parallel
 
 After M1.5 (val KL plateaued ≈ trial-2, GSM8K 0.40 within 1σ of 0.44),

@@ -14,6 +14,7 @@ subset eval, and rolling checkpoints.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -417,6 +418,20 @@ def main() -> None:
 
     wandb = _setup_wandb(cfg)
     ckpt_dir = Path(cfg.checkpoint.out_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Local JSONL mirror of every wandb.log payload. Append-mode so resumes
+    # don't truncate the existing history. Plot with
+    # `python -m delta_model.eval.plot_metrics <ckpt_dir>/metrics.jsonl`.
+    metrics_path = ckpt_dir / "metrics.jsonl"
+    metrics_fp = metrics_path.open("a", buffering=1)   # line-buffered
+    print(f"[train] metrics → {metrics_path}", flush=True)
+
+    def log_metrics(step: int, payload: dict) -> None:
+        """Mirror to both wandb (if active) and the local JSONL log."""
+        if wandb is not None:
+            wandb.log(payload, step=step)
+        metrics_fp.write(json.dumps({"step": int(step), **payload}) + "\n")
 
     log_keys = ("loss", "mse", "kl", "bce", "c_label_mean", "c_pred_mean")
     print("[train] starting", flush=True)
@@ -486,20 +501,19 @@ def main() -> None:
             refresh=False,
         )
 
-        if step % cfg.log.log_every == 0 and wandb is not None:
+        if step % cfg.log.log_every == 0:
             payload = {f"train/{k}": float(loss_dict[k].item()) for k in log_keys}
             payload["lr"] = lr
             payload["throughput/samples_per_sec"] = (
                 cfg.data.batch_size / max(1e-6, time.time() - t0)
             )
-            wandb.log(payload, step=step)
             t0 = time.time()
-            pbar.write(f"[time] step={step:6d} {timers.summary_and_reset()}")
-        elif step % cfg.log.log_every == 0:
-            pbar.write(
-                f"[train] step={step:6d} lr={lr:.2e} "
-                + " ".join(f"{k}={float(loss_dict[k].item()):.4e}" for k in log_keys),
-            )
+            log_metrics(step, payload)
+            if wandb is None:
+                pbar.write(
+                    f"[train] step={step:6d} lr={lr:.2e} "
+                    + " ".join(f"{k}={float(loss_dict[k].item()):.4e}" for k in log_keys),
+                )
             pbar.write(f"[time] step={step:6d} {timers.summary_and_reset()}")
 
         if step > 0 and step % cfg.log.val_every == 0:
@@ -514,10 +528,8 @@ def main() -> None:
                     bins_reveal=cfg.log.bins_reveal,
                     device=device, dtype=dtype,
                 )
-            if wandb is not None:
-                wandb.log({f"val/{k}": v for k, v in val_metrics.items()},
-                          step=step)
-            else:
+            log_metrics(step, {f"val/{k}": v for k, v in val_metrics.items()})
+            if wandb is None:
                 pbar.write(f"[val ] step={step:6d} {val_metrics}")
 
         if (step > 0 and cfg.log.gsm8k_every > 0
@@ -533,9 +545,7 @@ def main() -> None:
                     ),
                     seed=cfg.seed,
                 )
-                if wandb is not None:
-                    wandb.log({f"gsm8k/{k}": v for k, v in gsm.items()},
-                              step=step)
+                log_metrics(step, {f"gsm8k/{k}": v for k, v in gsm.items()})
             except Exception as e:
                 pbar.write(f"[gsm8k] mid-train eval failed (continuing): {e}")
 
@@ -548,6 +558,7 @@ def main() -> None:
 
     pbar.close()
     final = _ckpt_save(model, opt, step, cfg, out_dir=ckpt_dir)
+    metrics_fp.close()
     print(f"[train] done. final ckpt: {final}", flush=True)
 
 

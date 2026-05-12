@@ -74,6 +74,7 @@ tata/
     eval/
       shared_mass.py                        — overlap metric
       gsm8k_e2e.py                          — end-to-end eval harness
+      plot_metrics.py                       — matplotlib plotter for `<ckpt_dir>/metrics.jsonl` (multi-run compare)
     sanity/
       test_zero_init.py                              — T2: model+loss invariants
       test_collect_roundtrip.py                      — T3: cache schema check
@@ -406,7 +407,11 @@ the sampler uses `torch.manual_seed(cfg.seed)` set at startup.
 
 ## 4 · Training (`train.py`)
 
-Single-file training loop, AdamW + cosine LR + warmup. Wandb logging.
+Single-file training loop, AdamW + cosine LR + warmup. Wandb logging
+**plus** a local JSONL mirror at `<ckpt_dir>/metrics.jsonl` — every
+`wandb.log` payload is appended as one JSON line (`{step, ...}`). This
+gives full on-machine history independent of wandb's cloud, parseable
+by `eval/plot_metrics.py` (matplotlib). Append-mode survives resumes.
 
 Wallclock timers (`StepTimers`) wrap each section: `data / h2d / fwd /
 loss / bwd / opt / val`. Prints `[time]` line every `log_every` steps.
