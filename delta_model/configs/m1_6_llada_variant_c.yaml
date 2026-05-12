@@ -1,0 +1,86 @@
+# M1.6 — T6 (`λ_mse = 0`) ablation. Tests whether MSE is doing any
+# load-bearing work after M1.5's loss-space reallocation didn't move val KL.
+#
+# Diff vs `m1_5_llada_variant_c.yaml`:
+#   loss.lambda_mse: 1.0 → 0.0          # drop MSE entirely
+#   (everything else matches M1.5 Tier-1: final_norm space, dropout 0.1,
+#    ref0_weight_multiplier 3.0)
+#
+# Three outcomes to watch for:
+#   - Within ε of M1.5 on val KL + GSM8K → MSE wasn't load-bearing; ship
+#     the simpler 2-term loss (KL + BCE only). Validates LeWM's
+#     "fewer terms beat heuristics" recipe for tata.
+#   - Worse → MSE was a low-frequency anchor; keep it (revisit weight).
+#   - Better → KL alone optimizes more cleanly without MSE pulling on
+#     the residual stream; ship the 2-term loss with even more confidence.
+#
+# Reuses `cache_v1/llada/` (the trial-2 / M1.5 cache). Can run in PARALLEL
+# with T5 collect (which lands in `cache_v1_20k/llada/`) — different cache
+# dirs, no race. Separate ckpt dir + wandb group so M1.5 and M1.6 don't
+# overwrite each other.
+
+run_name:          m1_6_lambdamse0_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada                       # llada | dream
+  fast_dllm_path:  null                        # falls back to env / external/Fast-dLLM/v1
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1/llada              # same cache as M1.5 / trial-2
+  manifest:        cache_v1/llada/manifest.json
+  val_frac:        0.10
+  shuffle_seed:    42                          # keep val split identical to M1.5 for direct comparison
+  num_workers:     0
+  batch_size:      256
+  pin_memory:      false
+  preload:         true
+  mask_token_id:   126336
+  ref0_weight_multiplier: 3.0                  # same as M1.5
+
+model:
+  variant:         C
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2
+  d_ff_inner:      10944
+  dropout:         0.1                         # same as M1.5
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.01
+  betas:           [0.9, 0.95]
+  warmup_steps:    500
+  max_steps:       20000
+  scheduler:       cosine
+  grad_clip:       1.0
+  precision:       bf16
+
+loss:
+  # T6: λ_mse = 0 drops the MSE term entirely. mse_space is still set to
+  # final_norm so the metric we log is comparable to M1.5 (this only affects
+  # what gets reported in `train/mse` and `val/mse`; the gradient
+  # contribution is zero regardless of space when λ_mse=0).
+  mse_space:       final_norm
+  lambda_mse:      0.0                         # ← the ablation
+  lambda_kl:       1.0
+  lambda_conf:     1.0
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M1.6-lambdamse0-llada        # distinct from M1-llada / M1.5-tier1-llada
+  log_every:       50
+  val_every:       500
+  gsm8k_every:     5000
+  gsm8k_subset:    50
+  gsm8k_per_pos_threshold: 0.85                # may want to override with T4 winner
+  bins_gap:        [1, 2, 3, 4, 5]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  keep_last:       3
+  out_dir:         ckpts/m1_6_lambdamse0_llada_variant_c

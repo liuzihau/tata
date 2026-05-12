@@ -196,44 +196,61 @@ development; the full postmortem lives in `engineering.md` §6.
   - Trial 2 (after BCE fix, agreement decoding, alignment audit):
     GSM8K 0.28 → **0.44** at later checkpoint. Real progress; still
     0.28 short of baseline 0.72.
-- **M1.5 — Tier 1 fixes (loss-space + sampler + dropout).** From the
-  trial-2 diagnosis: train-val KL gap is ~4× while MSE gap is ~1.2×,
-  i.e. MSE has saturated at the fp16 noise floor while KL still
-  generalizes poorly. That, plus the fact that MSE consumes 76% of
-  weighted training gradient, says the dominant lever is **loss-space
-  misallocation**, not capacity or architecture. Three changes
-  shipped together:
-  - **T1 (= M1.5 A) — MSE in `final_norm` space.** Replace
-    `MSE(Δh_pred, h_target − h_ref)` with
-    `MSE(final_norm(h_ref + Δh_pred), final_norm(h_target))`.
-    Aligns MSE gradient with the subspace `lm_head` actually reads.
-    Rescale `λ_mse` from 0.1 to ~1.0 (post-norm MSE sits at O(1)
-    instead of O(10²)).
-  - **T2 — i_ref-biased sampler.** Training currently sees only 33%
-    of pairs with `i_ref = 0` (5/15 per block); inference is ~80-95%
-    `i_ref = 0`. Use `WeightedRandomSampler` with `ref0` weight
-    multiplier (default 3 → 60% `i_ref = 0`, tunable).
-  - **T3 — dropout 0.1 in the delta model.** ~500M params trained on
-    ~600k pairs → over-capacity. Config-only knob; closes the
-    train-val gap.
-- **M1.6 — Loss simplification ablation (M1.5 B).** After T1 lands a
-  stable baseline, ablate `λ_mse = 0`. If GSM8K within ε, ship the
-  simpler 2-term loss (KL + BCE) per the LeWM "fewer terms beat
-  heuristics" recipe. If worse, T1 keeps MSE.
-- **M2 — Tier 2 + variants A and B, LLaDA-8B.** Larger experiments
-  conditioned on Tier 1 outcomes:
-  - **T5 — scale data (5000 → 15000–20000 prompts).** Closes the
-    residual train-val KL gap. Pure collect cost (no code change).
-  - **T6 — multi-layer hidden fusion (EAGLE-3 hint).** Requires
-    recollect; only attempt if Tier 1 + T5 plateau below 0.65.
+- **M1.5 — Tier 1 fixes (loss-space + sampler + dropout). Landed
+  2026-05-12. Result: neutral.** Three changes shipped together
+  to test the loss-space hypothesis:
+  - **T1** — MSE in `final_norm` space (with `λ_mse 0.1 → 1.0`).
+  - **T2** — i_ref-biased `WeightedRandomSampler` (multiplier 3 →
+    60% P(i_ref=0)).
+  - **T3** — dropout 0.1 in the delta model.
+
+  Final metrics: train MSE/KL/BCE 0.989/0.092/0.348, val 1.081/0.293/0.472.
+  Compared to trial-2: **val KL identical (0.295 → 0.293)**; train-val
+  KL gap narrowed 3.93× → 3.19× (T3 working but undersized); MSE
+  scale dropped from O(10²) to O(1) as predicted (T1 mechanically
+  correct). GSM8K **0.40** vs trial-2's 0.44 — within 1σ noise at
+  n=200 (SE ≈ 0.035).
+
+  **Conclusion: loss-space was not the binding constraint at this
+  data scale.** Tier-1 was mechanically successful (clean loss, in
+  the right space, dropout reduced gap) but did not move the needle
+  on Nemotron generalization. The lever is data-vs-capacity ratio,
+  not loss space.
+
+  Why this is consistent: overfitting onset was at ~1.5k steps —
+  1500 × 256 = 384k samples ÷ 40k unique blocks = **~9.6 block-views**.
+  The 15 (i_ref, i_target) pairs in a block share `h_per_pass`,
+  `prefix_kv`, `reveal_per_pass`, and the prompt's `substituted_ids`
+  template, so the **block** is the effective sampling unit, not the
+  pair. At ~10 block-epochs the network can start memorizing
+  block-specific structure with 500M params. By step 20k that's ~128
+  block-epochs — too many for the data budget.
+
+- **M1.6 — `λ_mse = 0` ablation.** Test whether MSE is doing any
+  load-bearing work at all. M1.5 val KL was identical to trial-2's
+  despite swapping MSE-space, so MSE's contribution to generalization
+  is suspect. Config-only run on the existing cache; can launch in
+  parallel with M2 collect.
+
+- **M2 — Tier 2 (data scaling + capacity + variants).** Now ranked
+  with T5 as primary:
+  - **T5 — scale data (5000 → 15000–20000 prompts). PRIMARY.**
+    Direct response to the block-as-sampling-unit overfitting
+    signature. Pure collect cost (no code change). Lands in a new
+    cache dir (`cache_v1_20k/llada/`) so it doesn't race with M1.6
+    on the original cache. Hash-stable test split means the 800
+    test prompts are identical to trial-2's.
+  - **T7 — deeper delta model (2 → 4 layers).** Only if T5 plateaus
+    below 0.60; capacity may need to grow alongside data.
   - **Variants A (cross-attn anchor) / B (AdaLN-Zero).** Compare on
     val-shared-mass and swap-in GSM8K accuracy, binned by gap and
     reveal-fraction.
   - **T8 (= old C) — sliced 1-D distribution-matching regularizer**
     on `h_pred` vs `h_target`. SIGReg's projection-based mechanism,
     retargeted from anti-collapse to anti-drift. Gate: only attack
-    if per-bin val diagnostic shows late-iter / high-reveal degradation
-    after Tier 1 lands.
+    if per-bin val diagnostic shows late-iter / high-reveal
+    degradation after T5 lands.
+
 - **M3 — replicate winning variant on Dream-7B.** Confirms the recipe
   is base-model-portable in methodology (separate trained delta
   models, same architecture).
@@ -244,9 +261,9 @@ development; the full postmortem lives in `engineering.md` §6.
 0.85 default at `gsm8k_per_pos_threshold` was picked at design time,
 not tuned. Hybrid GSM8K accuracy is non-monotone in threshold (low =
 bad commits, high = unnecessary rollbacks). Run the existing eval
-harness's sweep over {0.70, 0.80, 0.85, 0.90, 0.95} before any
-retraining. Could surface a 0.44 → 0.50+ at zero cost. Command in
-`usage.md`.
+harness's sweep over {0.70, 0.80, 0.85, 0.90, 0.95} on the M1.5
+checkpoint. Free, ~30 min. Could recover the trial-2/M1.5 GSM8K gap
+at zero training cost. Command in `usage.md`.
 
 ---
 
@@ -353,30 +370,34 @@ critiques that motivated the delta-model proposal:
 ## 9 · Status snapshot (2026-05-12)
 
 M0 done. M1 trial 1 reproduced an alarming GSM8K decline
-(0.72 baseline → 0.10 at step 15k). M1 trial 2 landed with the
-following fixes: BCE-target clamp (fp32-softmax roundoff),
-agreement decoding via the per-position confidence head, alignment
-audit of the rollback path. Result: **GSM8K 0.28 → 0.44** at later
-checkpoint, real progress, but still 0.28 short of baseline 0.72.
+(0.72 baseline → 0.10 at step 15k). M1 trial 2: GSM8K **0.28 → 0.44**
+after BCE clamp + agreement decoding + alignment audit. M1.5 Tier-1
+(T1+T2+T3): val KL identical to trial-2 (0.293 vs 0.295), GSM8K
+**0.40** (within 1σ noise of 0.44).
 
-Trial-2 diagnosis:
+**The diagnosis updated.** The loss-space hypothesis was *good
+reasoning from trial-2 evidence* but is not the binding constraint
+at this data scale. Tier-1's mechanically correct loss reallocation
+did not move val KL, so the bottleneck is upstream — in data
+volume relative to model capacity. Concretely: overfitting onset at
+~1.5k steps corresponds to ~9.6 block-views (384k samples / 40k
+unique blocks), and the 15 pairs per block share enough structure
+(h_per_pass stack, prefix_kv, reveal patterns, substituted_ids
+template) that the **block** is the effective sampling unit. At
+~10 block-epochs a 500M-param network starts memorizing
+block-specific structure faster than it generalizes.
 
-- **Train-val gap is concentrated on KL (~4×), not MSE (~1.2×).**
-  Loss-space misallocation: MSE on raw h has saturated at the fp16
-  noise floor while KL is still learning. Yet MSE consumes 76% of
-  weighted training gradient because λ_mse=0.1, MSE~14 vs λ_kl=1.0,
-  KL~0.07. Direct evidence that **T1 (M1.5 A; final_norm-space MSE)
-  is the dominant lever**.
-- **Train-inference `i_ref` mismatch.** Training is 33% `i_ref = 0`;
-  inference is ~80–95%. Two-thirds of training gradient is spent on
-  pairs almost never seen at inference. Addressed by T2 (weighted
-  sampler).
-- **Over-capacity for current data.** ~500M params, ~600k training
-  pairs, ~8.5 epochs. Dropout=0 in the delta model. T3 turns dropout
-  up to 0.1; T5 scales data in M2 if Tier 1 plateaus.
+Three concurrent next actions:
 
-Next concrete action (M1.5, **current focus**): land T1 + T2 + T3
-together, retrain on existing cache, measure GSM8K and the train-val
-KL gap. T4 (eval-time threshold sweep on the current checkpoint) is
-free and should be run alongside as a sanity gate. See `usage.md`
-Tier 1 recipe.
+1. **T4 sweep on the M1.5 checkpoint** — free, ~30 min, may recover
+   the trial-2 / M1.5 GSM8K delta entirely from a better operating
+   point.
+2. **M1.6 = T6 (`λ_mse = 0` ablation)** — config-only, runs against
+   the *existing* `cache_v1/llada/` cache. Tests whether MSE is
+   load-bearing at all.
+3. **M2 collect for T5** — collect 15000–20000 prompts into a new
+   `cache_v1_20k/llada/` directory. Can run in parallel with M1.6
+   without racing on cache files. The hash-stable test split keeps
+   the same 800 test prompts as trial-2 for direct comparison.
+
+See `usage.md` Tier-1+ recipe for commands.

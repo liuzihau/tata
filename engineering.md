@@ -12,28 +12,33 @@ For *how* to run anything, see `usage.md`.
 
 ## Status snapshot (2026-05-12)
 
-Current focus: **M1.5 Tier 1** — three changes landing together
-(loss-space, sampler, dropout) on the existing trial-2 cache, no
-recollect needed.
+Current focus: **two parallel runs + one free eval** —
+- T4 sweep on the M1.5 checkpoint (free, ~30 min).
+- M1.6 = T6 (`λ_mse = 0`) on the existing `cache_v1/llada/` cache.
+- M2 T5 collect (5000 → 20000 prompts) into a separate
+  `cache_v1_20k/llada/` directory to avoid racing M1.6 on the
+  manifest.
 
 | area | state |
 |---|---|
-| Data schema | v2 (`prefix_kv` field, `prefix_window=64` stored, optional `prefix_kv_pad_mask`). Cache from before §3.1 work is **incompatible** — recollect required. Trial-2 cache is reused for Tier 1. |
-| Model | VariantC with RoPE on absolute positions (§1.5), RMSNorm + SwiGLU primitives (§1.6), per-position confidence head (§3.2). Dropout knob exposed via config (T3, §2.5). Pre-§3.2 checkpoints won't load. |
-| Training | Preload-all-samples (~80 GiB RAM). Single-process loader (64 MiB `/dev/shm` cap). Optional i_ref-biased `WeightedRandomSampler` (§3.4, T2). |
-| Loss | Composite MSE + KL + BCE. MSE space configurable via `loss.mse_space` (`raw` legacy, `final_norm` recommended; §3.2). BCE target clamped to [0, 1] for fp32-softmax roundoff. |
+| Data schema | v2 (`prefix_kv` field, `prefix_window=64` stored, optional `prefix_kv_pad_mask`). Trial-2 / M1.5 cache reused for M1.6. T5 collect lands in a new dir. |
+| Model | VariantC with RoPE on absolute positions (§1.5), RMSNorm + SwiGLU primitives (§1.6), per-position confidence head, dropout knob exposed (T3, §2.5). |
+| Training | Preload-all-samples (~80 GiB RAM). Single-process loader. Optional i_ref-biased `WeightedRandomSampler` (§3.4, T2). |
+| Loss | Composite MSE + KL + BCE. MSE space configurable via `loss.mse_space` (`raw` legacy, `final_norm` recommended; §3.2). BCE target clamped to [0, 1]. |
 | Inference | Hybrid runner: full forward @ pass 0, delta @ iter ≥ 1, partial-forward rollback (matches collect's iter ≥ 1). Agreement decoding via per-position threshold. |
-| Eval | gsm8k_e2e harness sweeps `per_pos_thresholds`; reports hybrid/vanilla accuracy + speedup + disagreement count. **T4 sweep can be run on the existing trial-2 checkpoint for free.** |
+| Eval | gsm8k_e2e harness sweeps `per_pos_thresholds`; reports hybrid/vanilla accuracy + speedup + disagreement count. |
 
 Trial results history:
 - **Trial 1** (pre-3.1 rollback fix, block-aggregate conf): 0.72 baseline → 0.20 at 15k.
-- **Trial 2** (post-3.1 alignment audit, agreement decoding, BCE clamp): 0.28 → **0.44** at later checkpoint. Train MSE/KL/BCE 12.6/0.054/0.29 vs val 16.1/0.38/0.59 — train-val KL gap ~4× is the smoking gun for loss-space misallocation.
+- **Trial 2** (post-3.1 alignment audit, agreement decoding, BCE clamp): GSM8K 0.28 → **0.44**. Train MSE/KL/BCE 12.6/0.054/0.29 vs val 16.1/0.38/0.59 — train-val KL gap ~4× hypothesized to be loss-space misallocation.
+- **M1.5 Tier-1** (T1 final_norm MSE + T2 sampler + T3 dropout): final train MSE/KL/BCE 0.989/0.092/0.348 vs val 1.081/0.293/0.472. **Val KL identical to trial-2 (0.293 vs 0.295)**; KL gap narrowed 3.93× → 3.19× (T3 working, undersized); GSM8K **0.40** (within 1σ of 0.44). Loss-space hypothesis **rejected as primary lever** at this data scale. Overfitting onset at ~1.5k steps = ~9.6 block-views (384k samples / 40k unique blocks); the 15 pairs/block share enough structure that the *block* is the effective sampling unit, putting a 500M-param model at ~10 block-epochs of effective data by 1.5k.
 
 Recent changes log (most recent first):
 
-- **2026-05-12** §3.2 T1 (= M1.5 A) landed: `mse_space="final_norm"` option in `composite_loss`; default config rescaled `λ_mse 0.1 → 1.0`.
+- **2026-05-12** M1.5 Tier-1 result recorded; tier ranking updated. T5 (data scaling) promoted to PRIMARY for M2; T6 (`λ_mse = 0`) elevated to runnable parallel ablation (M1.6).
+- **2026-05-12** §3.2 T1 (= M1.5 A) landed: `mse_space="final_norm"` option in `composite_loss`; new config (`m1_5_llada_variant_c.yaml`) rescaled `λ_mse 0.1 → 1.0`.
 - **2026-05-12** §3.4 T2 landed: i_ref-biased `WeightedRandomSampler` (`data.ref0_weight_multiplier`, default 3.0).
-- **2026-05-12** §2.5 T3 landed: `model.dropout = 0.1` default in M1 config (was 0.0).
+- **2026-05-12** §2.5 T3 landed: `model.dropout = 0.1` in M1.5 config (was 0.0 in trial-2).
 - **2026-05-11** Fix BCE NaN crash: clamp `c_label_per_pos ∈ [0, 1]` in `losses.py` (fp32-softmax roundoff).
 - **2026-05-11** §3.2 per-position confidence + agreement decoding landed.
 - **2026-05-11** §3.5 pad-and-mask short prompts (no skipping).
@@ -77,6 +82,7 @@ tata/
     configs/
       m1_llada_variant_c.yaml               — M1 trial-2 baseline (raw MSE, dropout 0, uniform sampler)
       m1_5_llada_variant_c.yaml             — M1.5 Tier-1 (T1+T2+T3) — final_norm MSE, dropout 0.1, ref0-biased sampler
+      m1_6_llada_variant_c.yaml             — M1.6 = T6 (λ_mse = 0 ablation) — KL+BCE only loss; rest matches M1.5
 ```
 
 ---
@@ -575,26 +581,33 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blo
 ### Model / loss
 - `[x]` RoPE on absolute positions (§1.5).
 - `[x]` RMSNorm + SwiGLU primitives matched to backbone (§1.6).
-- `[x]` Per-position confidence head + agreement decoding (§3.2 (legacy header)).
+- `[x]` Per-position confidence head + agreement decoding.
 - `[x]` Fix BCE NaN: clamp `c_label_per_pos ∈ [0, 1]` (fp32-softmax roundoff).
 - `[x]` **T1 (M1.5)** MSE-space switch (`raw` | `final_norm`) in
-  `composite_loss`. Default config now `final_norm` with `λ_mse=1.0`. See §3.2.
+  `composite_loss`. M1.5 config uses `final_norm` with `λ_mse=1.0`.
+  See §3.2. **Mechanically correct, did not move val KL — not the
+  binding constraint at trial-2 data scale.**
 - `[x]` **T2 (M1.5)** i_ref-biased `WeightedRandomSampler`
-  (`data.ref0_weight_multiplier`, default 3.0). See §3.4.
-- `[x]` **T3 (M1.5)** `model.dropout = 0.1` (config-only).
-- `[ ]` **T4** (eval-only) `per_pos_threshold` sweep on the existing
-  trial-2 checkpoint — `eval/gsm8k_e2e.py` already supports it; no
-  code change. Run command in `usage.md`.
-- `[ ]` **T6 / M1.6** `λ_mse = 0` ablation — config-only, run *after*
-  T1 lands a stable baseline. Tests LeWM "fewer terms beat heuristics"
-  point. See §3.2.
-- `[ ]` **T5 (M2)** Scale data 5000 → 15000–20000 prompts — pure
-  collect cost, no code change. Run if Tier 1 plateaus before 0.65.
+  (`data.ref0_weight_multiplier`, default 3.0). See §3.4. Tune
+  upward to 4–8 in M2 if per-bin diagnostic supports it.
+- `[x]` **T3 (M1.5)** `model.dropout = 0.1` (config-only). Reduced
+  train-val KL gap 3.93× → 3.19× — directionally right but
+  undersized. Try 0.2–0.3 in next round.
+- `[~]` **T4** (eval-only) `per_pos_threshold` sweep on the M1.5
+  checkpoint — `eval/gsm8k_e2e.py` already supports it; no code
+  change. Free; run alongside M1.6 / T5. Command in `usage.md`.
+- `[~]` **M1.6 = T6** `λ_mse = 0` ablation — own config
+  (`m1_6_llada_variant_c.yaml`). Uses existing `cache_v1/llada/`.
+  Parallel to M2 collect. Tests whether MSE is doing any load-bearing
+  work after the M1.5 reallocation didn't move val KL.
+- `[~]` **T5 (M2) — PRIMARY** scale data 5000 → 15000–20000 prompts
+  into `cache_v1_20k/llada/`. Pure collect cost, no code change.
+  Direct response to the block-as-sampling-unit overfitting
+  signature (M1.5 status snapshot).
+- `[ ]` **T7 (M2)** Deeper delta model (2 → 4 layers). Only if T5
+  plateaus below 0.60 and per-bin diagnostic implicates capacity.
 - `[ ]` **T8 = old C (M2)** Sliced 1-D distribution-matching
-  regularizer on `h_pred` vs `h_target` — SIGReg mechanism (random
-  projections + 1-D Wasserstein-1), anti-drift. See §3.3.
-- `[ ]` **T7 (M2)** Deeper delta model (2 → 4 layers). Only if Tier
-  1 + T5 plateau and per-bin diagnostics implicate capacity.
+  regularizer on `h_pred` vs `h_target` — SIGReg mechanism. See §3.3.
 - `[ ]` Variant A (cross-attn anchor) — M2 candidate.
 - `[ ]` Variant B (AdaLN-Zero) — M2 candidate.
 - `[ ]` Multi-layer hidden fusion (EAGLE-3 hint) — M2; requires recollect.
@@ -633,6 +646,7 @@ Recorded in `~/.claude/projects/.../memory/project_cluster_shm.md`:
 2. **What range of `per_pos_threshold` is useful?** Sweep at eval time. Too low → too many wrong commits, GSM8K drops. Too high → too many rollbacks, no speedup. Inflection point characterizes how confident the model deserves to be.
 3. **Do later passes (i ≥ 3) need a different treatment?** Empirical shared-mass plateaus at ~58–60% for pass i ≥ 3. Possibly the delta model can't recover this gap and we should always rollback after pass 2.
 4. **How do (i_ref, i_target) gap and reveal_fraction interact with accuracy?** Currently logged in val metrics binned by both — but not yet looked at as a diagnostic.
-5. **Right loss space (T1 landed).** Trial-2 evidence (train-val KL gap ~4× vs MSE gap ~1.2×) supports T1. §3.2 now ships `mse_space="final_norm"` by default in M1 config. Open: does T6 (`λ_mse = 0`) match or beat T1, ruling out a residual role for MSE entirely?
-6. **What is the actual inference `i_ref` distribution?** §3.4 T2 sampler tunes toward an assumed 80% `i_ref=0`. We don't yet measure inference's true distribution per rollback rate. Quick instrumentation: have `hybrid_runner.py` record `(i_ref_used, i_target)` tuples for each delta forward and emit a histogram into `stats`. Land alongside the Tier-1 first eval. Will tell us whether `ref0_weight_multiplier=3` is too conservative (current default → 60% `i_ref=0`).
-7. **Is trajectory drift the eval bottleneck (M2 gate for T8)?** §3.3's anti-drift regularizer is only worth implementing if mid-iter `h_pred` distribution diverging from `h_target` is what costs accuracy at later iters / higher reveal fractions. Diagnostic: log per-bin val-loss + shared-mass against `(i_ref, i_target)` gap after Tier 1 lands.
+5. **Right loss space (T1 result: not the binding constraint).** M1.5 val KL identical to trial-2's despite swapping MSE-space, so loss-space reallocation alone does not close the train-val gap at this data scale. Open: M1.6 (T6 `λ_mse = 0`) will tell us whether MSE is doing *any* load-bearing work, or whether the 2-term loss (KL + BCE) matches M1.5 exactly.
+6. **What is the actual inference `i_ref` distribution?** §3.4 T2 sampler is at multiplier 3 → 60% P(i_ref=0). Inference's actual distribution is unmeasured. Quick instrumentation: have `hybrid_runner.py` record `(i_ref_used, i_target)` tuples per delta forward and emit a histogram into `stats`. Land alongside the M1.6 eval. If inference is 90%+ i_ref=0, bump multiplier toward 8 in T5.
+7. **Is trajectory drift the eval bottleneck (M2 gate for T8)?** §3.3's anti-drift regularizer is only worth implementing if mid-iter `h_pred` distribution diverging from `h_target` is what costs accuracy at later iters / higher reveal fractions. Diagnostic: log per-bin val-loss + shared-mass against `(i_ref, i_target)` gap after T5 lands.
+8. **Block as effective sampling unit.** M1.5 overfitting onset at ~9.6 block-views says the 15 pairs/block share too much structure to count as independent examples. Open: should the dataset's sampling weight further down-weight intra-block redundancy, or is "one block ≈ one example" the right mental model and data-scaling (T5) the only fix? T5 is the experiment that answers this — if val KL drops materially with 3–4× more blocks, the model was data-starved at the block level.

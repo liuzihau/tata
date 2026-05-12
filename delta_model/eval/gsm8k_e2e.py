@@ -249,7 +249,9 @@ def main() -> None:
         rows.append(m)
 
     if args.out_json:
-        Path(args.out_json).write_text(json.dumps(rows, indent=2))
+        out_path = Path(args.out_json)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(rows, indent=2))
         print(f"[gsm8k] saved {args.out_json}", flush=True)
 
 

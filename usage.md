@@ -11,6 +11,89 @@ sibling `peft_project/` trees. The only external code dependency is
 
 ---
 
+## Quickstart — post-M1.5: T4 sweep + M1.6 + T5 collect, all in parallel
+
+After M1.5 (val KL plateaued ≈ trial-2, GSM8K 0.40 within 1σ of 0.44),
+three concurrent next actions. The first runs on the existing M1.5
+checkpoint; the second on the existing cache; the third writes to a
+new cache dir, so all three can be launched at the same time without
+racing.
+
+### Action 1 — T4 sweep on M1.5 checkpoint (free, ~30 min)
+
+```bash
+python -m delta_model.eval.gsm8k_e2e \
+    --delta_ckpt ckpts/m1_5_tier1_llada_variant_c/step_0020000.pt \
+    --fast_dllm_path external/Fast-dLLM/v1 \
+    --n_problems 200 \
+    --per_pos_thresholds 0.60,0.70,0.75,0.80,0.85,0.90,0.95 \
+    --out_json eval_results/t4_m1_5_thresh_sweep.json
+```
+
+The 0.85 default was design-time, not tuned. GSM8K is non-monotone
+in this threshold. If a different threshold lands at 0.46+, the M1.5
+result was undersold by a bad operating point. Note the winner — pass
+it to subsequent training via `--override log.gsm8k_per_pos_threshold=<w>`.
+
+### Action 2 — M1.6 (T6 `λ_mse = 0`) on the existing cache (~3–4 h)
+
+```bash
+python -m delta_model.train \
+    --config delta_model/configs/m1_6_llada_variant_c.yaml \
+    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+```
+
+Lands in `ckpts/m1_6_lambdamse0_llada_variant_c/`, wandb group
+`M1.6-lambdamse0-llada`. Reads the **same** `cache_v1/llada/` as
+M1.5 — directly comparable to M1.5's val KL trajectory. Watch:
+
+- `train/mse` and `val/mse` will be reported (mse_space still logs it
+  for comparability) but contribute zero to the loss. The interesting
+  signal is `train/kl` and `val/kl`.
+- If M1.6's val KL ends ≤ M1.5's (≤ 0.293), MSE was redundant and we
+  ship the 2-term loss for cleanliness.
+- If higher, MSE was a low-frequency anchor; keep it but maybe tune
+  λ down (try 0.3 next).
+
+### Action 3 — T5 collect (scale data 5k → 20k) (~12–20 h)
+
+```bash
+# Lands in a NEW cache dir so it doesn't race with M1.6 on
+# cache_v1/llada/manifest.json.
+python -m delta_model.data.collect_llada \
+    --n_train 20000 --n_test 800 \
+    --output_root cache_v1_20k/llada \
+    --fast_dllm_path external/Fast-dLLM/v1
+python -m delta_model.sanity.test_collect_roundtrip \
+    "cache_v1_20k/llada/test/sample_*.pt" | tail -5     # T3 schema check
+```
+
+The hash-stable test split means the 800 test prompts in
+`cache_v1_20k/llada/test/` are **identical** to `cache_v1/llada/test/`
+(same hashes, same `shuffle_seed=42`). Direct A/B vs trial-2/M1.5 on
+the same held-out test prompts.
+
+Storage: ~480 GB at n_train=20000 + n_test=800 with prefix_window=64.
+If tight, drop to n_train=15000 (~360 GB).
+
+Once T5 collect lands, the T5 training config is one copy of
+`m1_5_llada_variant_c.yaml` with `data.cache_root: cache_v1_20k/llada`
+and fresh `run_name` / `log.group` / `checkpoint.out_dir`. Not creating
+that config yet — wait for collect to finish so we can pick batch /
+epoch knobs against the actual sample count.
+
+### Decision tree after these three land
+
+| signal | interpretation | next move |
+|---|---|---|
+| T4 winner ≥ 0.46 | Bad operating point for M1.5 | Adopt as default; M1.5 wasn't underperforming |
+| M1.6 val KL ≤ M1.5 | MSE was redundant | Ship 2-term loss; carry into T5 |
+| M1.6 val KL > M1.5 | MSE was a soft anchor | Keep MSE but tune λ ∈ {0.3, 0.5} |
+| T5 val KL < 0.20 | Data was the binding constraint | Continue scaling; T7 capacity bump if val plateau |
+| T5 val KL ≈ M1.5 | Data isn't the binding constraint | Look at capacity (T7) or trajectory drift (T8) |
+
+---
+
 ## Quickstart — Tier 1 (M1.5; reuses trial-2 cache, no recollect)
 
 If you have a trial-2 cache at `cache_v1/llada/` and a trial-2
