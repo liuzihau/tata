@@ -99,6 +99,15 @@ def _load_and_split_nemotron(
     Each returned record is a dict {"prompt": str, "subset": str,
     "split": "train"|"test", "id": int}. The split is hash-stable: the
     same `n_test` test problems are returned regardless of `n_train`.
+
+    Deduplication: Nemotron has many records sharing the same user prompt
+    text (multiple candidate assistant responses per user query, plus
+    cross-subset overlap on chat-formatted math/code problems). Since our
+    on-disk filename is `sample_<id>.pt` and `id` is derived from the
+    user-prompt-text hash, duplicate prompts would clobber to the same
+    file and waste the n_train budget. We dedup globally by hash before
+    allocating the per-subset budget so `n_train + n_test` slots each
+    map to a unique prompt.
     """
     from datasets import load_dataset
 
@@ -108,6 +117,9 @@ def _load_and_split_nemotron(
 
     train_records: list[dict] = []
     test_records: list[dict] = []
+    # Global dedup set — shared across subsets so cross-subset duplicates
+    # (e.g. the same chat-math prompt in both subsets) are caught.
+    seen_hashes: set[int] = set()
 
     for subset, frac in subset_ratios.items():
         if frac <= 0:
@@ -118,36 +130,66 @@ def _load_and_split_nemotron(
             split=subset,
         )
 
+        # Extract prompts and dedup by hash. Track intra-subset duplicates
+        # (multiple records with the same user prompt — typically multiple
+        # assistant candidates per user query) separately from cross-subset
+        # duplicates (prompts already seen in an earlier subset).
+        unique_prompts: list[str] = []
+        unique_hashes:  list[int] = []
+        n_dup_intra = 0
+        n_dup_cross = 0
+        local_seen: set[int] = set()
+        for r in ds:
+            p = prompt_extractor(r)
+            h = _stable_hash(p)
+            if h in local_seen:
+                n_dup_intra += 1
+                continue
+            local_seen.add(h)
+            if h in seen_hashes:
+                n_dup_cross += 1
+                continue
+            seen_hashes.add(h)
+            unique_prompts.append(p)
+            unique_hashes.append(h)
+        print(
+            f"[nemotron] {subset}: {len(ds)} raw → {len(unique_prompts)} unique "
+            f"(dropped {n_dup_intra} intra-subset, {n_dup_cross} cross-subset)",
+            flush=True,
+        )
+
         # Deterministic order via hash of the prompt text.
-        prompts = [prompt_extractor(r) for r in ds]
-        hashes = [_stable_hash(p) for p in prompts]
-        order = sorted(range(len(ds)), key=lambda i: hashes[i])
+        order = sorted(range(len(unique_prompts)),
+                       key=lambda i: unique_hashes[i])
 
         q_test = int(round(n_test * frac / total_frac))
         q_train = int(round(n_train * frac / total_frac))
 
-        if q_test + q_train > len(ds):
+        if q_test + q_train > len(unique_prompts):
             raise ValueError(
-                f"subset '{subset}' has {len(ds)} rows but we asked for "
-                f"{q_test}+{q_train}. Lower n_train or subset_ratios[{subset}]."
+                f"subset '{subset}' has {len(unique_prompts)} unique prompts "
+                f"after dedup but we asked for {q_test}+{q_train}. Lower "
+                f"n_train, raise subset_ratios for other subsets, or pick "
+                f"a subset with more unique data."
             )
 
-        for i, idx in enumerate(order[:q_test]):
+        for idx in order[:q_test]:
             test_records.append({
-                "prompt": prompts[idx], "subset": subset, "split": "test",
-                "id": hashes[idx],
+                "prompt": unique_prompts[idx], "subset": subset, "split": "test",
+                "id": unique_hashes[idx],
             })
-        for i, idx in enumerate(order[q_test:q_test + q_train]):
+        for idx in order[q_test:q_test + q_train]:
             train_records.append({
-                "prompt": prompts[idx], "subset": subset, "split": "train",
-                "id": hashes[idx],
+                "prompt": unique_prompts[idx], "subset": subset, "split": "train",
+                "id": unique_hashes[idx],
             })
 
     rng = random.Random(seed)
     rng.shuffle(train_records)
     rng.shuffle(test_records)
     print(
-        f"[nemotron] split: {len(train_records)} train + {len(test_records)} test",
+        f"[nemotron] split: {len(train_records)} train + {len(test_records)} test "
+        f"({len(seen_hashes)} unique prompts seen across all subsets)",
         flush=True,
     )
     return train_records, test_records
