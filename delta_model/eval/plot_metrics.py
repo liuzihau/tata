@@ -40,13 +40,26 @@ from pathlib import Path
 
 
 def load_jsonl(path: str | Path) -> dict[str, tuple[list[int], list[float]]]:
-    """Read a metrics.jsonl file, return {metric_name: (steps, values)}.
+    """Read a metrics.jsonl, return {metric_name: (sorted_steps, values)}.
 
-    Skips malformed lines (resume artifacts, partial writes during a crash).
+    Returns step-sorted, step-deduplicated series. `train.py` opens the
+    JSONL in append-mode, so a restarted run produces overlapping step
+    ranges in the same file (e.g. 0..1350 from a killed run, then 0..N
+    from the relaunch). Plotting in file order then draws a horizontal
+    line from the old end back to the new start ("begin → last-point"
+    artifact). We dedup by step, *last occurrence in file order wins* —
+    matches the user-intuitive "show me the most recent training
+    trajectory."
+
+    Skips malformed lines (resume artifacts, partial writes during a
+    crash) and non-numeric values.
     """
-    series: dict[str, tuple[list[int], list[float]]] = defaultdict(
-        lambda: ([], []),
-    )
+    # {metric -> {step -> value}}, where later writes to the same step
+    # overwrite earlier ones (later in file = more recent run).
+    per_metric: dict[str, dict[int, float]] = {}
+    n_records = 0
+    n_step_decreases = 0
+    last_step = -(1 << 60)
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -59,13 +72,32 @@ def load_jsonl(path: str | Path) -> dict[str, tuple[list[int], list[float]]]:
             step = rec.get("step")
             if step is None:
                 continue
+            n_records += 1
+            step = int(step)
+            if step < last_step:
+                n_step_decreases += 1
+            last_step = step
             for k, v in rec.items():
                 if k == "step":
                     continue
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    series[k][0].append(int(step))
-                    series[k][1].append(float(v))
-    return dict(series)
+                    per_metric.setdefault(k, {})[step] = float(v)
+
+    if n_step_decreases:
+        print(
+            f"[plot] {path}: {n_step_decreases} step-decrease event(s) "
+            f"detected in {n_records} records — looks like the file contains "
+            f"history from multiple training sessions. Deduping by step "
+            f"(later writes win).",
+            flush=True,
+        )
+
+    result: dict[str, tuple[list[int], list[float]]] = {}
+    for name, d in per_metric.items():
+        steps = sorted(d.keys())
+        values = [d[s] for s in steps]
+        result[name] = (steps, values)
+    return result
 
 
 def _filter_metric_names(
