@@ -17,7 +17,11 @@ commits via the delta model's per-position confidence head:
 Rollback uses a *partial* backbone forward with the cached prefix from
 pass 0, matching collect's iter ≥ 1 path (see improvements.md §3.1) so
 the refreshed h_ref stays in the same distribution the delta model was
-trained on.
+trained on. A rollback then commits tokens via *vanilla* Fast-dLLM on the
+backbone's own logits — no confidence gate, because that gate only judges
+the *delta model's* predictions, not a real backbone forward. So a
+rollback always advances the block by ≥ 1 token; it can't livelock
+paying a backbone forward that then commits nothing.
 
 Returned stats include rollback / disagreement counts so the eval
 harness can plot accuracy / speed / per-position-threshold curves.
@@ -76,9 +80,11 @@ def generate_with_delta(
 
     `per_pos_threshold` ∈ (0, 1] gates per-position commits via the delta
     model's per-position confidence head. Set to 0 to commit everything
-    Fast-dLLM wants (fastest, most lenient). Set to 1 to commit nothing
-    (forces rollback every iter — equivalent to backbone-only baseline).
-    Useful sweep: {0.7, 0.8, 0.85, 0.9, 0.95}.
+    Fast-dLLM wants (fastest, most lenient). Set to 1 to gate out every
+    delta commit — each delta pass then disagrees and the following
+    rollback advances the block via vanilla Fast-dLLM, i.e. it degrades
+    gracefully to the backbone-only baseline (one wasted delta forward
+    per rollback, but no livelock). Useful sweep: {0.7, 0.8, 0.85, 0.9, 0.95}.
 
     `inner_loop_max_iter` is the hard upper bound on the agreement-decoding
     inner while loop. `None` (default) resolves to `2 * block_length`
@@ -99,9 +105,11 @@ def generate_with_delta(
     `max_iter_per_block` is still used as Fast-dLLM's per-iter transfer
     quota in `threshold` mode (unchanged).
 
-    stats keys: rollbacks (int), backbone_forwards (int), delta_forwards (int),
-                disagreements (int — passes where Fast-dLLM wanted more than
-                the per-pos head agreed to), walltime (float, sec),
+    stats keys: rollbacks (int — backbone passes triggered by a delta
+                disagreement; each commits ≥ 1 token via vanilla Fast-dLLM),
+                backbone_forwards (int), delta_forwards (int),
+                disagreements (int — delta passes where Fast-dLLM wanted more
+                than the per-pos head agreed to), walltime (float, sec),
                 per_block_passes (list[int]),
                 per_block_revealed_at_finish (list[int] — non-mask positions
                 in each block when its inner loop exited; reaches
@@ -215,10 +223,25 @@ def generate_with_delta(
                 if (x[:, s:e] == mask_id).sum().item() == 0:
                     break
 
-                # If the previous pass had a disagreement, refresh h_ref via
-                # a partial-forward rollback BEFORE this pass's delta forward.
-                # Same path as collect's iter ≥ 1 — keeps h_ref distribution
-                # aligned with the delta model's training distribution.
+                # If the previous (delta) pass disagreed, this pass is a
+                # ROLLBACK: a pure backbone Fast-dLLM step.
+                #
+                # The per-position confidence gate is the *delta model's*
+                # self-assessment — "can the small model match LLaDA here" —
+                # so it does NOT apply to a real backbone forward. A rollback
+                # follows vanilla Fast-dLLM on the backbone's own logits
+                # (factor / threshold), which commits ≥ 1 token. That
+                # guarantees forward progress: a rollback always pays one
+                # backbone forward AND advances the block, instead of paying
+                # the forward and then re-gating it away (the old livelock:
+                # at high per_pos_threshold every rollback committed nothing,
+                # so the block spun to loop_cap — ~62 backbone forwards/block,
+                # 10x slower than vanilla).
+                #
+                # The partial forward + token transfer mirror collect's
+                # iter ≥ 1 path exactly, so the refreshed h_ref AND the
+                # committed tokens both stay in the delta model's training
+                # distribution.
                 if force_rollback_next:
                     hook_state["is_full_forward"] = False
                     hook_state["s"] = s; hook_state["e"] = e
@@ -229,8 +252,37 @@ def generate_with_delta(
                     )
                     stats["backbone_forwards"] += 1
                     stats["rollbacks"] += 1
+                    # Refresh the delta model's anchor for the *next* delta
+                    # pass. After the commit below, h_ref lags the reveal
+                    # state — the in-distribution i_ref < i_target setup.
                     h_ref = hook_state["latest"]
                     force_rollback_next = False
+
+                    # Vanilla Fast-dLLM transfer on the backbone's own
+                    # logits, restricted to the current block. No gate.
+                    logits_rb = out_rb.logits                       # covers x[:, s:]
+                    mask_rb = (x[:, s:] == mask_id)
+                    mask_rb[:, block_length:] = False
+                    if factor is not None:
+                        x0_rb, transfer_rb = _get_transfer_index_dynamic(
+                            logits_rb, temperature, remasking, mask_rb,
+                            x[:, s:], factor=factor,
+                        )
+                    else:
+                        quota = (
+                            None if threshold is not None
+                            else num_transfer_tokens[
+                                :, min(n_passes, num_transfer_tokens.size(1) - 1)
+                            ]
+                        )
+                        x0_rb, transfer_rb = _get_transfer_index(
+                            logits_rb, temperature, remasking, mask_rb,
+                            x[:, s:], quota, threshold,
+                        )
+                    new_suffix = torch.where(transfer_rb, x0_rb, x[:, s:])
+                    x = torch.cat([x[:, :s], new_suffix], dim=1)
+                    n_passes += 1
+                    continue
 
                 # Build prev_emb at the current state of the block.
                 block_ids = x[0, s:e]

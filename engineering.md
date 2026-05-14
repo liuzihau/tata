@@ -40,6 +40,21 @@ Trial results history:
 
 Recent changes log (most recent first):
 
+- **2026-05-15** Rollback semantics fixed in `inference/hybrid_runner.py`
+  (§5.1). A rollback now commits tokens via vanilla Fast-dLLM on the
+  backbone's own logits (ungated — the confidence gate only judges the
+  *delta* model), guaranteeing ≥ 1 token of progress per rollback. Was a
+  livelock at high `per_pos_threshold`: rollbacks committed nothing,
+  blocks spun to `loop_cap` (0.95-sweep: `mean_rollbacks 467`,
+  `speedup 0.10`, `accuracy 0.03`).
+- **2026-05-15** `data/thin_cache.py` added — in-place, resumable cache
+  thinner (drop block 7, cap iterations to 5, shrink prefix-KV window
+  64→32; CLI-tunable). Thins `train/` only by default so `test/` stays
+  full-resolution and validation/GSM8K compare every run on an identical
+  held-out set. `data/repack.py` gained `--rm_source` (unlink per-sample
+  files as each shard lands → peak disk ~1× not ~2×). `dataset.py` now
+  reads the block count per-sample (not `S.NUM_BLOCKS`); `schema.py` /
+  T3 validate against `meta`-recorded `num_blocks` / `max_iter`.
 - **2026-05-14** `InterleavedShardSampler` landed in `data/dataset.py`
   (§3.6) — replaces `BlockShardSampler` as the default shard-mode sampler
   (`data.shard_sampler`, default `interleaved`). Keeps `active_shards`
@@ -656,10 +671,14 @@ pass 0:    full backbone forward → h_ref, prefix_kv, past_key_values_to_s
            token transfer on full-seq logits, restricted to [s:e]
 iter ≥ 1:
     if force_rollback_next:
-        # partial-forward rollback (matches collect's iter ≥ 1)
+        # ROLLBACK — a pure backbone Fast-dLLM step (§5.1).
         out = model(x[:, s:], past_key_values=past_key_values_to_s, use_cache=True)
-        h_ref ← out.h[block region]
-        past_key_values / prefix_kv unchanged (x[:, :s] hasn't changed within the block)
+        h_ref ← out.h[block region]                  # anchor for the NEXT delta pass
+        # vanilla Fast-dLLM transfer on out.logits — NO confidence gate;
+        # commits ≥ 1 token, mirrors collect's iter ≥ 1 path exactly.
+        commit Fast-dLLM's transfer set on out.logits
+        force_rollback_next = False; continue         # next iter is a delta pass
+    # ---- delta pass ----
     delta_h, c_pos = delta_model(h_ref, prev_emb, prefix_kv, block_start_pos, prefix_kv_pad_mask)
     h_pred = h_ref + delta_h
     logits = lm_head(final_norm(h_pred))
@@ -671,9 +690,9 @@ iter ≥ 1:
 ```
 
 Stats: `rollbacks`, `backbone_forwards`, `delta_forwards`, `disagreements`,
-`per_block_passes`, `walltime`.
+`per_block_passes`, `per_block_revealed_at_finish`, `walltime`.
 
-### 5.1 Agreement decoding rationale
+### 5.1 Agreement decoding + rollback semantics
 
 Block-aggregate confidence is a poor fit for Fast-dLLM's per-position
 commit semantics — a sharp-but-wrong delta can put high local confidence
@@ -682,6 +701,26 @@ when the block-average looks fine. Agreement decoding gates per-position
 on the delta model's own per-position confidence head, then forces a
 rollback when even one position disagrees. Closes the
 aggregate-vs-per-position signal mismatch identified in the post-mortem.
+
+**A rollback is a vanilla Fast-dLLM step, not a gated one (2026-05-15).**
+The per-position confidence gate is the *delta model's* self-assessment —
+"can the small model match what LLaDA would commit here." It has no
+meaning for a real backbone forward. So a rollback runs the partial
+backbone forward and commits its tokens via plain Fast-dLLM
+(`factor` / `threshold`), ungated — which commits ≥ 1 token. This
+guarantees forward progress: a rollback always pays one backbone forward
+*and* advances the block.
+
+The previous code discarded `out.logits` on a rollback and re-gated the
+refreshed `h_ref` through the delta model. At high `per_pos_threshold`
+that livelocked — every rollback committed nothing, so a block spun to
+`loop_cap` (~62 backbone forwards/block, 10× slower than vanilla, blocks
+left unfinished → garbage output). Observed in a 0.95-threshold sweep:
+`mean_rollbacks 467`, `speedup 0.10`, `accuracy 0.03`,
+`mean_revealed_per_block 4.87/32`. With the fix, max rollbacks is bounded
+at ~`block_length` per block (each commits ≥ 1 of the 32 positions), the
+block always finishes, and high `per_pos_threshold` degrades gracefully
+to ≈ the backbone-only baseline instead of livelocking.
 
 ---
 
