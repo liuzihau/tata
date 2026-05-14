@@ -96,6 +96,9 @@ log:
   gsm8k_every:     2000
   gsm8k_subset:    50
   gsm8k_per_pos_threshold: 0.85
+  # Keep gap-5: validation reads the *un-thinned* test split (6 iters), so
+  # gap-5 pairs still exist there. `val/mse_by_gap_5` then shows exactly
+  # what a thinned-train model (max train gap = 4) gave up.
   bins_gap:        [1, 2, 3, 4, 5]
   bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 

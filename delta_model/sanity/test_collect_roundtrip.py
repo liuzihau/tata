@@ -33,17 +33,23 @@ def check_one(path: Path) -> list[str]:
             f"expected {S.SCHEMA_VERSION}"
         )
 
-    if "blocks" not in s or len(s["blocks"]) != S.NUM_BLOCKS:
-        errs.append(f"expected {S.NUM_BLOCKS} blocks, got {len(s.get('blocks', []))}")
+    # `num_blocks` / `max_iter` come from `meta` when present — a cache
+    # thinned by `data/thin_cache.py` keeps fewer blocks / iterations and
+    # records the real counts there. Un-thinned caches fall back to the
+    # schema constants.
+    num_blocks = meta.get("num_blocks", S.NUM_BLOCKS)
+    if "blocks" not in s or len(s["blocks"]) != num_blocks:
+        errs.append(f"expected {num_blocks} blocks, got {len(s.get('blocks', []))}")
         return errs
 
     n_kv_heads    = meta.get("n_kv_heads",    S.N_KV_HEADS_LLADA)
     d_head        = meta.get("d_head",        S.D_HEAD_LLADA)
     d_model       = meta.get("d_model",       S.D_MODEL_LLADA)
     prefix_window = meta.get("prefix_window", S.COLLECT_PREFIX_WINDOW)
+    max_iter      = meta.get("max_iter",      S.MAX_ITER)
     expected = S.expected_block_shapes(
         n_kv_heads=n_kv_heads, d_head=d_head, d_model=d_model,
-        prefix_window=prefix_window,
+        prefix_window=prefix_window, max_iter=max_iter,
     )
 
     for b_idx, b in enumerate(s["blocks"]):
@@ -89,7 +95,7 @@ def check_one(path: Path) -> list[str]:
             )
 
         # Monotone reveal: revealed positions stay revealed across passes.
-        n_actual = b.get("n_passes_actual", S.MAX_ITER)
+        n_actual = b.get("n_passes_actual", max_iter)
         rev = b["reveal_per_pass"][:n_actual]
         for i in range(rev.shape[0] - 1):
             if torch.any(rev[i] & ~rev[i + 1]):

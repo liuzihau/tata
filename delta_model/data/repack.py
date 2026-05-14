@@ -51,11 +51,18 @@ def _atomic_save(obj, path: Path) -> None:
 
 def repack_split(
     cache_root: Path, split: str, shard_size: int, output_subdir: str,
+    *, rm_source: bool = False,
 ) -> list[dict]:
     """Pack `cache_root/<split>/sample_*.pt` into shards under
     `cache_root/<output_subdir>/<split>/shard_*.pt`. Returns a list of
     shard manifest records ({split, shard_index, filename, n_samples,
     sample_ids:[...]}).
+
+    `rm_source=True` unlinks each per-sample file *after* the shard
+    containing it has been atomically written — keeps peak disk usage at
+    ~(cache size + one shard) instead of ~2x. Safe to interrupt: a
+    half-written shard never deletes its sources (the unlink happens
+    post-`_atomic_save`).
     """
     src_dir = cache_root / split
     out_dir = cache_root / output_subdir / split
@@ -72,6 +79,7 @@ def repack_split(
     records: list[dict] = []
     buf: list[dict] = []
     sample_ids_in_buf: list[str] = []
+    paths_in_buf: list[Path] = []
     shard_idx = 0
 
     def flush() -> None:
@@ -100,14 +108,24 @@ def repack_split(
         })
         print(f"[repack] {split}: wrote {shard_path.name} "
               f"({len(buf)} samples, {shard_path.stat().st_size / 1e6:.1f} MB)")
+        # The shard is durably on disk now — only then is it safe to drop
+        # the per-sample sources it absorbed.
+        if rm_source:
+            for sp in paths_in_buf:
+                try:
+                    sp.unlink()
+                except OSError:
+                    pass
         shard_idx += 1
         buf.clear()
         sample_ids_in_buf.clear()
+        paths_in_buf.clear()
 
     for p in sample_paths:
         sample = torch.load(p, map_location="cpu", weights_only=False)
         buf.append(sample)
         sample_ids_in_buf.append(p.stem)  # e.g. "sample_<hex>"
+        paths_in_buf.append(p)
         if len(buf) >= shard_size:
             flush()
     flush()
@@ -125,6 +143,11 @@ def main() -> None:
                     help="subdirectory under cache_root to write shards into")
     ap.add_argument("--splits", type=str, default="train,test",
                     help="comma-separated list of splits to repack")
+    ap.add_argument("--rm_source", action="store_true",
+                    help="unlink each per-sample file after the shard "
+                         "containing it is written. Keeps peak disk at "
+                         "~(cache + one shard) instead of ~2x. Safe to "
+                         "interrupt — sources are only dropped post-save.")
     args = ap.parse_args()
 
     cache_root = args.cache_root.resolve()
@@ -138,6 +161,7 @@ def main() -> None:
             continue
         all_records.extend(repack_split(
             cache_root, split, args.shard_size, args.output_subdir,
+            rm_source=args.rm_source,
         ))
 
     manifest_path = cache_root / "shards_manifest.json"

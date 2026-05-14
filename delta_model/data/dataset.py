@@ -200,7 +200,12 @@ class TataDeltaDataset(Dataset):
         index_filter: Optional[Callable[[tuple], bool]],
     ) -> int:
         n_added = 0
-        for b in range(S.NUM_BLOCKS):
+        # Read the block count from the sample, not `S.NUM_BLOCKS` — a cache
+        # thinned by `data/thin_cache.py` keeps fewer blocks (e.g. 7) while
+        # collect / inference still operate on the full 8. `n_passes_actual`
+        # already bounds the per-block iteration enumeration, so a thinned
+        # cache loads transparently.
+        for b in range(len(sample["blocks"])):
             n_actual = int(sample["blocks"][b].get("n_passes_actual", S.MAX_ITER))
             if n_actual < 2:
                 continue

@@ -45,12 +45,18 @@ DTYPE_HIDDEN = torch.float16
 def expected_block_shapes(
     *, n_kv_heads: int, d_head: int, d_model: int,
     prefix_window: int = COLLECT_PREFIX_WINDOW,
+    max_iter: int = MAX_ITER,
 ) -> dict:
     """Authoritative per-block tensor shapes. Used by collect + tests.
 
     Defaults to `COLLECT_PREFIX_WINDOW` for the prefix_kv field — that's
     what's actually written to disk. Pass `prefix_window=PREFIX_WINDOW` to
     validate post-slicing dataset output instead.
+
+    `max_iter` defaults to the schema `MAX_ITER` (6). A cache thinned by
+    `data/thin_cache.py` stores fewer iterations per block and records the
+    real count in `meta["max_iter"]` — pass that here so T3 validates
+    against the actual on-disk shape.
     """
     # `prefix_kv_pad_mask` (shape `(prefix_window,)`, bool) is also written
     # by collect_llada but is OPTIONAL for legacy caches and validated
@@ -58,6 +64,6 @@ def expected_block_shapes(
     # before pad-and-mask) don't fail T3.
     return {
         "prefix_kv":          (2, n_kv_heads, prefix_window, d_head),
-        "h_per_pass":         (MAX_ITER, BLOCK_LENGTH, d_model),
-        "reveal_per_pass":    (MAX_ITER, BLOCK_LENGTH),
+        "h_per_pass":         (max_iter, BLOCK_LENGTH, d_model),
+        "reveal_per_pass":    (max_iter, BLOCK_LENGTH),
     }
