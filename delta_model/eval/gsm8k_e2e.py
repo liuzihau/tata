@@ -23,6 +23,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from ..data import schema as S
 from ..llada_runtime import load_llada
@@ -83,6 +84,7 @@ def run_gsm8k_eval(
     threshold: float | None = None,
     factor: float | None = 1.0,
     inner_loop_max_iter: int | None = None,
+    show_progress: bool = True,
 ) -> dict:
     """Run hybrid + vanilla on the same GSM8K slice. Returns metrics dict.
 
@@ -146,7 +148,11 @@ def run_gsm8k_eval(
     n_blocks_finished:  list[int]  = []      # of NUM_BLOCKS blocks per problem
     t_hybrid = t_vanilla = 0.0
 
-    for prob in ds:
+    pbar = tqdm(
+        ds, desc=f"gsm8k thr={per_pos_threshold:.2f}",
+        dynamic_ncols=True, disable=not show_progress, leave=show_progress,
+    )
+    for i, prob in enumerate(pbar):
         prompt_ids = _format_prompt_llada(tokenizer, prob["question"])
         gold_num = extract_final_number(prob["answer"])
 
@@ -190,6 +196,18 @@ def run_gsm8k_eval(
         )
         pred_v = extract_final_number(gen_text_v)
         hits_vanilla += int(pred_v is not None and pred_v == gold_num)
+
+        # Live readout: per-problem decode time hybrid vs vanilla (running
+        # means), the speedup ratio, and running accuracy. The bar itself
+        # shows the current problem number / total + ETA.
+        done = i + 1
+        pbar.set_postfix({
+            "hyb":   f"{t_hybrid / done:.2f}s",
+            "van":   f"{t_vanilla / done:.2f}s",
+            "x":     f"{t_vanilla / max(1e-6, t_hybrid):.2f}",
+            "acc_h": f"{hits_hybrid / done:.2f}",
+            "acc_v": f"{hits_vanilla / done:.2f}",
+        }, refresh=False)
 
     n = len(ds)
     out = {

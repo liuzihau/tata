@@ -719,6 +719,7 @@ def main() -> None:
                         cfg.log, "gsm8k_inner_loop_max_iter", None,
                     ),
                     seed=cfg.seed,
+                    show_progress=False,   # keep the train loop's pbar clean
                 )
                 log_metrics(step, {f"gsm8k/{k}": v for k, v in gsm.items()})
                 best_tracker.maybe_save(
