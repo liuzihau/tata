@@ -31,6 +31,7 @@ data:
   cache_root:      cache_v1/llada              # same cache as M1.5 / trial-2
   manifest:        cache_v1/llada/manifest.json
   val_frac:        0.10
+  val_split:       holdout                     # pinned: predates the test-split-validation default
   shuffle_seed:    42                          # keep val split identical to M1.5 for direct comparison
   num_workers:     0
   batch_size:      256

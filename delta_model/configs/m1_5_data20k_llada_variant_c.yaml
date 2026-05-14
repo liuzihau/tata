@@ -34,11 +34,13 @@ data:
   cache_root:      cache_v1_20k/llada
   manifest:        cache_v1_20k/llada/manifest.json
   val_frac:        0.10
+  val_split:       holdout                        # pinned: predates the test-split-validation default
   shuffle_seed:    42
   num_workers:     0
   batch_size:      256
   pin_memory:      false
   preload:         false                          # shards + BlockShardSampler
+  shard_sampler:   block                          # pinned: legacy one-shard-per-batch sampler
   samples_per_shard_visit: 512                    # validated by spsv ablation
   mask_token_id:   126336
   ref0_weight_multiplier: 3.0                     # same as M1.5

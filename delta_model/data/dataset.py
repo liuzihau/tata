@@ -61,11 +61,16 @@ class TataDeltaDataset(Dataset):
         mask_token_id: int = S.LLADA_MASK_TOKEN_ID,
         index_filter: Optional[Callable[[tuple], bool]] = None,
         preload: bool = True,
+        shard_lru_max: Optional[int] = None,
     ):
         cache_root = Path(cache_root)
         self.cache_root    = cache_root
         self.mask_token_id = mask_token_id
         self.preload       = preload
+        # Override for the shard-mode LRU cap. `InterleavedShardSampler`
+        # keeps `active_shards` shards resident at once — the LRU must hold
+        # all of them or it thrashes. `None` → `_SHARD_LRU_MAX` default.
+        self._shard_lru_max_override = shard_lru_max
 
         shards_manifest = cache_root / "shards_manifest.json"
         if shards_manifest.exists():
@@ -152,7 +157,11 @@ class TataDeltaDataset(Dataset):
                 self.sample_locator.append((shard_local_idx, within))
 
         self._shard_cache: "OrderedDict[int, dict]" = OrderedDict()
-        self._lru_max = _SHARD_LRU_MAX
+        self._lru_max = (
+            int(self._shard_lru_max_override)
+            if self._shard_lru_max_override is not None
+            else _SHARD_LRU_MAX
+        )
 
         # First pass: build flat index across all samples in this split.
         # In preload mode we load each shard exactly once and keep it; the
@@ -439,6 +448,115 @@ class BlockShardSampler(torch.utils.data.Sampler):
                 # Use indexing + tolist to avoid a Python loop over each draw.
                 picked = idxs[draw].tolist()
                 for k in picked:
+                    yield k
+                    n_yielded += 1
+                    if n_yielded >= self.num_samples:
+                        return
+
+
+class InterleavedShardSampler(torch.utils.data.Sampler):
+    """Diversity-preserving weighted sampler for shard-mode datasets.
+
+    Why it replaces `BlockShardSampler`: BlockShardSampler kept an entire
+    batch inside one shard (~shard_size prompts), producing correlated,
+    high-variance gradients. The three-way M1.5 comparison made the cost
+    explicit — same recipe, same ~11.8k-prompt cache, only the loader
+    differing:
+
+        preload + WeightedRandomSampler   val/kl 0.280   train/kl 0.15
+        BlockShardSampler (spsv 512)      val/kl 0.332   train/kl 0.21
+
+    This sampler keeps a *window* of `active_shards` shards resident at
+    once and interleaves draws across all of them, so every batch the
+    DataLoader cuts spans ~`active_shards · shard_size` prompts instead of
+    one shard's worth — recovering random-sampler gradient quality while
+    the in-RAM working set stays bounded at `active_shards` shards (set the
+    dataset's `shard_lru_max >= active_shards`).
+
+    I/O is the same as BlockShardSampler — each shard is still loaded once
+    per round; only the working set grows from 1 to `active_shards` shards.
+
+    Weighting (T2): per-index weights from
+    `TataDeltaDataset.compute_index_weights(...)` are pooled across the
+    window and used inside `torch.multinomial(replacement=True)`, so the
+    i_ref bias is preserved.
+
+    Each round:
+      1. Permute the shard order.
+      2. Slide a non-overlapping window of `active_shards` shards across
+         the permutation.
+      3. For each window, pool the indices + weights of its shards, draw
+         `chunk_size` indices (weighted, with replacement), shuffle them,
+         and yield. The shuffle is what mixes the shards within every
+         batch the DataLoader subsequently cuts.
+    Rounds repeat until `num_samples` indices have been emitted.
+    """
+
+    def __init__(
+        self,
+        shard_groups: "dict[int, list[int]]",
+        weights: torch.Tensor,
+        *,
+        active_shards: int,
+        chunk_size: int | None = None,
+        num_samples: int | None = None,
+        generator: torch.Generator | None = None,
+    ):
+        super().__init__(None)
+        if not shard_groups:
+            raise ValueError("InterleavedShardSampler: shard_groups is empty")
+        if active_shards < 1:
+            raise ValueError(f"active_shards must be >= 1; got {active_shards}")
+
+        self.shard_ids: list[int] = sorted(shard_groups.keys())
+        self._shard_indices: list[torch.Tensor] = []
+        self._shard_weights: list[torch.Tensor] = []
+        for sid in self.shard_ids:
+            idxs = torch.as_tensor(shard_groups[sid], dtype=torch.long)
+            self._shard_indices.append(idxs)
+            self._shard_weights.append(weights[idxs].clone().float())
+
+        n_shards = len(self.shard_ids)
+        self.active_shards = min(int(active_shards), n_shards)
+
+        total_pairs = sum(int(t.numel()) for t in self._shard_indices)
+        # Auto chunk_size: one window emits ≈ the number of pairs it holds,
+        # so one full round ≈ one epoch over the dataset.
+        if chunk_size is None:
+            mean_pairs_per_shard = max(1, round(total_pairs / n_shards))
+            chunk_size = self.active_shards * mean_pairs_per_shard
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1; got {chunk_size}")
+        self.chunk_size = int(chunk_size)
+
+        self.num_samples = (
+            int(num_samples) if num_samples is not None else total_pairs
+        )
+        self.generator = generator
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self):
+        n_yielded = 0
+        n_shards  = len(self.shard_ids)
+        while n_yielded < self.num_samples:
+            perm = torch.randperm(n_shards, generator=self.generator).tolist()
+            for w_start in range(0, n_shards, self.active_shards):
+                window = perm[w_start : w_start + self.active_shards]
+                pool_idx = torch.cat([self._shard_indices[s] for s in window])
+                pool_w   = torch.cat([self._shard_weights[s] for s in window])
+                draw = torch.multinomial(
+                    pool_w, self.chunk_size,
+                    replacement=True, generator=self.generator,
+                )
+                # Shuffle the chunk so the DataLoader's batch boundaries mix
+                # all `active_shards` shards instead of running shard-by-shard.
+                picked = pool_idx[draw]
+                picked = picked[torch.randperm(
+                    picked.numel(), generator=self.generator,
+                )]
+                for k in picked.tolist():
                     yield k
                     n_yielded += 1
                     if n_yielded >= self.num_samples:

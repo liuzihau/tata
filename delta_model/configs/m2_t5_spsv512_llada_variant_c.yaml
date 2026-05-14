@@ -44,11 +44,13 @@ data:
   cache_root:      cache_v1_20k/llada
   manifest:        cache_v1_20k/llada/manifest.json
   val_frac:        0.10
+  val_split:       holdout                          # pinned: predates the test-split-validation default
   shuffle_seed:    42
   num_workers:     0
   batch_size:      256
   pin_memory:      false
   preload:         false
+  shard_sampler:   block                            # pinned: legacy one-shard-per-batch sampler
   # 512 (vs m2_t5's 4096): 2 batches per shard visit instead of 16.
   # Trades a bit more I/O (more shard loads per epoch) for ~8× higher
   # gradient diversity per training step.

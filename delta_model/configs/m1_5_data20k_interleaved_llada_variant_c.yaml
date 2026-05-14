@@ -1,0 +1,105 @@
+# M1.5 recipe on the 20k shard cache, fed by InterleavedShardSampler.
+#
+# This is the scale-up run. The three-way M1.5 comparison settled it:
+#   m1_5            (5k,    preload + WeightedRandomSampler)  val/kl 0.293
+#   m1_5_data20k    (~11.8k, BlockShardSampler spsv512)       val/kl 0.332
+#   m1_5_data20k_preload (~11.8k, preload + WRS)              val/kl 0.280
+# Data scaling *works* (0.280 < 0.293) — but `preload=true` is RAM-capped
+# at ~11.8k, and the only non-preload path so far (BlockShardSampler)
+# cratered to 0.332 because every batch came from a single shard.
+#
+# InterleavedShardSampler keeps `active_shards` shards resident and mixes
+# draws across all of them, so batches span ~active_shards·shard_size
+# prompts at bounded RAM. Expectation: match `m1_5_data20k_preload`
+# (~0.280) while being free to scale the cache past the preload ceiling.
+#
+# Also new: `val_split: test` — train on the FULL train split, validate on
+# the hash-stable `test/` split. The test split is identical across cache
+# sizes, so val/kl is finally comparable run-to-run (the old
+# `make_train_val_filter` carved a *different* 10% of prompts out of each
+# differently-sized cache).
+#
+# Differences vs `m1_5_data20k_llada_variant_c.yaml`:
+#   data.shard_sampler:           block → interleaved
+#   data.active_shards:           (new) 8
+#   data.samples_per_shard_visit: removed (block-sampler knob)
+#   data.val_split:               (new) test  — was implicit holdout
+#   data.val_frac:                removed (holdout-only knob)
+#   run_name / log.group / checkpoint.out_dir: distinct.
+#
+# Run:
+#   python -m delta_model.train \
+#       --config delta_model/configs/m1_5_data20k_interleaved_llada_variant_c.yaml \
+#       --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+
+run_name:          m1_5_data20k_interleaved_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada
+  fast_dllm_path:  null
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1_20k/llada
+  manifest:        cache_v1_20k/llada/manifest.json
+  # Validate on the hash-stable cache `test/` split; train on the full
+  # train split. (Set to `holdout` + add `val_frac` for the legacy
+  # carve-from-train behaviour.)
+  val_split:       test
+  shuffle_seed:    42
+  num_workers:     0
+  batch_size:      256
+  pin_memory:      false
+  preload:         false                          # shard mode + InterleavedShardSampler
+  shard_sampler:   interleaved
+  # Number of shards held resident & interleaved at once. A batch then
+  # spans ~active_shards · shard_size prompts. RAM ≈ active_shards · ~800 MB
+  # (at shard_size 50) ≈ 6.4 GB for the train working set — well under the
+  # 300 GB bound. Bump for more diversity, drop if RAM-tight.
+  active_shards:   8
+  # shard_chunk_size: (auto)  → active_shards · mean_pairs_per_shard
+  mask_token_id:   126336
+  ref0_weight_multiplier: 3.0                      # T2 weights flow into the sampler
+
+model:
+  variant:         C
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2
+  d_ff_inner:      10944
+  dropout:         0.1                             # M1.5 recipe
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.01                            # M1.5 recipe
+  betas:           [0.9, 0.95]
+  warmup_steps:    500
+  max_steps:       20000
+  scheduler:       cosine
+  grad_clip:       1.0
+  precision:       bf16
+
+loss:
+  mse_space:       final_norm
+  lambda_mse:      1.0                             # M1.5 recipe
+  lambda_kl:       1.0
+  lambda_conf:     1.0
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M1.5-data20k-interleaved-llada
+  log_every:       50
+  val_every:       500
+  gsm8k_every:     2000
+  gsm8k_subset:    50
+  gsm8k_per_pos_threshold: 0.85
+  bins_gap:        [1, 2, 3, 4, 5]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  keep_last:       3
+  out_dir:         ckpts/m1_5_data20k_interleaved_llada_variant_c

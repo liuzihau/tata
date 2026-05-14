@@ -10,18 +10,24 @@ For *how* to run anything, see `usage.md`.
 
 ---
 
-## Status snapshot (2026-05-12, evening)
+## Status snapshot (2026-05-14)
 
-Current focus: **T5 (data scale, 5000 → 20000 prompts)** — collect
-in progress, training config (`m2_t5_llada_variant_c.yaml`) drafted
-and ready to launch. M1.6 done (results below). T4 sweep complete,
-pending discussion of results.
+Current focus: **the shard-mode data loader.** The three-way M1.5
+comparison (5k preload / ~11.8k BlockShardSampler / ~11.8k preload)
+proved (a) data scaling *works* — preload+WRS at ~11.8k hits val/kl
+**0.280** vs the 5k run's 0.293 — and (b) `BlockShardSampler` was the
+cause of the m2_t5 / m1_5_data20k underperformance (val/kl 0.332),
+because it draws a whole batch from one shard. `preload=true` is
+RAM-capped at ~11.8k, so `InterleavedShardSampler` (§3.6) is the
+unlock to scale the cache further. Next run:
+`m1_5_data20k_interleaved_llada_variant_c.yaml` — should match the
+preload run (~0.280) and confirm the sampler is the fix.
 
 | area | state |
 |---|---|
 | Data schema | v2 (`prefix_kv` field, `prefix_window=64` stored, optional `prefix_kv_pad_mask`). Trial-2 / M1.5 cache reused for M1.6. T5 collect lands in a new dir. |
 | Model | VariantC with RoPE on absolute positions (§1.5), RMSNorm + SwiGLU primitives (§1.6), per-position confidence head, dropout knob exposed (T3, §2.5). |
-| Training | Preload-all-samples (~80 GiB RAM). Single-process loader. Optional i_ref-biased `WeightedRandomSampler` (§3.4, T2). |
+| Training | Full-train-split training + `test/`-split validation (`data.val_split`, §1.3). Single-process loader. Sampler: `InterleavedShardSampler` for shard caches (§3.6), i_ref-biased `WeightedRandomSampler` for preloaded (§3.4, T2). |
 | Loss | Composite MSE + KL + BCE. MSE space configurable via `loss.mse_space` (`raw` legacy, `final_norm` recommended; §3.2). BCE target clamped to [0, 1]. |
 | Inference | Hybrid runner: full forward @ pass 0, delta @ iter ≥ 1, partial-forward rollback (matches collect's iter ≥ 1). Agreement decoding via per-position threshold. |
 | Eval | gsm8k_e2e harness sweeps `per_pos_thresholds`; reports hybrid/vanilla accuracy + speedup + disagreement count. |
@@ -34,6 +40,22 @@ Trial results history:
 
 Recent changes log (most recent first):
 
+- **2026-05-14** `InterleavedShardSampler` landed in `data/dataset.py`
+  (§3.6) — replaces `BlockShardSampler` as the default shard-mode sampler
+  (`data.shard_sampler`, default `interleaved`). Keeps `active_shards`
+  shards resident and mixes draws across all of them, so a batch spans
+  many shards instead of one. Root-caused from the three-way M1.5
+  comparison: same recipe + same ~11.8k cache, BlockShardSampler val/kl
+  0.332 vs preload+WRS 0.280; the spsv 4096-vs-512 ablation was null
+  because both confine a batch to one shard.
+- **2026-05-14** `train.py` `data.val_split` knob (§1.3): default `test`
+  validates on the hash-stable cache `test/` split and trains on the
+  *full* train split; `holdout` is the legacy carve-`val_frac`-from-train
+  behaviour. Makes val/kl comparable across cache sizes (the old
+  `make_train_val_filter` carved a *different* 10% out of each
+  differently-sized cache). All pre-2026-05-14 configs pinned to
+  `val_split: holdout` (+ the four shard configs to `shard_sampler:
+  block`) so their recorded results stay reproducible.
 - **2026-05-12** `BlockShardSampler` landed in `data/dataset.py` (§3.5). Auto-selected when `preload=False` + shard mode (T5 default). Keeps memory bounded at ~4 GB for the 400-GB T5 cache by visiting one shard for `samples_per_shard_visit` consecutive indices.
 - **2026-05-12** `train.py` gains best-checkpoint tracker (`_BestTracker`); saves `best_val_kl_step<N>.pt` + `best_gsm8k_step<N>.pt` independent of `keep_last` rotation. Sidecar `best_metrics.json` for resume.
 - **2026-05-12** M1.6 result recorded; ranking finalized: T5 unambiguous primary, M1.6 keeps MSE but at half weight.
@@ -177,6 +199,19 @@ Auto-detects storage layout at construction:
 miss: at `__init__` every sample/shard that contributes any index is
 pinned in RAM without eviction. ~80 GiB at 5000 train samples. Drops
 samples whose pairs are filtered out by `train_filter` / `val_filter`.
+`shard_lru_max` overrides the shard-mode LRU cap — `train.py` sets it to
+`active_shards + 1` so `InterleavedShardSampler`'s window stays resident
+(§3.6).
+
+**Validation source (`data.val_split`, 2026-05-14).** Default `test`:
+`train.py` builds the train dataset from the *full* `train/` split (no
+`index_filter`) and the val dataset from the cache's `test/` split — the
+800 hash-stable prompts, identical across cache sizes, so val/kl is
+comparable run-to-run. `holdout` restores the legacy
+`make_train_val_filter` carve (a `val_frac` slice of `train/`, keyed on
+positional `s_idx`, which makes the held-out set differ between
+differently-sized caches). `make_train_val_filter` is retained only for
+`holdout`.
 
 Per `__getitem__` returns:
 
@@ -458,9 +493,58 @@ End-to-end workflow for T5+:
   1. `collect_llada.py` writes per-sample (existing flow).
   2. `data/repack.py --shard_size 50` packs into shards + creates
      `shards_manifest.json`. Dataset auto-detects shard mode.
-  3. Train config sets `data.preload: false`,
-     `data.samples_per_shard_visit: 4096`. `train.py` constructs
-     `BlockShardSampler` automatically.
+  3. Train config sets `data.preload: false`. `train.py` constructs
+     a shard sampler from `data.shard_sampler` (§3.6).
+
+### 3.6 InterleavedShardSampler — the default shard-mode sampler (2026-05-14)
+
+**Why BlockShardSampler was retired as the default.** §3.5's design —
+"keep consecutive accesses inside one shard" — means an entire batch is
+drawn from a single shard (~`shard_size` ≈ 50 prompts). The three-way
+M1.5 comparison made the cost unambiguous: same recipe, same ~11.8k
+cache, only the loader differing —
+
+| loader | train/kl | val/kl |
+|---|---:|---:|
+| `preload` + `WeightedRandomSampler` | ~0.15 | **0.280** |
+| `BlockShardSampler` (spsv 512) | ~0.21 | 0.332 |
+
+Single-shard batches give correlated, high-variance gradients → the
+optimizer plateaus ~2× worse on *both* train and val. The spsv
+4096-vs-512 ablation was null because every spsv confines a batch to one
+shard — there is no spsv that fixes it.
+
+**`InterleavedShardSampler`** (`data/dataset.py`) keeps a *window* of
+`active_shards` shards resident at once and interleaves draws across all
+of them, so each batch the DataLoader cuts spans ~`active_shards ·
+shard_size` prompts. Per round it permutes the shard order, slides a
+non-overlapping window of `active_shards` shards, pools each window's
+indices + T2 weights, draws `chunk_size` indices
+(`multinomial(replacement=True)`), shuffles them, and yields. The shuffle
+is what mixes shards within every batch. I/O is identical to
+`BlockShardSampler` (each shard loaded once per round); only the in-RAM
+working set grows from 1 to `active_shards` shards — so the dataset's
+shard LRU must be ≥ `active_shards` (`train.py` passes
+`shard_lru_max = active_shards + 1`).
+
+Config knobs (`data.*`, used when `preload: false` + shard mode):
+
+| knob | default | meaning |
+|---|---|---|
+| `shard_sampler` | `interleaved` | `interleaved` \| `block` (legacy §3.5) |
+| `active_shards` | `8` | shards resident & interleaved at once; RAM ≈ `active_shards · shard_bytes` |
+| `shard_chunk_size` | auto | indices per window; auto = `active_shards · mean_pairs_per_shard` (≈ one round = one epoch) |
+
+Sampler selection in `train.py:main`:
+
+  - `preload=False` + shard + `shard_sampler=interleaved` → `InterleavedShardSampler` (default)
+  - `preload=False` + shard + `shard_sampler=block`       → `BlockShardSampler` (legacy)
+  - `preload=True`  OR per-sample, `ref0_mult ≠ 1.0`      → `WeightedRandomSampler`
+  - otherwise                                            → standard `shuffle=True`
+
+Sanity: `python -m delta_model.sanity.test_interleaved_sampler` (T5; no
+cache / GPU needed) — checks exact count, per-batch shard spread,
+coverage, and that T2 weights bias the draw.
 
 ---
 

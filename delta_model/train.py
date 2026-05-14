@@ -37,6 +37,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 from .data import schema as S
 from .data.dataset import (
     BlockShardSampler,
+    InterleavedShardSampler,
     TataDeltaDataset,
     make_train_val_filter,
 )
@@ -408,35 +409,101 @@ def main() -> None:
     print(f"[train] backbone hyperparams: {bb_cfg}", flush=True)
 
     print("[train] building Datasets …", flush=True)
-    train_filter, val_filter = make_train_val_filter(
-        cfg.data.val_frac, seed=cfg.data.shuffle_seed,
-    )
     preload = bool(getattr(cfg.data, "preload", True))
+
+    # Sampler config — read early because the interleaving sampler needs the
+    # shard LRU sized to `active_shards` *before* the dataset is built.
+    shard_sampler_kind = str(getattr(cfg.data, "shard_sampler", "interleaved"))
+    active_shards      = int(getattr(cfg.data, "active_shards", 8))
+
+    # Validation source:
+    #   "test"    → validate on the hash-stable cache `test/` split (default),
+    #               and train on the *full* train split. The test split is
+    #               identical across cache sizes, so val/kl is finally
+    #               comparable between e.g. the 5k and 20k caches.
+    #   "holdout" → legacy: carve `val_frac` out of the train split via
+    #               `make_train_val_filter`. The held-out prompts differ
+    #               between caches, so cross-cache val/kl is NOT comparable.
+    val_split = str(getattr(cfg.data, "val_split", "test"))
+    if val_split == "test":
+        train_filter = val_filter = None
+        val_ds_split = "test"
+    elif val_split == "holdout":
+        train_filter, val_filter = make_train_val_filter(
+            cfg.data.val_frac, seed=cfg.data.shuffle_seed,
+        )
+        val_ds_split = "train"
+    else:
+        raise ValueError(
+            f"data.val_split must be 'test' or 'holdout'; got {val_split!r}"
+        )
+
+    # When the interleaving sampler is active the train dataset's shard LRU
+    # must hold every shard in the active window simultaneously, else it
+    # thrashes. +1 for headroom across window boundaries.
+    train_shard_lru = (
+        active_shards + 1
+        if (shard_sampler_kind == "interleaved" and not preload)
+        else None
+    )
     train_ds = TataDeltaDataset(
         cfg.data.cache_root, split="train",
         mask_token_id=cfg.data.mask_token_id, index_filter=train_filter,
-        preload=preload,
+        preload=preload, shard_lru_max=train_shard_lru,
     )
     val_ds = TataDeltaDataset(
-        cfg.data.cache_root, split="train",
+        cfg.data.cache_root, split=val_ds_split,
         mask_token_id=cfg.data.mask_token_id, index_filter=val_filter,
         preload=preload,
     )
-    print(f"[train] train pairs={len(train_ds)}  val pairs={len(val_ds)}",
-          flush=True)
+    print(
+        f"[train] val_split={val_split!r} → val from {val_ds_split!r} split. "
+        f"train pairs={len(train_ds)}  val pairs={len(val_ds)}",
+        flush=True,
+    )
 
-    # Sampler selection. Three modes:
-    #   1. preload=False + shard mode  → BlockShardSampler (locality-aware,
-    #      weighted; keeps the LRU shard cache hot so 20k+ caches don't
-    #      blow RAM). Default for T5+.
-    #   2. preload=True or per-sample  → WeightedRandomSampler when
-    #      ref0_weight_multiplier ≠ 1.0 (T2; engineering.md §3.4).
+    # Sampler selection:
+    #   1. shard mode + preload=False → a shard-aware sampler:
+    #        - "interleaved" (default): InterleavedShardSampler keeps
+    #          `active_shards` shards resident and mixes draws across all of
+    #          them, so every batch spans ~active_shards · shard_size prompts.
+    #          Recovers random-sampler gradient quality at bounded RAM.
+    #        - "block" (legacy): BlockShardSampler — one shard per batch.
+    #          Kept only to reproduce the m1_5_data20k / m2_t5 runs; it gave
+    #          correlated gradients (val/kl 0.332 vs 0.280 preload).
+    #   2. preload=True or per-sample, ref0_mult ≠ 1.0 → WeightedRandomSampler.
     #   3. otherwise → standard shuffle.
     ref0_mult = float(getattr(cfg.data, "ref0_weight_multiplier", 1.0))
     weights = train_ds.compute_index_weights(ref0_weight_multiplier=ref0_mult)
-    use_block_shard = (train_ds.mode == "shard" and not preload)
+    use_shard_sampler = (train_ds.mode == "shard" and not preload)
+    n_ref0 = int((weights == ref0_mult).sum().item()) if ref0_mult != 1.0 else 0
 
-    if use_block_shard:
+    dl_common = dict(
+        batch_size=cfg.data.batch_size, shuffle=False,
+        num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
+        drop_last=True, persistent_workers=cfg.data.num_workers > 0,
+    )
+
+    if use_shard_sampler and shard_sampler_kind == "interleaved":
+        shard_groups = train_ds.get_shard_groups()
+        gen = torch.Generator(); gen.manual_seed(int(cfg.seed))
+        chunk_size = getattr(cfg.data, "shard_chunk_size", None)
+        sampler = InterleavedShardSampler(
+            shard_groups, weights,
+            active_shards=active_shards,
+            chunk_size=int(chunk_size) if chunk_size is not None else None,
+            num_samples=len(train_ds),       # match nominal epoch length
+            generator=gen,
+        )
+        train_dl = DataLoader(train_ds, sampler=sampler, **dl_common)
+        print(
+            f"[train] InterleavedShardSampler: {len(shard_groups)} shards, "
+            f"active_shards={sampler.active_shards}, chunk_size={sampler.chunk_size} "
+            f"(≈{sampler.chunk_size // cfg.data.batch_size} batches/window). "
+            f"ref0_mult={ref0_mult} ({n_ref0} ref0 pairs / {len(weights)} total).",
+            flush=True,
+        )
+    elif use_shard_sampler and shard_sampler_kind == "block":
         spsv = int(getattr(cfg.data, "samples_per_shard_visit", 4096))
         shard_groups = train_ds.get_shard_groups()
         gen = torch.Generator(); gen.manual_seed(int(cfg.seed))
@@ -446,31 +513,23 @@ def main() -> None:
             num_samples=len(train_ds),       # match nominal epoch length
             generator=gen,
         )
-        train_dl = DataLoader(
-            train_ds, batch_size=cfg.data.batch_size,
-            sampler=sampler, shuffle=False,
-            num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
-            drop_last=True, persistent_workers=cfg.data.num_workers > 0,
-        )
-        n_shards = len(shard_groups)
-        n_ref0   = int((weights == ref0_mult).sum().item()) if ref0_mult != 1.0 else 0
+        train_dl = DataLoader(train_ds, sampler=sampler, **dl_common)
         print(
-            f"[train] BlockShardSampler: {n_shards} shards, "
+            f"[train] BlockShardSampler (legacy): {len(shard_groups)} shards, "
             f"{spsv} samples/visit ({spsv // cfg.data.batch_size} batches/visit). "
             f"ref0_mult={ref0_mult} ({n_ref0} ref0 pairs / {len(weights)} total).",
             flush=True,
+        )
+    elif use_shard_sampler:
+        raise ValueError(
+            f"data.shard_sampler must be 'interleaved' or 'block'; "
+            f"got {shard_sampler_kind!r}"
         )
     elif ref0_mult != 1.0:
         sampler = torch.utils.data.WeightedRandomSampler(
             weights=weights, num_samples=len(train_ds), replacement=True,
         )
-        train_dl = DataLoader(
-            train_ds, batch_size=cfg.data.batch_size,
-            sampler=sampler, shuffle=False,
-            num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
-            drop_last=True, persistent_workers=cfg.data.num_workers > 0,
-        )
-        n_ref0 = int((weights == ref0_mult).sum().item())
+        train_dl = DataLoader(train_ds, sampler=sampler, **dl_common)
         n_other = len(weights) - n_ref0
         p_ref0 = (n_ref0 * ref0_mult) / (n_ref0 * ref0_mult + n_other)
         print(
@@ -479,11 +538,8 @@ def main() -> None:
             flush=True,
         )
     else:
-        train_dl = DataLoader(
-            train_ds, batch_size=cfg.data.batch_size, shuffle=True,
-            num_workers=cfg.data.num_workers, pin_memory=cfg.data.pin_memory,
-            drop_last=True, persistent_workers=cfg.data.num_workers > 0,
-        )
+        dl_kwargs = dict(dl_common); dl_kwargs["shuffle"] = True
+        train_dl = DataLoader(train_ds, **dl_kwargs)
     # Mirror the training loader's worker count exactly: if cfg.data.num_workers
     # is 0 (e.g. constrained /dev/shm), val must also be 0, otherwise the first
     # val pass spawns a worker and SIGBUSes on shm.

@@ -44,6 +44,7 @@ data:
   cache_root:      cache_v1_20k/llada           # ← new cache from T5 collect (must be shard-mode!)
   manifest:        cache_v1_20k/llada/manifest.json
   val_frac:        0.10
+  val_split:       holdout                       # pinned: predates the test-split-validation default
   shuffle_seed:    42
   num_workers:     0
   batch_size:      256
@@ -53,6 +54,7 @@ data:
   # shards → train with preload=false. The shard LRU cap (~4 GB) keeps
   # memory bounded while BlockShardSampler keeps cache hit rate near 1.
   preload:         false
+  shard_sampler:   block                         # pinned: legacy one-shard-per-batch sampler
   # Locality-aware sampler kicks in automatically when the dataset is in
   # shard mode AND preload=false. Each shard's data is loaded once and
   # used for `samples_per_shard_visit` consecutive indices before moving
