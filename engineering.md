@@ -10,18 +10,36 @@ For *how* to run anything, see `usage.md`.
 
 ---
 
-## Status snapshot (2026-05-14)
+## Status snapshot (2026-05-15)
 
-Current focus: **the shard-mode data loader.** The three-way M1.5
-comparison (5k preload / ~11.8k BlockShardSampler / ~11.8k preload)
-proved (a) data scaling *works* — preload+WRS at ~11.8k hits val/kl
-**0.280** vs the 5k run's 0.293 — and (b) `BlockShardSampler` was the
-cause of the m2_t5 / m1_5_data20k underperformance (val/kl 0.332),
-because it draws a whole batch from one shard. `preload=true` is
-RAM-capped at ~11.8k, so `InterleavedShardSampler` (§3.6) is the
-unlock to scale the cache further. Next run:
-`m1_5_data20k_interleaved_llada_variant_c.yaml` — should match the
-preload run (~0.280) and confirm the sampler is the fix.
+Current focus: **scale data to 30k under the disk budget.** Two
+load-bearing fixes landed and were verified end-to-end this week —
+the shard-mode loader and the inference rollback semantics. Both
+unblock the data scaling direction:
+
+- **Loader fixed and verified.** Three-way M1.5 comparison (5k preload /
+  ~11.8k BlockShardSampler / ~11.8k preload / ~11.8k interleaved) closed
+  the question: same recipe, same cache, only the loader differing —
+  `BlockShardSampler` 0.332 → `preload+WRS` 0.280 → `InterleavedShardSampler`
+  matches preload on `train/kl` (~0.15) with comparable noise. Data
+  scaling at ~11.8k beats the 5k run on val/kl, **and the new sampler
+  reaches that quality at bounded RAM** so the 11.8k preload ceiling is
+  gone. The block sampler was the whole underperformance story.
+- **Rollback fixed and verified.** Inference's rollback now commits via
+  vanilla Fast-dLLM on the backbone's own logits (ungated; the
+  confidence gate is the *delta*-model's self-assessment and has no
+  meaning for a real backbone forward; §5.1). The pre-fix 0.95-threshold
+  livelock (`mean_rollbacks 467`, `speedup 0.10`, `accuracy 0.03`) is
+  gone; high-threshold regimes now degrade gracefully to ≈ backbone
+  baseline.
+
+**Next: 30k collect.** Storage budget is tight (300 GB), so the next
+cache (`cache_v1_30k/llada/`) thins the train split during collect to
+6 blocks × 3 iters × 32-KV — early-stage pairs only (`(0,1) (0,2) (1,2)`)
+— putting the cache at ~236 GB. Test split stays full-fidelity. The
+2.5× block-diversity bump should keep pushing val/kl down per the
+3-way scaling result. Curriculum plan: a later second-stage tune on
+late-iter pairs if the early-iter recipe plateaus.
 
 | area | state |
 |---|---|
@@ -40,6 +58,24 @@ Trial results history:
 
 Recent changes log (most recent first):
 
+- **2026-05-15** Three-way M1.5 comparison verified end-to-end (plots in
+  `plot_from_wandb/` and `plots/sampler_3way_core.png`). `train/kl` —
+  the loader-agnostic, val-set-agnostic metric —
+  **InterleavedShardSampler ≈ preload+WRS (~0.15) ≪ BlockShardSampler
+  (~0.21)** with much lower noise. Sampler hypothesis confirmed; data
+  scaling works; the m2_t5 underperformance was entirely a loader
+  artifact, not a data/capacity issue.
+- **2026-05-15** `eval/plot_sweep.py` added — 3-panel per_pos_threshold
+  sweep visualizer (accuracy–speed Pareto + accuracy/speedup-vs-threshold
+  + rollback bars). Supports overlay of multiple sweep JSONs for
+  before/after comparisons. Uses Okabe–Ito palette; honest dual-axis
+  design (each axis has its own reference, every point text-labelled).
+- **2026-05-15** `eval/gsm8k_e2e.py` shows a live `tqdm` bar with running
+  hybrid-vs-vanilla decode time, speedup ratio, and accuracy
+  (`hyb=1.83s van=2.05s x=1.12 acc_h=0.41 acc_v=0.75`). Disabled when
+  called from `train.py` (mid-training eval) via `show_progress=False`.
+  `eval/plot_metrics.py` no longer crashes when a smoothing window
+  exceeds a sparse metric's point count — sparse series plot raw.
 - **2026-05-15** Rollback semantics fixed in `inference/hybrid_runner.py`
   (§5.1). A rollback now commits tokens via vanilla Fast-dLLM on the
   backbone's own logits (ungated — the confidence gate only judges the
@@ -104,29 +140,36 @@ tata/
     data/
       schema.py                             — cache-format constants
       collect_llada.py                      — cache builder
-      dataset.py                            — TataDeltaDataset (preload+shard+per-sample)
-      repack.py                             — convert per-sample files to multi-sample shards
+      thin_cache.py                         — in-place cache thinner (drop blocks/iters, shrink KV window)
+      dataset.py                            — TataDeltaDataset (preload + shard + per-sample) + InterleavedShardSampler / BlockShardSampler
+      repack.py                             — pack per-sample files to multi-sample shards; `--rm_source` deletes per-sample as each shard lands
       sample_prompts.txt                    — built-in smoke-test prompts
     models/
       heads.py                              — DeltaHead, ConfHead (legacy), ConfHeadPerPos
       variant_c.py                          — VariantC (RoPE, RMSNorm, SwiGLU, per-pos conf)
     losses.py                               — composite_loss (MSE + KL + per-position BCE)
-    train.py                                — AdamW + cosine + wandb + timers
-    inference/hybrid_runner.py              — generate_with_delta + agreement decoding
+    train.py                                — AdamW + cosine + wandb + timers + sampler selection + val_split knob
+    inference/hybrid_runner.py              — generate_with_delta + agreement decoding (rollback commits vanilla Fast-dLLM, §5.1)
     eval/
       shared_mass.py                        — overlap metric
-      gsm8k_e2e.py                          — end-to-end eval harness
+      gsm8k_e2e.py                          — end-to-end eval harness (tqdm bar with live hyb/van decode time)
       plot_metrics.py                       — matplotlib plotter for `<ckpt_dir>/metrics.jsonl` (multi-run compare)
+      plot_sweep.py                         — 3-panel per_pos_threshold sweep visualizer (accuracy–speed Pareto + accuracy/speedup vs threshold + rollbacks)
     sanity/
       test_zero_init.py                              — T2: model+loss invariants
-      test_collect_roundtrip.py                      — T3: cache schema check
+      test_collect_roundtrip.py                      — T3: cache schema check (validates against meta-recorded num_blocks/max_iter/prefix_window)
       test_partial_full_forward_equivalence.py       — T4: documents Fast-dLLM partial-forward behavior
+      test_interleaved_sampler.py                    — T5: InterleavedShardSampler (no GPU/cache needed)
       inspect_llada_modeling.py                      — diagnostic for the loaded LLaDA modeling code
     configs/
-      m1_llada_variant_c.yaml               — M1 trial-2 baseline (raw MSE, dropout 0, uniform sampler)
-      m1_5_llada_variant_c.yaml             — M1.5 Tier-1 (T1+T2+T3) — final_norm MSE λ=1, dropout 0.1, ref0-biased sampler
-      m1_6_llada_variant_c.yaml             — M1.6 = T6 (λ_mse = 0 ablation) — KL+BCE only loss; rest matches M1.5
-      m2_t5_llada_variant_c.yaml            — M2 T5 (data 20k) — λ_mse 0.5, dropout 0.2, wd 0.05, gsm8k_every 2k
+      m1_llada_variant_c.yaml                          — M1 trial-2 baseline (raw MSE, dropout 0, uniform sampler). Pinned `val_split: holdout`.
+      m1_5_llada_variant_c.yaml                        — M1.5 Tier-1 (T1+T2+T3) — final_norm MSE λ=1, dropout 0.1, ref0-biased sampler. Pinned `val_split: holdout`.
+      m1_6_llada_variant_c.yaml                        — M1.6 = T6 (λ_mse = 0 ablation) — KL+BCE only loss; rest matches M1.5. Pinned `val_split: holdout`.
+      m1_5_data20k_llada_variant_c.yaml                — M1.5 recipe on 20k shard cache, legacy `shard_sampler: block` (the BlockShardSampler result of record).
+      m1_6_data20k_llada_variant_c.yaml                — M1.6 recipe on 20k shard cache, legacy `shard_sampler: block`.
+      m2_t5_llada_variant_c.yaml                       — M2 T5 (data 20k, λ_mse 0.5, dropout 0.2, wd 0.05, gsm8k_every 2k), legacy `shard_sampler: block`.
+      m2_t5_spsv512_llada_variant_c.yaml               — spsv ablation against m2_t5 (null result; confirmed within-shard correlation isn't the lever). Legacy `shard_sampler: block`.
+      m1_5_data20k_interleaved_llada_variant_c.yaml    — M1.5 recipe + 20k shard cache + `shard_sampler: interleaved` + `val_split: test`. The current best loader configuration.
 ```
 
 ---
@@ -770,11 +813,24 @@ python -m delta_model.eval.gsm8k_e2e \
     --delta_ckpt ckpts/.../step_NNNN.pt \
     --fast_dllm_path external/Fast-dLLM/v1 \
     --n_problems 200 \
-    --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95
+    --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
+    --out_json eval_results/<run>_sweep.json
 ```
 
-Decoding mode (`--factor` / `--threshold`) **must match what collect used** or
-the delta is being tested in a regime it never trained on.
+The harness shows a live `tqdm` bar with running per-problem decode time
+(hybrid vs vanilla), running speedup ratio, and running accuracy — so a
+broken threshold is visible after ~10 problems, not 200. Bar disables
+itself (`show_progress=False`) when called from `train.py`'s mid-train
+eval, keeping the train loop's pbar clean.
+
+Decoding mode (`--factor` / `--threshold`) **must match what collect
+used** or the delta is being tested in a regime it never trained on.
+
+Visualize a sweep JSON (or overlay several) with `eval/plot_sweep.py` —
+3 panels: accuracy–speed Pareto with the "win zone" shaded, accuracy
+bars + speedup line vs threshold (dual-axis, Okabe–Ito palette, every
+point text-labelled), and rollback bars vs threshold. See §usage.md
+for the command.
 
 ---
 
@@ -786,6 +842,7 @@ the delta is being tested in a regime it never trained on.
 | T2 | `test_zero_init` | DeltaHead zero-init invariant; full forward signature + per-position loss path; new RoPE / RMSNorm / SwiGLU primitives don't crash | after model or loss changes |
 | T3 | `test_collect_roundtrip` | cache schema matches `schema.py`; field shapes / dtypes correct; optional `prefix_kv_pad_mask` validated if present | after any collect run |
 | T4 | `test_partial_full_forward_equivalence` | documents the Fast-dLLM partial-forward behavior (B1 & B3 both diverge from full forward → ✓ EXPECTED on this LLaDA build) | informational; run after any LLaDA upgrade or modeling-side change |
+| T5 | `test_interleaved_sampler` | `InterleavedShardSampler` emits exactly `num_samples`, a 256-batch spans ≥ `active_shards` shards (interleaving works), every index reachable over enough rounds, T2 weights bias the draw ~3× | after sampler changes; no GPU / cache needed |
 | diag | `inspect_llada_modeling` | dumps `LLaDAModelLM.forward` / `LLaDAModel.forward` signatures + RotaryEmbedding source + attention method source + targeted grep hits | when investigating an LLaDA modeling question |
 
 ---
@@ -828,26 +885,51 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blo
   resume. See §4.1.
 - `[x]` Local metrics JSONL mirror — `<ckpt_dir>/metrics.jsonl`,
   plotted by `eval/plot_metrics.py`. See §4 intro.
-- `[~]` **T5 (M2) — PRIMARY** scale data 5000 → 20000 prompts
-  into `cache_v1_20k/llada/`. Collect in progress. Training config
-  `m2_t5_llada_variant_c.yaml` drafted: `λ_mse=0.5`, `dropout=0.2`,
-  `weight_decay=0.05`, `gsm8k_every=2000`.
-- `[ ]` **T7 (M2)** Deeper delta model (2 → 4 layers). Only if T5
-  plateaus below 0.60 and per-bin diagnostic implicates capacity.
+- `[x]` **T5 (M2)** Scale data 5k → ~11.8k prompts (cap from dedup +
+  RAM ceiling). Cache `cache_v1_20k/llada/`. With the correct loader
+  (interleaved), `train/kl` reaches ~0.15 (vs 5k preload's lower train
+  loss being a memorization artifact) and val/kl drops to 0.280 — data
+  scaling works. Confirmed by the three-way comparison; sampler was the
+  bottleneck, not data.
+- `[~]` **T5b — scale to 30k under disk budget.** New cache
+  `cache_v1_30k/llada/` thinned at collect time to 6 blocks × 3 iters ×
+  KV 32 (~236 GB). Test split kept full. Curriculum: stage-1 trains on
+  early-iter pairs `(0,1) (0,2) (1,2)`; stage 2 (optional) adds late
+  iters if early-iter plateaus. Needs CLI flags `--keep_blocks` /
+  `--keep_iters` in `collect_llada.py` to write thinned files directly
+  (full-then-thin would peak at ~600 GB during collect).
+- `[ ]` **T7 (M2)** Deeper delta model (2 → 4 layers). Only if T5b
+  plateaus and per-bin diagnostic implicates capacity.
 - `[ ]` **T8 = old C (M2)** Sliced 1-D distribution-matching
   regularizer on `h_pred` vs `h_target` — SIGReg mechanism. See §3.3.
 - `[ ]` Variant A (cross-attn anchor) — M2 candidate.
 - `[ ]` Variant B (AdaLN-Zero) — M2 candidate.
 - `[ ]` Multi-layer hidden fusion (EAGLE-3 hint) — M2; requires recollect.
+  Closest single architectural lever per the DFlash comparison.
 
 ### Data
-- `[x]` Schema v2: `prefix_kv` field, `prefix_window=64` stored, optional pad mask (§3.4, §3.5).
-- `[ ]` Locality-aware sampler — only needed if cache > RAM.
+- `[x]` Schema v2: `prefix_kv` field, `prefix_window=64` stored, optional pad mask.
+- `[x]` **Locality-aware sampler.** `InterleavedShardSampler` (§3.6) is
+  the cache > RAM solution; replaced `BlockShardSampler` as default.
+- `[x]` `data/thin_cache.py` — in-place, resumable cache thinner. Drops
+  trailing blocks / later iterations / shrinks KV window. Trains on
+  `train/` only by default so `test/` stays full for fair eval.
+- `[x]` `data/repack.py --rm_source` — peak disk during repack drops
+  from ~2× to ~(cache + one shard).
+- `[x]` `dataset.py` / `schema.py` / T3 tolerate per-sample-variable
+  block count, iter count, prefix window (read from `meta`). Lets
+  a single cache hold thinned train + full test transparently.
 - `[ ]` Per-iteration revealed-token snapshots in cache — flagged as "future collector additions" but not specified.
 
 ### Inference / correctness
 - `[x]` §3.1 alignment chain audited; hybrid runner rollback uses partial forward.
 - `[x]` §3.2 agreement decoding.
+- `[x]` **Rollback semantics fix (§5.1, 2026-05-15).** A rollback now
+  commits via vanilla Fast-dLLM on the backbone's own logits (ungated;
+  the confidence gate only judges the *delta* model). Guarantees ≥ 1
+  token of progress per rollback. Pre-fix 0.95-threshold livelock
+  (`mean_rollbacks 467`, `speedup 0.10`, `accuracy 0.03`) eliminated;
+  high thresholds degrade gracefully to ≈ backbone baseline.
 - `[ ]` Sample-level diagnostic: log per-position c_pos vs actual top-1 correctness at val time. Would tell us whether the conf head is well-calibrated independently of the per_pos_threshold setting.
 
 ### Accepted limitations (not targeted)

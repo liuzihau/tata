@@ -248,34 +248,58 @@ development; the full postmortem lives in `engineering.md` §6.
   - Default `gsm8k_every` lowered 5000 → 2000 in M2 configs so peak
     location is observable to within ±1k steps.
 
-- **M2 — Tier 2 (data scaling + capacity + variants).** Now ranked
-  with T5 as primary:
-  - **T5 — scale data (5000 → 20000 prompts). PRIMARY.**
-    Direct response to the block-as-sampling-unit overfitting
-    signature and the M1.5/M1.6 GSM8K peak-then-decline. Reads from
-    a new `cache_v1_20k/llada/` so it doesn't race with M1.6 on the
-    original cache. Hash-stable test split means the 800 test
-    prompts are identical to trial-2's.
-
-    T5 training config (`m2_t5_llada_variant_c.yaml`) inherits M1.5's
-    setup with M1.5/M1.6-informed tweaks:
-    - `λ_mse 1.0 → 0.5` (M1.5's MSE dominated; M1.6's zero hurt — split
-      the difference so MSE is a co-regularizer at ~40% weighted loss)
-    - `dropout 0.1 → 0.2` (M1.5's 0.1 was undersized)
-    - `weight_decay 0.01 → 0.05` (second regularizer alongside dropout)
-    - `gsm8k_every 5000 → 2000` (peak detection at ±1k resolution)
-    - Best-checkpoint tracker preserves the peak through `keep_last`
-      rotation.
-  - **T7 — deeper delta model (2 → 4 layers).** Only if T5 plateaus
-    below 0.60; capacity may need to grow alongside data.
+- **M2 — Tier 2 (data scaling + sampler + variants). Sampler discovery
+  rewrote the order of operations. Landed 2026-05-15.**
+  - **T5 — scale data (5k → ~11.8k prompts; capped by dedup + preload
+    RAM ceiling).** Initial runs (`m2_t5_*`, `m1_5_data20k`,
+    `m1_6_data20k`) underperformed the 5k baseline on val/kl (0.332 vs
+    0.293) and gave the false signal "data isn't the constraint." The
+    three-way M1.5 comparison (5k preload / ~11.8k BlockShardSampler /
+    ~11.8k preload) isolated the cause: **`BlockShardSampler` confined
+    every batch to a single shard (~50 prompts), producing correlated
+    high-variance gradients and ~2× worse train *and* val loss**. With
+    `preload + WeightedRandomSampler` at the same ~11.8k cache, val/kl
+    drops to **0.280 — beating the 5k baseline.** Data scaling does
+    work; the m2_t5 underperformance was a loader artifact, not a
+    data/capacity finding.
+  - **InterleavedShardSampler — landed, verified.** Keeps `active_shards`
+    shards resident and mixes draws across all of them at bounded RAM
+    (~`active_shards × shard_size` prompts per batch). On the same
+    ~11.8k cache it matches preload's `train/kl` and noise, lifting the
+    11.8k preload RAM ceiling. The `m2_t5` regularization changes
+    (`dropout 0.2`, `wd 0.05`, `λ_mse 0.5`) were tuned against the broken
+    loader — the current best config reverts to M1.5's defaults
+    (`m1_5_data20k_interleaved_llada_variant_c.yaml`).
+  - **Rollback semantics (inference) fix.** A pre-fix 0.95-threshold
+    sweep showed `mean_rollbacks 467`, `speedup 0.10x`, accuracy 0.03 —
+    a livelock where every rollback paid a backbone forward and the
+    delta gate vetoed everything. Fixed (`engineering.md` §5.1): a
+    rollback now commits ungated via vanilla Fast-dLLM on the backbone's
+    own logits. Guarantees ≥ 1 token per rollback, high-threshold
+    regimes degrade gracefully.
+  - **T5b — scale to 30k under disk budget. NEXT.** Three-way result
+    confirms more data still helps. Storage budget (300 GB) is the
+    binding constraint. Plan: collect 30k into `cache_v1_30k/llada/`,
+    **thin during collect** to 6 blocks × 3 iters × KV 32 (early-stage
+    pairs `(0,1) (0,2) (1,2)` only). Test split stays full. Cache lands
+    at ~236 GB. Block-views over 20k steps × 256 batch: 28/block-unit
+    (vs current 62/block-unit) — clear room for more data before the
+    overfitting onset. Stage-2 (optional, later) on late-iter pairs if
+    early-iter plateaus.
+  - **T7 — deeper delta model (2 → 4 layers).** Only if T5b plateaus
+    and per-bin diagnostic implicates capacity.
   - **Variants A (cross-attn anchor) / B (AdaLN-Zero).** Compare on
     val-shared-mass and swap-in GSM8K accuracy, binned by gap and
     reveal-fraction.
-  - **T8 (= old C) — sliced 1-D distribution-matching regularizer**
-    on `h_pred` vs `h_target`. SIGReg's projection-based mechanism,
-    retargeted from anti-collapse to anti-drift. Gate: only attack
-    if per-bin val diagnostic shows late-iter / high-reveal
-    degradation after T5 lands.
+  - **Multi-layer hidden fusion (EAGLE-3 style).** The closest single
+    architectural lever per the DFlash comparison: DFlash drafters take
+    multiple intermediate-layer hidden states from the target; tata uses
+    last-layer only. Requires re-collect that records hidden states at
+    `{layer_8, layer_16, layer_24, layer_31}` instead of just final.
+  - **T8 — sliced 1-D distribution-matching regularizer** on `h_pred`
+    vs `h_target`. SIGReg's projection-based mechanism, retargeted from
+    anti-collapse to anti-drift. Gate: only attack if per-bin val
+    diagnostic shows late-iter / high-reveal degradation after T5b.
 
 - **M3 — replicate winning variant on Dream-7B.** Confirms the recipe
   is base-model-portable in methodology (separate trained delta
@@ -393,45 +417,55 @@ critiques that motivated the delta-model proposal:
 
 ---
 
-## 9 · Status snapshot (2026-05-12)
+## 9 · Status snapshot (2026-05-15)
 
 M0 done. M1 trial 1: 0.72 → 0.10 at 15k (alignment bugs). M1 trial 2:
-**0.44** at 20k. M1.5 Tier-1: peak **0.40 @ 5k**, final 0.28.
-M1.6 λ_mse=0: peak **0.36 @ 10k**, final 0.30. T4 sweep on M1.5
-ckpt: complete, result pending discussion.
+**0.44** at 20k. M1.5 Tier-1: peak **0.40 @ 5k**, final 0.28. M1.6
+`λ_mse=0`: peak **0.36 @ 10k**, final 0.30. M2 T5 / m1_5_data20k
+(BlockShardSampler): val/kl **0.332**. **m1_5_data20k_preload** (preload
++ WRS, same cache): val/kl **0.280** — first win over the 5k baseline.
+**m1_5_data20k_interleaved** (InterleavedShardSampler, same cache):
+matches preload on `train/kl` (~0.15) and noise → loader fix verified
+end-to-end.
 
-**Updated diagnosis after M1.5 + M1.6:**
+**Headline findings (M2 phase):**
 
-- The loss-space hypothesis was reasonable from trial-2 evidence
-  but is not the binding constraint at this data scale.
-- **GSM8K accuracy peaks then declines** in both Tier-1 runs — not
-  just val loss. M1.5 peaks early-and-high (0.40 @ 5k), M1.6 peaks
-  late-and-low (0.36 @ 10k). MSE is doing useful work as a soft
-  regularizer (M1.6 fits train KL faster, generalizes slightly
-  worse), but at λ=1.0 it dominated the gradient budget at ~60% of
-  weighted loss.
-- The block-as-sampling-unit math (~9.6 block-views at the 1.5k
-  inflection point) explains why: 5000 prompts × 8 blocks is too
-  few independent units for a 500M-parameter network.
+- **Data scaling works** once the loader is correct (0.293 → 0.280 going
+  5k → ~11.8k). Earlier "data isn't the constraint" reading from the
+  m2_t5 runs was a `BlockShardSampler` artifact.
+- **The sampler was the bottleneck.** BlockShardSampler confined every
+  batch to one shard (~50 prompts); InterleavedShardSampler keeps a
+  window of `active_shards` shards resident and mixes draws across them,
+  recovering random-sampler gradient quality at bounded RAM.
+- **Inference rollback semantics were broken at high threshold.** A
+  rollback paid a backbone forward but re-gated the result through the
+  delta confidence head, producing a livelock that committed nothing
+  (0.95 sweep: `mean_rollbacks 467`, `speedup 0.10x`, accuracy 0.03).
+  Fixed: rollback now commits via vanilla Fast-dLLM on the backbone's
+  own logits, ungated (engineering.md §5.1).
+
+**Infrastructure landed this phase:**
+
+- `InterleavedShardSampler` + `data.shard_sampler` knob.
+- `data.val_split=test` — train on full train split, validate on
+  hash-stable test split → val/kl comparable across cache sizes.
+- `data/thin_cache.py` (in-place cache thinner) + `repack.py --rm_source`
+  (peak disk = 1× not 2×) + per-sample-variable shapes in dataset/T3.
+- `eval/plot_sweep.py` — 3-panel per_pos_threshold sweep visualizer.
+- `eval/gsm8k_e2e.py` tqdm bar with live hyb / van decode time.
+- Best-checkpoint tracker (`best_val_kl_step<N>.pt`,
+  `best_gsm8k_step<N>.pt`) + sidecar `best_metrics.json`.
+- Local `metrics.jsonl` mirror of every `wandb.log` call.
 
 **Now in progress:**
 
-1. **T5 collect (5000 → 20000 prompts)** into a new
-   `cache_v1_20k/llada/` directory. Hash-stable test split keeps the
-   800 test prompts identical to trial-2. Same 800 problems →
-   directly comparable.
-2. **T5 training config** (`m2_t5_llada_variant_c.yaml`) is drafted
-   and ready to launch once collect finishes. Tweaks vs M1.5:
-   `λ_mse 1.0 → 0.5`, `dropout 0.1 → 0.2`, `weight_decay 0.01 → 0.05`,
-   `gsm8k_every 5000 → 2000`, plus the new best-checkpoint tracker.
-
-**Infrastructure landed alongside this milestone:**
-
-- `train.py` now writes `<ckpt_dir>/metrics.jsonl` mirroring every
-  wandb.log call (locally inspectable, plottable via
-  `eval/plot_metrics.py`).
-- `train.py` now tracks best-by-metric and saves
-  `best_val_kl_step<N>.pt` and `best_gsm8k_step<N>.pt` independent
-  of the rolling `step_*.pt` files — peak no longer gets rotated
-  away.
-- `eval/gsm8k_e2e.py` now auto-creates the `--out_json` parent dir.
+1. **Post-fix GSM8K sweep on the three best checkpoints** (block /
+   preload / interleaved) — the downstream proof that the loader fix
+   carries through to GSM8K, not just `train/kl`. Visualized with
+   `plot_sweep.py` overlay.
+2. **T5b — 30k collect under the 300 GB disk budget.** New cache
+   `cache_v1_30k/llada/` thinned at collect time to 6 blocks × 3 iters ×
+   KV 32 (early-stage pairs only). Needs `--keep_blocks` / `--keep_iters`
+   CLI flags in `collect_llada.py`. Test split kept full.
+3. **Curriculum stage 2** (optional, later): late-iter pairs if the
+   early-iter recipe plateaus.

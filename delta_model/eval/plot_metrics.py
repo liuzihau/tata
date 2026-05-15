@@ -213,7 +213,12 @@ def main() -> None:
             if metric not in series:
                 continue
             steps, values = series[metric]
-            if args.smooth > 1:
+            # Only slice `steps` when smoothing actually ran. Sparse metrics
+            # like gsm8k/* (logged every ~2000 steps) often have fewer points
+            # than the smoothing window — `_running_mean` returns values
+            # unchanged in that case, so we must keep `steps` unchanged too
+            # or matplotlib hits a "shapes (0,) vs (N,)" mismatch.
+            if args.smooth > 1 and len(values) >= args.smooth:
                 values = _running_mean(values, args.smooth)
                 steps = steps[args.smooth - 1:]
             ax.plot(steps, values, label=run_name, linewidth=1.2)

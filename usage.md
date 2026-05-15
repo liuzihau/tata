@@ -7,383 +7,100 @@ any of this exists, see `design.md`. For *how* the internals work
 
 `tata/` is **a standalone repo** — no cross-package imports from
 sibling `peft_project/` trees. The only external code dependency is
-**Fast-dLLM v1**, found at runtime via path / env var (§ Prereqs).
+**Fast-dLLM v1**, found at runtime via path / env var (see Prereqs).
+
+The current end-to-end pipeline:
+
+```
+collect_llada  →  thin_cache  →  repack --rm_source  →  sanity  →  train  →  gsm8k_e2e  →  plot_sweep
+                  (optional)                            (preflight)            (sweep)      / plot_metrics
+```
+
+A clean run from scratch is in [Quickstart](#quickstart). Sections
+below cover each step in detail.
 
 ---
 
-## Local plotting (no wandb cloud needed)
+## Quickstart
 
-`train.py` writes every metric it logs to wandb into a plain JSONL at
-`<ckpt_dir>/metrics.jsonl` as well. The companion script
-`delta_model/eval/plot_metrics.py` turns one or more of those files
-into matplotlib plots — handy for fast on-machine comparison across
-trials.
+A full run from no cache to a per-threshold sweep plot. Total ~5–7 h
+on a single H100-class node (collect dominates).
 
 ```bash
-# Single run, all common metrics, popup window
-python -m delta_model.eval.plot_metrics \
-    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl
+# 0. Pre-flight (no GPU / cache needed) — ~30 s
+python3 -m py_compile \
+    delta_model/{train,inference/hybrid_runner}.py \
+    delta_model/data/{schema,collect_llada,dataset,repack,thin_cache}.py \
+    delta_model/eval/{gsm8k_e2e,plot_metrics,plot_sweep}.py \
+  && echo OK
+python -m delta_model.sanity.test_zero_init
+python -m delta_model.sanity.test_interleaved_sampler
 
-# Trial-2 vs M1.5 vs M1.6 on a few metrics, saved to PNG
-python -m delta_model.eval.plot_metrics \
-    ckpts/m1_llada_variant_c/metrics.jsonl \
-    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl \
-    ckpts/m1_6_lambdamse0_llada_variant_c/metrics.jsonl \
-    --metric train/kl val/kl gsm8k/accuracy_hybrid \
-    --out plots/m1_kl_gsm8k.png
-
-# Smooth noisy single-batch train curves, log scale
-python -m delta_model.eval.plot_metrics \
-    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl \
-    --metric "train/.*" --smooth 25 --ylog \
-    --out plots/m1_5_train_smooth.png
-
-# Per-bin val MSE breakdown
-python -m delta_model.eval.plot_metrics \
-    ckpts/m1_5_tier1_llada_variant_c/metrics.jsonl \
-    --metric "val/mse_by_gap_.*" --out plots/m1_5_val_bins.png
-```
-
-Notes:
-
-- The script accepts exact metric names *or* regexes (`train/.*`,
-  `val/mse_by_gap_[0-9]+`). With no `--metric`, plots all metrics
-  common across the runs you passed.
-- Subplot legend uses the **checkpoint folder name** as the run label
-  (e.g. `m1_5_tier1_llada_variant_c`), so visually distinct configs
-  → visually distinct labels.
-- Trial-2 and M1.5 ran **before** the JSONL mirror landed (2026-05-12),
-  so their `metrics.jsonl` doesn't exist yet — their history lives
-  only in wandb cloud or the local `wandb/run-*/run-*.wandb` binary.
-  M1.6 / T5 / all future runs will have JSONL by default. To get
-  trial-2 / M1.5 into a plot, re-run them, or pull via `wandb.Api()`.
-
----
-
-## Quickstart — post-M1.5: T4 sweep + M1.6 + T5 collect, all in parallel
-
-After M1.5 (val KL plateaued ≈ trial-2, GSM8K 0.40 within 1σ of 0.44),
-three concurrent next actions. The first runs on the existing M1.5
-checkpoint; the second on the existing cache; the third writes to a
-new cache dir, so all three can be launched at the same time without
-racing.
-
-### Action 1 — T4 sweep on M1.5 checkpoint (free, ~30 min)
-
-```bash
-python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt ckpts/m1_5_tier1_llada_variant_c/step_0020000.pt \
-    --fast_dllm_path external/Fast-dLLM/v1 \
-    --n_problems 200 \
-    --per_pos_thresholds 0.60,0.70,0.75,0.80,0.85,0.90,0.95 \
-    --out_json eval_results/t4_m1_5_thresh_sweep.json
-```
-
-The 0.85 default was design-time, not tuned. GSM8K is non-monotone
-in this threshold. If a different threshold lands at 0.46+, the M1.5
-result was undersold by a bad operating point. Note the winner — pass
-it to subsequent training via `--override log.gsm8k_per_pos_threshold=<w>`.
-
-### Action 2 — M1.6 (T6 `λ_mse = 0`) on the existing cache (~3–4 h)
-
-```bash
-python -m delta_model.train \
-    --config delta_model/configs/m1_6_llada_variant_c.yaml \
-    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
-```
-
-Lands in `ckpts/m1_6_lambdamse0_llada_variant_c/`, wandb group
-`M1.6-lambdamse0-llada`. Reads the **same** `cache_v1/llada/` as
-M1.5 — directly comparable to M1.5's val KL trajectory. Watch:
-
-- `train/mse` and `val/mse` will be reported (mse_space still logs it
-  for comparability) but contribute zero to the loss. The interesting
-  signal is `train/kl` and `val/kl`.
-- If M1.6's val KL ends ≤ M1.5's (≤ 0.293), MSE was redundant and we
-  ship the 2-term loss for cleanliness.
-- If higher, MSE was a low-frequency anchor; keep it but maybe tune
-  λ down (try 0.3 next).
-
-### Action 3 — T5 collect (scale data 5k → 20k) (~12–20 h)
-
-```bash
-# Lands in a NEW cache dir so it doesn't race with M1.6 on
-# cache_v1/llada/manifest.json.
+# 1. Collect (~4–7 h depending on n_train) — needs HF + Fast-dLLM
+huggingface-cli login                                                     # once
 python -m delta_model.data.collect_llada \
     --n_train 20000 --n_test 800 \
     --output_root cache_v1_20k/llada \
     --fast_dllm_path external/Fast-dLLM/v1
+
+# 2. Thin the train split in-place (drop block 7, cap iters to 5,
+#    shrink KV window 64 → 32). Test split is left full for fair eval.
+python -m delta_model.data.thin_cache --cache_root cache_v1_20k/llada
 python -m delta_model.sanity.test_collect_roundtrip \
-    "cache_v1_20k/llada/test/sample_*.pt" | tail -5     # T3 schema check
-```
+    "cache_v1_20k/llada/train/sample_*.pt" | tail -3                       # T3 on thinned train
+python -m delta_model.sanity.test_collect_roundtrip \
+    "cache_v1_20k/llada/test/sample_*.pt"  | tail -3                       # T3 on full-fidelity test
 
-The hash-stable test split means the 800 test prompts in
-`cache_v1_20k/llada/test/` are **identical** to `cache_v1/llada/test/`
-(same hashes, same `shuffle_seed=42`). Direct A/B vs trial-2/M1.5 on
-the same held-out test prompts.
+# 3. Repack into shards, deleting per-sample files as each shard lands
+python -m delta_model.data.repack --cache_root cache_v1_20k/llada \
+    --shard_size 50 --output_subdir shards --rm_source
 
-Storage: ~480 GB at n_train=20000 + n_test=800 with prefix_window=64.
-If tight, drop to n_train=15000 (~360 GB).
-
-### Action 3a — Repack into shards (~30 min, one-time)
-
-20k samples × ~20 MB doesn't fit in 300 GB RAM under `preload=true`.
-Solution: pack the per-sample files into ~50-sample shards (~1 GB each)
-and use `preload=false` + `BlockShardSampler`, which keeps the shard
-LRU cache hot through long same-shard runs (engineering.md §3.5).
-
-```bash
-python -m delta_model.data.repack \
-    --cache_root cache_v1_20k/llada \
-    --shard_size 50 \
-    --output_subdir shards
-# Writes cache_v1_20k/llada/shards/{train,test}/shard_NNNNN.pt
-# AND cache_v1_20k/llada/shards_manifest.json (dataset auto-detects this).
-# Non-destructive: original per-sample/ files are kept; delete the
-# `shards/` dir + manifest to revert to per-sample mode.
-```
-
-### Action 3b — T5 training (after collect + repack)
-
-The training config is already drafted: `m2_t5_llada_variant_c.yaml`.
-Tweaks vs M1.5 are documented in its header. Key data knobs:
-`preload: false`, `samples_per_shard_visit: 4096` (16 batches/shard).
-
-```bash
+# 4. Train — current best config (~3–4 h for 20k steps)
+wandb login                                                               # once
 python -m delta_model.train \
-    --config delta_model/configs/m2_t5_llada_variant_c.yaml \
+    --config delta_model/configs/m1_5_data20k_interleaved_llada_variant_c.yaml \
     --override backbone.fast_dllm_path=external/Fast-dLLM/v1
-```
 
-At startup the train log should print a `[train] BlockShardSampler:`
-line — that confirms the locality sampler is active. If you see
-`[train] i_ref-biased sampler:` instead, the dataset didn't land in
-shard mode (the repack step didn't run or the manifest is missing).
-
-Lands in `ckpts/m2_t5_data20k_llada_variant_c/`, wandb group
-`M2-T5-data20k-llada`. Mid-training GSM8K eval at every 2000 steps
-(was 5000) — peak should now be locatable to ±1k.
-
-Resident RAM during training: ~4 GB for the shard cache (LRU=4) +
-~30 GB for the model and optimizer state + ~4 GB for the val
-dataset. Total ≈ 40 GB, well under the 300 GB bound. (For comparison,
-M1.5/M1.6 at 5000 samples held ~80–100 GB resident for the preloaded
-cache alone.)
-
-### Best-checkpoint files (auto-saved)
-
-Every run from 2026-05-12 onward saves *three* kinds of checkpoint
-to `cfg.checkpoint.out_dir`:
-
-| pattern | when | survives `keep_last` |
-|---|---|---|
-| `step_<NNNNNNN>.pt` | every `cfg.checkpoint.every` steps | no (rotated) |
-| `best_val_kl_step<N>.pt` | when val/kl hits a new running minimum | yes |
-| `best_gsm8k_step<N>.pt` | when gsm8k/accuracy_hybrid hits a new running maximum | yes |
-
-The two `best_*` files are the ones to use for final eval (not the
-last rolling step). Read `<ckpt_dir>/best_metrics.json` for the
-recorded peak value + step:
-
-```bash
-cat ckpts/m2_t5_data20k_llada_variant_c/best_metrics.json
-# {
-#   "val_kl": {"value": 0.21, "step": 8000, "mode": "min"},
-#   "gsm8k":  {"value": 0.52, "step": 10000, "mode": "max"}
-# }
-
-# Final eval on the GSM8K-best checkpoint, with the threshold sweep:
+# 5. GSM8K per_pos_threshold sweep on the best-by-GSM8K checkpoint
 python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt $(ls ckpts/m2_t5_data20k_llada_variant_c/best_gsm8k_step*.pt) \
+    --delta_ckpt $(ls ckpts/m1_5_data20k_interleaved_llada_variant_c/best_gsm8k_step*.pt) \
     --fast_dllm_path external/Fast-dLLM/v1 \
     --n_problems 200 \
     --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
-    --out_json eval_results/m2_t5_best.json
+    --out_json eval_results/m1_5_data20k_interleaved_sweep.json
+
+# 6. Visualize the sweep
+python -m delta_model.eval.plot_sweep \
+    eval_results/m1_5_data20k_interleaved_sweep.json \
+    --out plots/m1_5_data20k_interleaved_sweep.png
 ```
 
-### Decision tree after these three land
-
-| signal | interpretation | next move |
-|---|---|---|
-| T4 winner ≥ 0.46 | Bad operating point for M1.5 | Adopt as default; M1.5 wasn't underperforming |
-| M1.6 val KL ≤ M1.5 | MSE was redundant | Ship 2-term loss; carry into T5 |
-| M1.6 val KL > M1.5 | MSE was a soft anchor | Keep MSE but tune λ ∈ {0.3, 0.5} |
-| T5 val KL < 0.20 | Data was the binding constraint | Continue scaling; T7 capacity bump if val plateau |
-| T5 val KL ≈ M1.5 | Data isn't the binding constraint | Look at capacity (T7) or trajectory drift (T8) |
-
----
-
-## Quickstart — Tier 1 (M1.5; reuses trial-2 cache, no recollect)
-
-If you have a trial-2 cache at `cache_v1/llada/` and a trial-2
-checkpoint at `ckpts/m1_llada_variant_c/`, this is the full Tier 1
-sequence. The Tier-1 trial uses a **separate config**
-(`m1_5_llada_variant_c.yaml`), wandb group (`M1.5-tier1-llada`), and
-checkpoint dir (`ckpts/m1_5_tier1_llada_variant_c/`) — the trial-2
-artifacts stay untouched as the baseline of record.
-
-Total ~3–4 h wall time + ~30 min for T4.
+Multi-run comparison of training curves at the end:
 
 ```bash
-# 0. Pre-flight compile + sanity
-python3 -m py_compile \
-    delta_model/{losses,train}.py \
-    delta_model/data/dataset.py \
-    delta_model/models/variant_c.py \
-  && echo OK
-python -m delta_model.sanity.test_zero_init                          # raw-MSE invariant still holds (test uses default kwarg)
-
-# 1. (free) T4 — per_pos_threshold sweep on the EXISTING trial-2 checkpoint.
-#    No retrain. Could move 0.44 → ~0.50 at zero cost.
-python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt ckpts/m1_llada_variant_c/step_0020000.pt \
-    --fast_dllm_path external/Fast-dLLM/v1 \
-    --n_problems 200 \
-    --per_pos_thresholds 0.70,0.75,0.80,0.85,0.90,0.95 \
-    --out_json eval_results/t4_trial2_thresh_sweep.json
-# Pick the best per_pos_threshold — that's your new gsm8k_per_pos_threshold default.
-
-# 2. Launch the Tier-1 trial. Lands in a SEPARATE ckpt dir — the trial-2
-#    checkpoint stays in place untouched.
-python -m delta_model.train \
-    --config delta_model/configs/m1_5_llada_variant_c.yaml \
-    --override backbone.fast_dllm_path=external/Fast-dLLM/v1 \
-    --override log.gsm8k_per_pos_threshold=<T4 winner>     # optional
-
-# 3. Final Tier-1 eval (same threshold sweep, fresh checkpoint).
-python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt ckpts/m1_5_tier1_llada_variant_c/step_0020000.pt \
-    --fast_dllm_path external/Fast-dLLM/v1 \
-    --n_problems 200 \
-    --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
-    --out_json eval_results/m1_5_tier1.json
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_5_data20k_llada_variant_c/metrics.jsonl \
+    ckpts/m1_5_data20k_preload_llada_variant_c/metrics.jsonl \
+    ckpts/m1_5_data20k_interleaved_llada_variant_c/metrics.jsonl \
+    --metric train/kl gsm8k/accuracy_hybrid gsm8k/speedup_ratio throughput/samples_per_sec \
+    --smooth 25 \
+    --out plots/sampler_3way_core.png
 ```
-
-What to watch in wandb during Tier-1 training (wandb group
-`M1.5-tier1-llada`, run name `m1_5_tier1_llada_variant_c_seed42`):
-
-- `train/mse` should now sit at O(1) instead of O(10), since MSE is
-  computed in `final_norm` space (T1). If you see it at O(10), the
-  config's `loss.mse_space` wasn't picked up.
-- `train/kl` should drop faster than trial 2 — same KL term, but now
-  MSE is pulling in the same direction instead of the orthogonal
-  raw-h direction.
-- `val/kl` ÷ `train/kl` should narrow toward 1× (was ~4× at trial 2).
-  If it stays at 4×, T1 didn't help; revisit T3 dropout strength.
-- `val/mse_by_gap_1` should drop fastest under T2 (i_ref=0 → gap=1
-  pairs are the most over-sampled bin).
-- At startup the train log should print a line like
-  `[train] i_ref-biased sampler: ref0_weight_multiplier=3.0 → P(i_ref=0) ≈ 0.60 (...)`.
-  If it doesn't appear, T2 didn't fire.
-
-### A/B against trial-2
-
-To re-launch trial-2 exactly (e.g. to confirm baseline reproducibility),
-use the original config:
-
-```bash
-python -m delta_model.train \
-    --config delta_model/configs/m1_llada_variant_c.yaml \
-    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
-```
-
-That lands in `ckpts/m1_llada_variant_c/` and wandb group `M1-llada` —
-same place the trial-2 result lives.
-
----
-
-## Quickstart — trial 2 (recollect + retrain)
-
-If you just landed the §3.1/§3.2 changes from `engineering.md` and want
-to retrain on a fresh cache, this is the full sequence. Total ~5–8 h
-wall time.
-
-```bash
-# 1. Pre-flight: compile + sanity checks (~1 min)
-rm -rf delta_model/{data,models,sanity,inference,eval}/__pycache__
-python3 -m py_compile \
-    delta_model/data/{schema,collect_llada,dataset,repack}.py \
-    delta_model/models/{heads,variant_c}.py \
-    delta_model/{losses,train}.py \
-    delta_model/inference/hybrid_runner.py \
-    delta_model/eval/{shared_mass,gsm8k_e2e}.py \
-    delta_model/sanity/{test_zero_init,test_collect_roundtrip,test_partial_full_forward_equivalence,inspect_llada_modeling}.py \
-  && echo OK
-python -m delta_model.sanity.test_zero_init                                                      # T2
-python -m delta_model.sanity.test_partial_full_forward_equivalence --fast_dllm_path external/Fast-dLLM/v1   # T4 (expect ✓ EXPECTED)
-
-# 2. Move stale artifacts aside (don't delete; useful as a reference)
-mv cache_v1/llada                cache_v1/llada_pre_3_1                       2>/dev/null || true
-mv ckpts/m1_llada_variant_c      ckpts/m1_llada_variant_c_pre_3_2             2>/dev/null || true
-
-# 3. (Optional) 5-prompt smoke recollect (~3 min, no HF login)
-python -m delta_model.data.collect_llada \
-    --prompts_file delta_model/data/sample_prompts.txt \
-    --output_root cache_v1/llada_smoke \
-    --fast_dllm_path external/Fast-dLLM/v1
-python -m delta_model.sanity.test_collect_roundtrip "cache_v1/llada_smoke/test/sample_*.pt"      # T3
-
-# 4. Real recollect (~4–7 h)
-python -m delta_model.data.collect_llada \
-    --n_train 5000 --n_test 800 \
-    --output_root cache_v1/llada \
-    --fast_dllm_path external/Fast-dLLM/v1
-python -m delta_model.sanity.test_collect_roundtrip "cache_v1/llada/test/sample_*.pt" | tail -5  # T3 again
-
-# 5. Train (~3–4 h for 20k steps)
-python -m delta_model.train \
-    --config delta_model/configs/m1_llada_variant_c.yaml \
-    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
-
-# 6. Final eval (sweeps the per-position threshold)
-python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt ckpts/m1_llada_variant_c/step_0020000.pt \
-    --fast_dllm_path external/Fast-dLLM/v1 \
-    --n_problems 200 \
-    --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
-    --out_json eval_results/m1_trial2.json
-```
-
-What to watch in wandb during training:
-- `train/loss` should drop from the start.
-- `val/loss` should track `train/loss`; if they diverge sharply at e.g. 8k, the model is overfitting.
-- `gsm8k/accuracy_hybrid` at intermediate checkpoints — should **trend up** with training. If it declines monotonically like in trial 1, §3.2 didn't help and we move to model-side investigation (see `engineering.md` §11 open questions).
-- `[time]` line printed every `log_every` step: with `data.preload: true` (default), `data` should be small; `fwd / bwd` dominate.
-
-If something breaks, see `## Common errors` at the bottom.
-
----
-
-## cwd and Python path
-
-All commands assume cwd = the tata repo root. After cloning:
-
-```
-$ cd <wherever>/tata && ls
-delta_model/  design.md  engineering.md  usage.md  ...
-```
-
-Imports are relative within `delta_model/`. `python -m delta_model.X`
-works because `delta_model/` is in the cwd. From elsewhere, use
-`PYTHONPATH=/abs/path/to/tata python -m delta_model.X`.
 
 ---
 
 ## Prerequisites
 
-| step | GPU? | HF login? | Fast-dLLM? | Time |
-|---|---|---|---|---|
-| T1 compile-check | no | no | no | <5 s |
-| T2 zero-init | no | no | no | ~5 s |
-| T3 cache-format roundtrip | no | no | no | ~10 s per cache |
-| T4 partial-vs-full forward | **yes** | no | **yes** | ~30 s |
-| Smoke recollect (5 prompts) | **yes** | no | **yes** | ~3 min |
-| Real recollect (5800 prompts) | **yes** | **yes** | **yes** | ~4–7 h |
-| Train (20k steps) | **yes** | no | **yes**¹ | ~3–4 h |
-| Final eval | **yes** | no | **yes** | depends on N |
+### Python deps
 
-¹ training needs Fast-dLLM v1 because we lift `final_norm`, `lm_head`,
-and `token_embed` off the loaded LLaDA backbone.
+```bash
+pip install "torch>=2.4" transformers>=4.44 datasets h5py wandb pyyaml \
+            numpy huggingface_hub tqdm matplotlib
+```
+
+LLaDA-8B is downloaded from `GSAI-ML/LLaDA-8B-Instruct` on first load
+(public, no auth). HF login is only required for the gated Nemotron
+Post-Training v2 dataset used in real collect.
 
 ### Fast-dLLM v1 placement
 
@@ -392,8 +109,6 @@ Recommended layout (cwd = the tata repo root):
 ```
 tata/
 ├── delta_model/
-│   ├── data/sample_prompts.txt
-│   └── ...
 └── external/Fast-dLLM/v1/            ← clone of github.com/NVlabs/Fast-dLLM
     └── llada/model/modeling_llada.py
 ```
@@ -409,17 +124,6 @@ Discovery order at runtime:
 2. Env var: `export FAST_DLLM_V1_PATH=/abs/path/to/Fast-dLLM/v1`
 3. Default: `external/Fast-dLLM/v1` (relative to cwd)
 
-### Python deps
-
-```bash
-pip install "torch>=2.4" transformers>=4.44 datasets h5py wandb pyyaml \
-            numpy huggingface_hub
-```
-
-LLaDA-8B is downloaded from `GSAI-ML/LLaDA-8B-Instruct` on first load
-(public, no auth). HF login is only required for the gated Nemotron
-Post-Training v2 dataset used in real collect.
-
 ### One-time auth
 
 ```bash
@@ -427,64 +131,120 @@ wandb login                 # before training
 huggingface-cli login       # before real collect (Nemotron is gated)
 ```
 
+### cwd and Python path
+
+All commands assume cwd = the tata repo root. Imports are relative
+within `delta_model/`; `python -m delta_model.X` works because
+`delta_model/` is in the cwd. From elsewhere, use
+`PYTHONPATH=/abs/path/to/tata python -m delta_model.X`.
+
 ---
 
-## Diagnostic tests reference
+## 1 · Collect (`data/collect_llada.py`)
 
-| # | what it tests | command |
-|---|---|---|
-| T1 | Syntax / imports across the package | `python3 -m py_compile delta_model/...` (see quickstart) |
-| T2 | DeltaHead zero-init invariant + full model forward + per-position loss path | `python -m delta_model.sanity.test_zero_init` |
-| T3 | Cache schema matches `data/schema.py`; field shapes/dtypes; optional `prefix_kv_pad_mask` if present | `python -m delta_model.sanity.test_collect_roundtrip "cache/.../sample_*.pt"` |
-| T4 | Documents that Fast-dLLM's partial-forward path diverges from a hypothetical full forward at the same `x` state (expected behavior on this LLaDA build) | `python -m delta_model.sanity.test_partial_full_forward_equivalence --fast_dllm_path external/Fast-dLLM/v1` |
-| diag | Print loaded LLaDA's forward signatures + `RotaryEmbedding.forward` source + attention method source + targeted grep hits | `python -m delta_model.sanity.inspect_llada_modeling --fast_dllm_path external/Fast-dLLM/v1` |
+Builds the per-sample cache from Nemotron prompts by running LLaDA +
+Fast-dLLM in prefix-cache mode.
+
+```bash
+python -m delta_model.data.collect_llada \
+    --n_train 20000 --n_test 800 \
+    --output_root cache_v1_20k/llada \
+    --fast_dllm_path external/Fast-dLLM/v1
+```
+
+Knobs (see `engineering.md` §1.2 for the full set):
+
+- `--subset_ratios '{"chat":0.35,"math":0.35,"code":0.20,"stem":0.10}'` — change the mix.
+- `--factor 1.0` (default) — Fast-dLLM dynamic per-rank threshold. Paper-recommended; matches the baseline at eval.
+- `--threshold 0.9` — fixed-threshold mode (mutually exclusive with `--factor`).
+- `--prefix_window N` (default 64) — last-prefix KV slots cached per block. Must be ≥ 32.
+- `--start_index N` — resume a partially-done run.
+- `--limit N` — testing cap.
+
+**Hash-stable test split**: re-running with a larger `--n_train` will
+not touch the same 800 test samples, so you can grow the train set
+across runs without contaminating eval.
+
+**Storage**: ~120 GB at default 5800 samples; ~480 GB at 20k samples
+with `--prefix_window 64`. If tight, drop to `--prefix_window 32` and
+plan to thin (next step) before sharding.
+
+**Resume**: collect skips files that already exist. Safe to Ctrl-C
+and re-run.
+
+---
+
+## 2 · Thin (`data/thin_cache.py`)
+
+In-place cache thinner — drops trailing blocks, caps iterations, and
+shrinks the prefix-KV window. Per-file atomic, resumable (skips
+already-thinned files). Defaults thin **train only**; test stays at
+full fidelity so the held-out eval set is identical run-to-run.
+
+```bash
+python -m delta_model.data.thin_cache \
+    --cache_root cache_v1_20k/llada \
+    --keep_blocks 7 --keep_iters 5 --prefix_window 32
+```
+
+Defaults match the current best practice (drop block 7, cap iters at 5,
+window 32). Pass `--splits train,test` only if you also want to thin
+the test split (you probably don't — it's the eval anchor).
+
+The dataset and `test_collect_roundtrip` (T3) read each sample's
+`meta` for `num_blocks`/`max_iter`/`prefix_window`, so thinned-train +
+full-test coexist in one cache transparently.
+
+---
+
+## 3 · Repack (`data/repack.py`)
+
+Packs per-sample files into multi-sample shards. With `--rm_source`
+each per-sample file is unlinked once the shard containing it is
+durably written, so peak disk stays at ~(cache + one shard) instead
+of doubling.
+
+```bash
+python -m delta_model.data.repack \
+    --cache_root cache_v1_20k/llada \
+    --shard_size 50 \
+    --output_subdir shards \
+    --rm_source
+```
+
+After repack:
+- `cache_v1_20k/llada/shards/{train,test}/shard_NNNNN.pt` — shard files
+- `cache_v1_20k/llada/shards_manifest.json` — auto-detected by the dataset
+
+To revert to per-sample mode (assuming you ran *without* `--rm_source`):
+delete the `shards/` directory + `shards_manifest.json`.
+
+---
+
+## 4 · Sanity tests (`sanity/`)
+
+| # | command | what it checks | when to run |
+|---|---|---|---|
+| T1 | `python3 -m py_compile delta_model/...` | syntax / imports | before every sit-and-wait command |
+| T2 | `python -m delta_model.sanity.test_zero_init` | DeltaHead zero-init invariant; full forward signature | after model or loss changes |
+| T3 | `python -m delta_model.sanity.test_collect_roundtrip "cache/.../sample_*.pt"` | cache schema matches `schema.py` (validates against meta-recorded num_blocks/max_iter/prefix_window) | after any collect or thin run |
+| T4 | `python -m delta_model.sanity.test_partial_full_forward_equivalence --fast_dllm_path external/Fast-dLLM/v1` | documents Fast-dLLM partial-forward behavior; prints `✓ EXPECTED` on this LLaDA build | informational; after any LLaDA upgrade |
+| T5 | `python -m delta_model.sanity.test_interleaved_sampler` | `InterleavedShardSampler` count / interleaving / coverage / T2 weighting | after sampler changes; no GPU/cache needed |
 
 Pass criteria:
 - **T1**: prints `OK`.
 - **T2**: prints `delta_h.abs().max() = 0.000000e+00` and `✓ zero-init sanity passed`.
 - **T3**: prints `N OK, 0 bad.` for each sample.
-- **T4**: prints `✓ EXPECTED — both partial-forward paths diverge from the full forward`. (Both partial paths *should* diverge; this is the documented Fast-dLLM behavior. If T4 instead prints `⚠ NOTABLE`, the modeling code has been updated to make them agree — informational.)
-
-T4 details and the alignment rationale: `engineering.md` §6.
-
----
-
-## Real collect (Nemotron, gated)
-
-```bash
-huggingface-cli login    # once; accept the Nemotron license at the dataset page
-
-python -m delta_model.data.collect_llada \
-    --n_train 5000 --n_test 800 \
-    --output_root cache_v1/llada \
-    --fast_dllm_path external/Fast-dLLM/v1
-```
-
-Hash-stable test split: re-running with a larger `--n_train` will not
-touch the same 800 test samples, so you can grow the train set across
-runs without contaminating eval.
-
-Knobs (see `engineering.md` §1.2 for the full list):
-- `--subset_ratios '{"chat":0.4,"math":0.4,"code":0.2,"stem":0.0}'` — change the mix.
-- `--factor 1.0` (default) — Fast-dLLM dynamic per-rank threshold. Paper-recommended; matches the baseline at eval.
-- `--threshold 0.9` — fixed-threshold mode (mutually exclusive with `--factor`).
-- `--prefix_window N` (default 64) — number of last-prefix tokens cached per block. Must be ≥ 32. The cache also stores a pad mask so prompts shorter than `prefix_window` are kept, not skipped.
-- `--start_index N` — resume a partially-done run.
-- `--limit N` — testing cap (overrides `n_train + n_test`).
-
-Storage: ~120 GB at default 5800 samples (5000 train + 800 test) with
-`prefix_window=64`. Cache files are resumable: if interrupted, just
-re-run — existing files are skipped.
+- **T4**: prints `✓ EXPECTED — both partial-forward paths diverge from the full forward`.
+- **T5**: prints `✓ InterleavedShardSampler sanity passed`.
 
 ---
 
-## Training
+## 5 · Train (`train.py`)
 
 ```bash
-wandb login   # once
-
 python -m delta_model.train \
-    --config delta_model/configs/m1_llada_variant_c.yaml \
+    --config delta_model/configs/m1_5_data20k_interleaved_llada_variant_c.yaml \
     --override backbone.fast_dllm_path=external/Fast-dLLM/v1
 ```
 
@@ -492,80 +252,165 @@ Single-line config overrides via `--override key=value` (dot notation):
 
 ```bash
 python -m delta_model.train \
-    --config delta_model/configs/m1_llada_variant_c.yaml \
+    --config delta_model/configs/m1_5_data20k_interleaved_llada_variant_c.yaml \
     --override backbone.fast_dllm_path=external/Fast-dLLM/v1 \
-    --override data.batch_size=128 \
-    --override optim.lr=5e-5 \
-    --override optim.max_steps=10000
+    --override data.active_shards=16 \
+    --override optim.lr=5e-5
 ```
 
 Resume from a checkpoint:
 
 ```bash
 python -m delta_model.train \
-    --config delta_model/configs/m1_llada_variant_c.yaml \
-    --resume_from ckpts/m1_llada_variant_c/step_0010000.pt
+    --config delta_model/configs/m1_5_data20k_interleaved_llada_variant_c.yaml \
+    --resume_from ckpts/m1_5_data20k_interleaved_llada_variant_c/step_0010000.pt
 ```
 
-> Pre-§1.5 / §3.2 checkpoints **will not load** — state_dict keys changed
-> (RoPE / RMSNorm / SwiGLU / per-position conf head). Start fresh.
+### What to watch at startup
 
-At startup you should see (with `data.preload: true`, the default):
-
-```
-[dataset] preloaded ~4500/5000 samples into RAM (~72000 MiB) for split='train'
-[dataset] preloaded ~500/5000  samples into RAM (~8000 MiB) for split='train'
-[train] backbone hyperparams: {'rope_theta': 1e6, 'rms_eps': 1e-5, ...}
-```
-
-Per-step timing (every `log_every` steps):
+The first ~minute of output tells you the new code paths engaged:
 
 ```
-[time] step=  500 data: 18.7ms(11%) fwd: 50.0ms(30%) bwd: 90.0ms(54%) loss:  5.2ms(3%) h2d: 3.1ms(2%) opt: 1.8ms(1%)
+[train] val_split='test' → val from 'test' split. train pairs=…  val pairs=…
+[train] InterleavedShardSampler: <N> shards, active_shards=8, chunk_size=… (≈… batches/window). ref0_mult=3.0 …
+[time] step=    50 data: …ms(<5%) fwd: …ms(30%) bwd: …ms(54%) …
 ```
 
-With preload on, `data` should be small (compute-bound). If `data > 30%`,
-check that preload is actually on at startup, and see `engineering.md`
-§1.4 (open items) for follow-ups.
+🚩 If you instead see `BlockShardSampler (legacy)` or `i_ref-biased
+sampler:` for a 20k-cache run, the dataset didn't land in shard mode
+(missing `shards_manifest.json` — re-run repack) or the config has
+`shard_sampler: block` pinned (legacy reproducibility configs).
 
-What to watch in wandb (project `tata-delta-model`, group `M1-llada`):
-- `train/loss` decreasing from step 0.
-- `train/c_label_mean` rising from ~0.5 baseline toward 0.9+ as the
-  delta model gets better.
-- `val/mse_by_gap_{1..5}` — gap=1 should be much lower than gap=5.
+### What to watch during training
+
+`<ckpt_dir>/metrics.jsonl` mirrors every `wandb.log` payload — plottable
+locally without wandb cloud (`plot_metrics.py`, §7).
+
+- `train/kl` decreasing smoothly. Heavy noise → loader / sampler is wrong.
+- `val/kl` decreasing too, no big gap from train (with M1.5 recipe + 20k
+  data + InterleavedShardSampler, expect convergence near val/kl 0.28).
 - `gsm8k/accuracy_hybrid` mid-training — trend should be **rising**.
+- `throughput/samples_per_sec` — interleaved sits a touch below preload.
 
-Halt criteria (rough guidance, not a hard rule):
-- Step 5000: GSM8K subset accuracy ≥ 0.5 × vanilla. Below 0.3 → stop and revisit loss weights / model size.
-- Step 20000: full GSM8K accuracy ≥ vanilla − 0.05.
+### Best-checkpoint files (auto-saved)
+
+Every run saves three kinds of checkpoint to `cfg.checkpoint.out_dir`:
+
+| pattern | when | survives `keep_last` |
+|---|---|---|
+| `step_<NNNNNNN>.pt` | every `cfg.checkpoint.every` steps | no (rotated) |
+| `best_val_kl_step<N>.pt` | when `val/kl` hits a new minimum | yes |
+| `best_gsm8k_step<N>.pt` | when `gsm8k/accuracy_hybrid` hits a new max | yes |
+
+Use the `best_*` files for final eval. `<ckpt_dir>/best_metrics.json` is
+a sidecar that records the running best per metric (persists across
+resumes).
 
 ---
 
-## Final eval
+## 6 · GSM8K eval & sweep (`eval/gsm8k_e2e.py`)
+
+Sweeps `per_pos_threshold` against the same GSM8K slice, comparing
+hybrid vs vanilla `generate_with_prefix_cache`.
 
 ```bash
 python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt ckpts/m1_llada_variant_c/step_0020000.pt \
+    --delta_ckpt $(ls ckpts/m1_5_data20k_interleaved_llada_variant_c/best_gsm8k_step*.pt) \
     --fast_dllm_path external/Fast-dLLM/v1 \
     --n_problems 200 \
     --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
-    --out_json eval_results/m1_v0.json
+    --out_json eval_results/m1_5_data20k_interleaved_sweep.json
 ```
 
-`--per_pos_thresholds` controls the §3.2 agreement-decode gate. Lower
-= more lenient (more delta commits, faster, riskier). Higher = more
-conservative (more rollbacks, slower, safer).
+Live progress bar shows running per-problem decode times, speedup, and
+accuracy — a broken threshold is visible after ~10 problems:
+
+```
+gsm8k thr=0.85:  47%|████▋     | 94/200 [03:12<03:36, hyb=1.83s, van=2.05s, x=1.12, acc_h=0.41, acc_v=0.75]
+```
+
+Output (one dict per threshold): `accuracy_hybrid`, `accuracy_vanilla`,
+`accuracy_delta`, `speedup_ratio`, `mean_rollbacks`,
+`mean_backbone_calls`, `mean_revealed_per_block`, `mean_blocks_finished`.
 
 **Decoding mode must match collect.** Pass `--factor 1.0` (default) or
-`--threshold 0.9` — whichever was used to build the cache. The
-cache's `manifest.json["decoding"]` records this.
+`--threshold 0.9` — whichever was used to build the cache. The cache's
+`manifest.json["decoding"]` records this.
 
-Output per threshold:
-- `accuracy_hybrid`, `accuracy_vanilla`, `accuracy_delta`
-- `speedup_ratio` (vanilla wall-time / hybrid wall-time)
-- `mean_rollbacks`, `mean_backbone_calls`, `mean_disagreements` per problem
+For final eval against both kinds of "best" checkpoint:
 
-Plot `accuracy_delta` vs `speedup_ratio` to find the working point.
+```bash
+for best in best_gsm8k_step best_val_kl_step; do
+    python -m delta_model.eval.gsm8k_e2e \
+        --delta_ckpt $(ls ckpts/<run>/${best}*.pt) \
+        --fast_dllm_path external/Fast-dLLM/v1 \
+        --n_problems 200 \
+        --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
+        --out_json eval_results/<run>_${best}_sweep.json
+done
+```
+
+---
+
+## 7 · Plot
+
+### Threshold-sweep visualizer (`eval/plot_sweep.py`)
+
+Three panels: accuracy–speed Pareto with the "win zone" shaded;
+accuracy bars (left axis) + speedup line (right axis) vs threshold;
+rollback bars vs threshold. Single file = polished single-run plot;
+multiple files = overlay (grouped bars, per-file colour).
+
+```bash
+# Single sweep
+python -m delta_model.eval.plot_sweep \
+    eval_results/m1_5_data20k_interleaved_sweep.json \
+    --out plots/m1_5_data20k_interleaved_sweep.png
+
+# Overlay (e.g. preload vs interleaved, post-fix)
+python -m delta_model.eval.plot_sweep \
+    eval_results/m1_5_data20k_preload_sweep.json \
+    eval_results/m1_5_data20k_interleaved_sweep.json \
+    --out plots/preload_vs_interleaved_sweep.png
+```
+
+Prints a one-line summary per file: `best acc 0.775 @ thr=0.85 (speedup
+0.37x) | 1 threshold(s) faster than vanilla`.
+
+### Training-metrics overlay (`eval/plot_metrics.py`)
+
+Multi-run comparison of `<ckpt_dir>/metrics.jsonl` series. Smoothing
+window auto-skips sparse metrics (e.g. `gsm8k/*` logged every 2000
+steps).
+
+```bash
+# Single run, popup window
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_5_data20k_interleaved_llada_variant_c/metrics.jsonl
+
+# Multi-run comparison on specific metrics
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_5_data20k_llada_variant_c/metrics.jsonl \
+    ckpts/m1_5_data20k_preload_llada_variant_c/metrics.jsonl \
+    ckpts/m1_5_data20k_interleaved_llada_variant_c/metrics.jsonl \
+    --metric train/kl gsm8k/accuracy_hybrid gsm8k/speedup_ratio throughput/samples_per_sec \
+    --smooth 25 \
+    --out plots/sampler_3way_core.png
+
+# Per-bin val diagnostics (regex)
+python -m delta_model.eval.plot_metrics \
+    ckpts/m1_5_data20k_interleaved_llada_variant_c/metrics.jsonl \
+    --metric "val/mse_by_gap_.*" \
+    --out plots/val_by_gap.png
+```
+
+Notes:
+- Run label = checkpoint folder name (`ckpts/<name>/metrics.jsonl`
+  → `<name>`).
+- `--metric` accepts exact names or regex (`train/.*`,
+  `val/mse_by_gap_[0-9]+`). Default = metrics common across the runs.
+- Trial-2 / M1.5-5k ran *before* the JSONL mirror landed; their
+  history lives only in wandb. M1.6 onwards have `metrics.jsonl`.
 
 ---
 
@@ -575,19 +420,22 @@ Plot `accuracy_delta` vs `speedup_ratio` to find the working point.
 |---|---|---|
 | `ModuleNotFoundError: No module named 'delta_model'` | wrong cwd | `cd` into tata repo root, or `PYTHONPATH=/path/to/tata` |
 | `FileNotFoundError: Fast-dLLM v1 not found at …` | Fast-dLLM not cloned | clone NVlabs/Fast-dLLM into `external/`, or pass `--fast_dllm_path` |
-| `FileNotFoundError: No cached samples found at cache_v1/llada/train` | collect didn't run | run real collect; or update `cfg.data.cache_root` |
+| `FileNotFoundError: No cached samples found at …` | collect didn't run, or wrong cache dir | run collect; or fix `cfg.data.cache_root` |
+| `FileNotFoundError: shard missing: …` | shards out of sync with `shards_manifest.json` | re-repack, or delete `shards/` + `shards_manifest.json` and start fresh |
 | `KeyError: 'Could not find a prompt field in record …'` | Nemotron record schema mismatch | adjust `_default_prompt_extractor` in `collect_llada.py` |
-| `RuntimeError: No LLaDA transformer blocks found` | wrapper class renamed in your Fast-dLLM checkout | update class names in `_find_last_block` (collect + hybrid_runner) |
-| `All samples skipped: "prompt too short (< 1 tokens)"` | empty prompts in your input file | filter the prompts file; pad-and-mask handles short-but-nonempty prompts but cannot handle empty |
+| `RuntimeError: No LLaDA transformer blocks found` | wrapper class renamed in your Fast-dLLM checkout | update class names in `_find_last_block` |
+| Startup shows `BlockShardSampler (legacy)` when you wanted `InterleavedShardSampler` | config pinned `shard_sampler: block`, or default changed unintentionally | check the config; for the current path use the `_interleaved_` config |
+| Startup shows `i_ref-biased sampler:` for a shard cache | dataset didn't go into shard mode | check `shards_manifest.json` exists in `cache_root`; re-repack if not |
 | wandb hangs at init | not logged in | `wandb login` once, then re-run |
-| 401/403 from HuggingFace on Nemotron | gated dataset; not accepted | `huggingface-cli login` and accept the Nemotron license on its HF page |
-| OOM during training | batch / preload / RAM | `--override data.batch_size=128`; or `--override data.preload=false` if RAM-constrained |
-| `RuntimeError: Error(s) in loading state_dict for VariantC: Missing key(s) ".../weight"` | resuming a pre-§3.2 checkpoint into the new architecture | start fresh; model definition changed (RoPE + RMSNorm + SwiGLU + per-pos conf) |
-| `KeyError: 'block_start_pos'` or `'prefix_kv_pad_mask'` in train loop | stale `__pycache__` | `rm -rf delta_model/data/__pycache__` and re-run |
-| `[time]` shows `data: >30%` after preload | preload didn't fire | check startup for `[dataset] preloaded N/M samples` line; if missing, look at `data.preload` in config |
-| Bus error in DataLoader (SIGBUS) | cluster `/dev/shm` too small for any worker IPC | default config already uses `num_workers: 0`; if you flipped it back, revert (see `engineering.md` §10) |
-| Eval and collect disagree on `n_passes_actual` distribution | decoding-mode mismatch | check `manifest.json["decoding"]`; pass the matching `--factor` or `--threshold` at eval |
-| GSM8K mid-train eval fails | usually a dtype mismatch in the rollback path | logged + skipped (training continues); see the printed traceback |
+| 401/403 from HuggingFace on Nemotron | gated dataset; not accepted | `huggingface-cli login` and accept on the dataset page |
+| OOM during training | batch / preload / RAM | drop `data.batch_size`; drop `data.active_shards` (3-4) for the interleaved path |
+| `RuntimeError: Error(s) in loading state_dict for VariantC` | resuming a pre-§3.2 checkpoint into the new architecture | start fresh — model definition changed (RoPE + RMSNorm + SwiGLU + per-pos conf) |
+| `KeyError: 'block_start_pos'` or `'prefix_kv_pad_mask'` in train loop | stale `__pycache__` | `rm -rf delta_model/**/__pycache__` and re-run |
+| `[time]` shows `data: >30%` after the first warm-up | shard LRU thrashing | bump `data.active_shards` (more shards resident), or `preload: true` if RAM allows |
+| Bus error in DataLoader (SIGBUS) | cluster `/dev/shm` too small | configs already use `num_workers: 0`; if you flipped it back, revert |
+| GSM8K mid-train eval fails | dtype mismatch in the rollback path | logged + skipped (training continues) |
+| Sweep shows huge `mean_rollbacks` and tiny `mean_blocks_finished` at high threshold | pre-rollback-fix inference code | update to current `inference/hybrid_runner.py` (rollback commits vanilla Fast-dLLM tokens; engineering.md §5.1) |
+| `ValueError: x and y must have same first dimension, but have shapes (0,) and (N,)` in `plot_metrics` | smoothing window > metric point count (older code) | update — current `plot_metrics.py` falls back to raw for sparse metrics |
 
 ---
 
@@ -600,19 +448,27 @@ To rebuild the test set from scratch (e.g. after changing
 `subset_ratios` for the test partition), delete:
 
 ```bash
-rm cache_v1/llada/manifest.json
-rm -rf cache_v1/llada/test
+rm cache_v1_20k/llada/manifest.json
+rm -rf cache_v1_20k/llada/test
 ```
 
 The hash partition produces the same test IDs for any given subset
 ratios, so you can rebuild the manifest without re-collecting if
 `subset_ratios` for test stayed constant.
 
-If you want to keep a "broken cache" around as a reference while
-working on a new one, move-aside is safer than delete:
+To revert a shard-mode cache back to per-sample (only possible if you
+ran repack *without* `--rm_source`):
 
 ```bash
-mv cache_v1/llada  cache_v1/llada_pre_3_1
+rm -rf cache_v1_20k/llada/shards
+rm cache_v1_20k/llada/shards_manifest.json
+```
+
+If you want to keep a "broken cache" around as a reference while
+working on a new one, move it aside rather than delete:
+
+```bash
+mv cache_v1_20k/llada  cache_v1_20k/llada_pre_thin
 ```
 
 ---
@@ -621,11 +477,14 @@ mv cache_v1/llada  cache_v1/llada_pre_3_1
 
 ```
 design.md         — research framing: problem, idea, prior work, milestones
-engineering.md    — code-level contracts, current status of every component
+engineering.md    — code-level contracts; recent-changes log; status of every component
 usage.md          — this file: commands to run, error handling
-README.md         — short pointer to the three above (if present)
+delta_model/      — the importable package (see engineering.md §File map)
 ```
 
-Old docs (`scoping.md`, `implementation_plan.md`, `improvements.md`) are
-kept as stubs pointing here / to `engineering.md`; their content has been
-consolidated.
+Old / historical configs (`m1_llada_variant_c.yaml`,
+`m1_5_llada_variant_c.yaml`, `m1_6_*`, `m2_t5_*`, the spsv ablation)
+are pinned with `val_split: holdout` and (for shard ones)
+`shard_sampler: block` so re-running them reproduces their recorded
+results. The current best is
+`m1_5_data20k_interleaved_llada_variant_c.yaml`.
