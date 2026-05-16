@@ -148,33 +148,61 @@ def main() -> None:
                          "containing it is written. Keeps peak disk at "
                          "~(cache + one shard) instead of ~2x. Safe to "
                          "interrupt — sources are only dropped post-save.")
+    ap.add_argument("--merge_manifest", action="store_true",
+                    help="merge with the existing shards_manifest.json "
+                         "instead of overwriting it. Only the splits being "
+                         "repacked have their records replaced; other "
+                         "splits' records carry through. Use when "
+                         "re-packing one split (e.g. test) without "
+                         "wanting to wipe records for splits packed in "
+                         "an earlier run.")
     args = ap.parse_args()
 
     cache_root = args.cache_root.resolve()
     if not cache_root.exists():
         raise FileNotFoundError(f"--cache_root {cache_root} does not exist")
 
+    splits_to_repack = [s.strip() for s in args.splits.split(",") if s.strip()]
+
     all_records: list[dict] = []
-    for split in args.splits.split(","):
-        split = split.strip()
-        if not split:
-            continue
+    for split in splits_to_repack:
         all_records.extend(repack_split(
             cache_root, split, args.shard_size, args.output_subdir,
             rm_source=args.rm_source,
         ))
 
     manifest_path = cache_root / "shards_manifest.json"
-    manifest = {
-        "shard_size":     args.shard_size,
-        "output_subdir":  args.output_subdir,
-        "schema_version": S.SCHEMA_VERSION,
-        "shards":         all_records,
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"[repack] manifest: {manifest_path}")
-    print(f"[repack] done. {len(all_records)} shards across "
-          f"{len(set(r['split'] for r in all_records))} splits.")
+    if args.merge_manifest and manifest_path.exists():
+        existing = json.loads(manifest_path.read_text())
+        existing_shards = existing.get("shards", [])
+        kept = [r for r in existing_shards if r["split"] not in splits_to_repack]
+        dropped = len(existing_shards) - len(kept)
+        merged_shards = kept + all_records
+        manifest = {
+            "shard_size":     args.shard_size,
+            "output_subdir":  args.output_subdir,
+            "schema_version": S.SCHEMA_VERSION,
+            "shards":         merged_shards,
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        print(f"[repack] manifest: {manifest_path} (merge mode)")
+        print(f"[repack]   kept {len(kept)} record(s) from splits "
+              f"{sorted({r['split'] for r in kept})}; "
+              f"replaced {dropped} record(s) for splits "
+              f"{splits_to_repack}; added {len(all_records)} new record(s).")
+        print(f"[repack] done. {len(merged_shards)} shards across "
+              f"{len(set(r['split'] for r in merged_shards))} splits.")
+    else:
+        manifest = {
+            "shard_size":     args.shard_size,
+            "output_subdir":  args.output_subdir,
+            "schema_version": S.SCHEMA_VERSION,
+            "shards":         all_records,
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        print(f"[repack] manifest: {manifest_path}")
+        print(f"[repack] done. {len(all_records)} shards across "
+              f"{len(set(r['split'] for r in all_records))} splits.")
 
 
 if __name__ == "__main__":
