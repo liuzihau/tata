@@ -7,4 +7,4 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
-plot*
+plot*/
