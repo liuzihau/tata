@@ -1,0 +1,78 @@
+# M1.5-v2 — 10k BlockShardSampler ("sample") — legacy loader anchor.
+#
+# preload=false + shard mode + shard_sampler=block. Each batch is drawn
+# entirely from a single shard (~shard_size prompts), which the v1 3-way
+# comparison showed underperforms the InterleavedShardSampler. Included as
+# the v2 BlockShardSampler anchor — keeps the legacy loader path covered so
+# the v2 result set spans the same three loader strategies the v1 trio did
+# (preload+WRS, BlockShardSampler, InterleavedShardSampler).
+#
+# Expected: train/kl plateaus ~0.06–0.10 higher than the matched
+# interleaved run; val/kl ~0.04–0.05 worse. If the v2 gap closes (e.g.
+# from the smaller block-count / iter-count making single-shard batches
+# less correlated), that's an interesting v2-specific finding.
+
+run_name:          m1_5_v2_10k_sample_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada
+  fast_dllm_path:  null
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1_20k/llada                # SHARED v2 cache (thinned 6/4/32, test aligned)
+  manifest:        cache_v1_20k/llada/manifest.json
+  val_split:       test
+  shuffle_seed:    42
+  num_workers:     0
+  batch_size:      256
+  pin_memory:      false
+  preload:         false                             # shards + BlockShardSampler
+  shard_sampler:   block
+  samples_per_shard_visit: 512
+  mask_token_id:   126336
+  ref0_weight_multiplier: 3.0
+  train_max_prompts: 10000                           # first 10000 prompts of the 20k cache (by manifest order)
+
+model:
+  variant:         C
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2
+  d_ff_inner:      10944
+  dropout:         0.1
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.01
+  betas:           [0.9, 0.95]
+  warmup_steps:    500
+  max_steps:       20000
+  scheduler:       cosine
+  grad_clip:       1.0
+  precision:       bf16
+
+loss:
+  mse_space:       final_norm
+  lambda_mse:      1.0
+  lambda_kl:       1.0
+  lambda_conf:     1.0
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M1.5-v2-llada
+  log_every:       50
+  val_every:       500
+  gsm8k_every:     2000
+  gsm8k_subset:    50
+  gsm8k_per_pos_threshold: 0.80
+  bins_gap:        [1, 2, 3]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  keep_last:       3
+  out_dir:         ckpts/m1_5_v2_10k_sample_llada_variant_c

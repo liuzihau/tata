@@ -62,6 +62,7 @@ class TataDeltaDataset(Dataset):
         index_filter: Optional[Callable[[tuple], bool]] = None,
         preload: bool = True,
         shard_lru_max: Optional[int] = None,
+        max_prompts: Optional[int] = None,
     ):
         cache_root = Path(cache_root)
         self.cache_root    = cache_root
@@ -71,6 +72,14 @@ class TataDeltaDataset(Dataset):
         # keeps `active_shards` shards resident at once — the LRU must hold
         # all of them or it thrashes. `None` → `_SHARD_LRU_MAX` default.
         self._shard_lru_max_override = shard_lru_max
+        # Cap the number of prompts in `split` to the first `max_prompts`
+        # by load order (sorted sample paths in per-sample mode; manifest
+        # order in shard mode). Applied BEFORE shard loading so a 5k slice
+        # of a 20k cache only loads ~5k of shards into preload RAM.
+        # `None` (or 0) keeps the entire split.
+        self._max_prompts = (
+            int(max_prompts) if max_prompts and int(max_prompts) > 0 else None
+        )
 
         shards_manifest = cache_root / "shards_manifest.json"
         if shards_manifest.exists():
@@ -103,6 +112,8 @@ class TataDeltaDataset(Dataset):
                 f"No cached samples found at {cache_root}/{split}. "
                 f"Run collect_llada first."
             )
+        if self._max_prompts is not None:
+            sample_paths = sample_paths[: self._max_prompts]
         self.sample_paths = sample_paths
 
         # Pre-build the (sample, block, i_ref, i_target) flat index. We have
@@ -155,6 +166,15 @@ class TataDeltaDataset(Dataset):
             self.shard_paths.append(shard_path)
             for within in range(r["n_samples"]):
                 self.sample_locator.append((shard_local_idx, within))
+
+        # Cap to the first `max_prompts` prompts (by manifest order). Slicing
+        # `sample_locator` keeps `_get_shard()` from touching shards that
+        # carry only excluded prompts — preload RAM scales with the kept N,
+        # not the full split size. `shard_paths` is left intact because
+        # nothing else dereferences out-of-range shard indices once the
+        # iteration below skips them.
+        if self._max_prompts is not None:
+            self.sample_locator = self.sample_locator[: self._max_prompts]
 
         self._shard_cache: "OrderedDict[int, dict]" = OrderedDict()
         self._lru_max = (

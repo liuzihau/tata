@@ -446,10 +446,17 @@ def main() -> None:
         if (shard_sampler_kind == "interleaved" and not preload)
         else None
     )
+    # `data.train_max_prompts` (optional, default = full split) caps the
+    # train side to the first N prompts by load order, applied *before*
+    # shard loading so preload RAM scales with N rather than the full cache.
+    # Used by the v2 5k/10k/20k bracket runs to derive 5k / 10k / 20k train
+    # subsets from a single cache_v1_20k cache. Val stays full.
+    train_max_prompts = int(getattr(cfg.data, "train_max_prompts", 0))
     train_ds = TataDeltaDataset(
         cfg.data.cache_root, split="train",
         mask_token_id=cfg.data.mask_token_id, index_filter=train_filter,
         preload=preload, shard_lru_max=train_shard_lru,
+        max_prompts=train_max_prompts if train_max_prompts > 0 else None,
     )
     val_ds = TataDeltaDataset(
         cfg.data.cache_root, split=val_ds_split,
