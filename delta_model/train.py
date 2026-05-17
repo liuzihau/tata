@@ -566,6 +566,7 @@ def main() -> None:
         rope_theta=bb_cfg["rope_theta"],
         rms_eps=bb_cfg["rms_eps"],
         max_seq_len=bb_cfg["max_seq_len"],
+        detach_conf_features=bool(getattr(cfg.model, "detach_conf_features", False)),
     ).to(device, dtype=dtype)
 
     opt = torch.optim.AdamW(

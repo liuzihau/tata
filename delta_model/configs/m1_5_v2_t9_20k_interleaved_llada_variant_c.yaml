@@ -1,0 +1,107 @@
+# M1.5-v2 — T9 "tame the BCE overfit"
+#
+# Hypothesis: v2's GSM8K decay is driven by the conf head's BCE overfitting,
+# not by the delta head's KL overfitting. Evidence:
+#   • val/bce minima land at the same step where GSM8K peaks (10k cache:
+#     step 2k–3k; 20k cache: step 5k–8k) and val/bce then climbs ~10% even
+#     while val/kl keeps falling smoothly
+#   • a miscalibrated conf head misroutes commits at inference — false
+#     positives leak bad tokens, false negatives drive unneeded rollbacks
+#     (10k sweep showed both: hybrid acc 1.5–5% below vanilla AND mean
+#     rollbacks 22–39 per problem)
+#
+# Three layered changes from `m1_5_v2_20k_interleaved`:
+#
+#   1. (PRIMARY) `loss.lambda_conf: 1.0 → 0.3`
+#      BCE no longer dominates the loss budget after it has reached its
+#      useful floor. Goal: val/bce stays near its minimum (~0.45) instead
+#      of climbing 10% above it.
+#
+#   2. `model.detach_conf_features: false → true`
+#      ConfHeadPerPos reads `feats.detach()` so BCE gradient only trains
+#      itself — it can no longer push the shared trunk in a direction
+#      that hurts the delta-head representation. (Implemented in
+#      `variant_c.py`; backwards-compatible default = false.)
+#
+#   3. Slightly stronger general regularization + earlier first GSM8K
+#      sampling so we can lock the peak in real time:
+#         model.dropout       0.10 → 0.20
+#         optim.weight_decay  0.01 → 0.03
+#         log.gsm8k_every     2000 → 500   (peak is sharp)
+#         optim.max_steps    20000 → 12000 (peak consistently before 10k)
+#
+# Secondary: data.ref0_weight_multiplier 3.0 → 1.5. Under v2's natural
+# 67% ref0 baseline (4 iters/block + early termination), mult=3 pushes
+# P(ref0)≈0.86 — overshoots typical inference rates AND starves gap-2/3
+# pairs (where val/mse_by_gap_3 is 2.3× val/mse_by_gap_1). 1.5 → ~75%
+# P(ref0), still inference-aligned, gives more gradient to harder pairs.
+#
+# Inference default: `log.gsm8k_per_pos_threshold: 0.80 → 0.75`. If the
+# calibration fix lands, the conf head will be more trustworthy → lower
+# threshold should help. Worth re-sweeping fully via run_v2_sweeps.sh
+# regardless.
+
+run_name:          m1_5_v2_t9_20k_interleaved_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada
+  fast_dllm_path:  null
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1_20k/llada                # SHARED v2 cache (thinned 6/4/32, test aligned)
+  manifest:        cache_v1_20k/llada/manifest.json
+  val_split:       test
+  shuffle_seed:    42
+  num_workers:     0
+  batch_size:      256
+  pin_memory:      false
+  preload:         false
+  shard_sampler:   interleaved
+  active_shards:   8
+  mask_token_id:   126336
+  ref0_weight_multiplier: 1.5                        # 3.0 → 1.5 (T9 secondary)
+
+model:
+  variant:         C
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2
+  d_ff_inner:      10944
+  dropout:         0.20                              # 0.10 → 0.20 (T9)
+  detach_conf_features: true                         # NEW (T9 primary)
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.03                              # 0.01 → 0.03 (T9)
+  betas:           [0.9, 0.95]
+  warmup_steps:    300                               # 500 → 300 (proportional to shorter max_steps)
+  max_steps:       12000                             # 20000 → 12000 (peak consistently before 10k)
+  scheduler:       cosine
+  grad_clip:       1.0
+  precision:       bf16
+
+loss:
+  mse_space:       final_norm
+  lambda_mse:      1.0
+  lambda_kl:       1.0
+  lambda_conf:     0.3                               # 1.0 → 0.3 (T9 primary)
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M1.5-v2-t9-llada
+  log_every:       50
+  val_every:       500
+  gsm8k_every:     500                               # 2000 → 500 (lock the peak)
+  gsm8k_subset:    50
+  gsm8k_per_pos_threshold: 0.75                      # 0.80 → 0.75 (trust the better-calibrated conf head)
+  bins_gap:        [1, 2, 3]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  keep_last:       3
+  out_dir:         ckpts/m1_5_v2_t9_20k_interleaved_llada_variant_c

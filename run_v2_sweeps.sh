@@ -44,6 +44,11 @@ RUNS=(
   # 20k_preload may not have a checkpoint if training OOM'd at startup —
   # find_ckpt logs FAIL and moves on, which is fine.
   "20k_preload:m1_5_v2_20k_preload_llada_variant_c"
+  # T9 — BCE-tame trial. Same cache + sampler as 20k_interleaved, plus
+  # detached conf head + lambda_conf=0.3 etc. Skip with
+  #   SKIP="t9_20k_interleaved" ./run_v2_sweeps.sh
+  # if the training hasn't finished yet.
+  "t9_20k_interleaved:m1_5_v2_t9_20k_interleaved_llada_variant_c"
 )
 
 SKIP="${SKIP:-}"

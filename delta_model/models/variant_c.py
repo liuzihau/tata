@@ -234,11 +234,19 @@ class VariantC(nn.Module):
         rope_theta: float = 1e6,
         rms_eps:    float = 1e-5,
         max_seq_len: int = 16384,
+        detach_conf_features: bool = False,
     ):
         super().__init__()
         self.d_model      = d_model
         self.block_length = S.BLOCK_LENGTH
         self.n_heads      = n_heads
+        # When True, the conf head reads `feats.detach()` so BCE gradient
+        # doesn't reach the shared trunk / delta head. Lets BCE only train
+        # ConfHeadPerPos itself — keeps the delta-head representation
+        # uncontaminated when BCE starts to overfit (the v2 finding:
+        # val/bce minimum at step ~5k–8k, then rises while val/kl keeps
+        # falling; the rise tracks the GSM8K decay 1-for-1).
+        self.detach_conf_features = bool(detach_conf_features)
         head_dim          = d_model // n_heads
         # SwiGLU param budget ≈ matches a GELU MLP at 4·d_model when
         # d_ff_inner ≈ 8/3·d_model. Caller can override.
@@ -320,5 +328,6 @@ class VariantC(nn.Module):
 
         feats   = x[:, BL:, :]                                        # prev_emb half
         delta_h = self.delta_head(feats)                              # [B, BL, D]
-        c_pos   = self.conf_head_per_pos(feats)                        # [B, BL] ∈ (0, 1)
+        conf_in = feats.detach() if self.detach_conf_features else feats
+        c_pos   = self.conf_head_per_pos(conf_in)                      # [B, BL] ∈ (0, 1)
         return delta_h, c_pos
