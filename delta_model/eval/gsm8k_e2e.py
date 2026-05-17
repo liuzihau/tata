@@ -144,9 +144,21 @@ def run_gsm8k_eval(
     hits_hybrid = hits_vanilla = 0
     rollbacks: list[int] = []
     backbone_calls: list[int] = []
+    vanilla_backbone_calls: list[int] = []
+    delta_forwards: list[int] = []
+    disagreements:  list[int] = []
+    rollback_rates: list[float] = []          # disagreements / delta_forwards, per problem
     revealed_at_finish: list[float] = []     # block_length = fully decoded
     n_blocks_finished:  list[int]  = []      # of NUM_BLOCKS blocks per problem
     t_hybrid = t_vanilla = 0.0
+
+    # Counter for vanilla backbone forwards. Registered on the top-level
+    # `backbone_model` only for the duration of the vanilla call below — so
+    # hybrid forwards (which already self-report via stats["backbone_forwards"])
+    # are NOT double-counted here.
+    _van_counter = {"n": 0}
+    def _van_count_hook(module, inputs):
+        _van_counter["n"] += 1
 
     pbar = tqdm(
         ds, desc=f"gsm8k thr={per_pos_threshold:.2f}",
@@ -173,6 +185,17 @@ def run_gsm8k_eval(
         hits_hybrid += int(pred_h is not None and pred_h == gold_num)
         rollbacks.append(stats["rollbacks"])
         backbone_calls.append(stats["backbone_forwards"])
+        # Delta-pass disagreement rate. `disagreements` is the count of delta
+        # passes where Fast-dLLM wanted more tokens than the per-pos confidence
+        # gate let through (and hence forced a rollback on the next pass).
+        # rollback_rate = disagreements / delta_forwards is the per-pass
+        # probability that the small model's commit set got vetoed at ≥ 1
+        # position — independent of how many backbone forwards that triggered.
+        n_dlt = int(stats.get("delta_forwards", 0))
+        n_dis = int(stats.get("disagreements", 0))
+        delta_forwards.append(n_dlt)
+        disagreements.append(n_dis)
+        rollback_rates.append(n_dis / n_dlt if n_dlt > 0 else 0.0)
         # Cascading-failure diagnostic — mean revealed positions per block
         # (= S.BLOCK_LENGTH iff every block finished cleanly).
         revealed = stats.get("per_block_revealed_at_finish", [])
@@ -182,15 +205,23 @@ def run_gsm8k_eval(
                 int(sum(1 for r in revealed if r == S.BLOCK_LENGTH))
             )
 
-        # Vanilla run.
+        # Vanilla run. Hook is registered only here so hybrid forwards
+        # (counted by hybrid_runner via stats["backbone_forwards"]) are not
+        # double-counted into the vanilla column.
+        _van_counter["n"] = 0
+        _van_handle = backbone_model.register_forward_pre_hook(_van_count_hook)
         t0 = time.time()
-        out_v = _vanilla_prefix_cache_generate(
-            backbone_model, prompt_ids,
-            gen_length=S.GEN_LENGTH, block_length=S.BLOCK_LENGTH,
-            threshold=threshold, factor=factor,
-            mask_id=S.LLADA_MASK_TOKEN_ID,
-        )
+        try:
+            out_v = _vanilla_prefix_cache_generate(
+                backbone_model, prompt_ids,
+                gen_length=S.GEN_LENGTH, block_length=S.BLOCK_LENGTH,
+                threshold=threshold, factor=factor,
+                mask_id=S.LLADA_MASK_TOKEN_ID,
+            )
+        finally:
+            _van_handle.remove()
         t_vanilla += time.time() - t0
+        vanilla_backbone_calls.append(_van_counter["n"])
         gen_text_v = tokenizer.decode(
             out_v[0, prompt_ids.shape[1]:].tolist(), skip_special_tokens=True,
         )
@@ -207,6 +238,9 @@ def run_gsm8k_eval(
             "x":     f"{t_vanilla / max(1e-6, t_hybrid):.2f}",
             "acc_h": f"{hits_hybrid / done:.2f}",
             "acc_v": f"{hits_vanilla / done:.2f}",
+            "bb_h":  f"{np.mean(backbone_calls):.1f}",
+            "bb_v":  f"{np.mean(vanilla_backbone_calls):.1f}",
+            "rb%":   f"{100 * np.mean(rollback_rates):.0f}",
         }, refresh=False)
 
     n = len(ds)
@@ -216,10 +250,19 @@ def run_gsm8k_eval(
         "accuracy_vanilla":      hits_vanilla / n,
         "accuracy_delta":        (hits_hybrid - hits_vanilla) / n,
         "speedup_ratio":         (t_vanilla / max(1e-6, t_hybrid)),
-        "mean_rollbacks":        float(np.mean(rollbacks)),
-        "mean_backbone_calls":   float(np.mean(backbone_calls)),
-        "per_pos_threshold":     per_pos_threshold,
-        "inner_loop_max_iter":   inner_loop_max_iter,
+        "mean_rollbacks":             float(np.mean(rollbacks)),
+        "mean_backbone_calls":        float(np.mean(backbone_calls)),
+        "mean_vanilla_backbone_calls": float(np.mean(vanilla_backbone_calls)),
+        "mean_delta_forwards":        float(np.mean(delta_forwards)),
+        "mean_disagreements":         float(np.mean(disagreements)),
+        # Per-problem rollback rate averaged across problems (NOT
+        # sum(disagreements) / sum(delta_forwards), which would over-weight
+        # problems with more delta passes). Bounded in [0, 1]; high values
+        # mean the per-pos confidence gate is vetoing most delta-pass
+        # commits — the small model isn't being trusted on this slice.
+        "rollback_rate":              float(np.mean(rollback_rates)),
+        "per_pos_threshold":          per_pos_threshold,
+        "inner_loop_max_iter":        inner_loop_max_iter,
     }
     if revealed_at_finish:
         # Diagnostic for the cascading-failure mode (mass at block_length =
