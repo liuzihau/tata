@@ -28,6 +28,10 @@ RUNS=(
   "10k_sample:m1_5_v2_10k_sample_llada_variant_c.yaml"
   "10k_interleaved:m1_5_v2_10k_interleaved_llada_variant_c.yaml"
   "20k_interleaved:m1_5_v2_20k_interleaved_llada_variant_c.yaml"
+  "20k_sample:m1_5_v2_20k_sample_llada_variant_c.yaml"
+  # 20k_preload is risky (~180 GiB resident) — placed last so an OOM here
+  # doesn't wipe out earlier runs that have already finished.
+  "20k_preload:m1_5_v2_20k_preload_llada_variant_c.yaml"
 )
 
 SKIP="${SKIP:-}"
