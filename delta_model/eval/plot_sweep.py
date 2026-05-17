@@ -152,13 +152,12 @@ def main() -> None:
                             xytext=(6, 5), fontsize=8, color=c)
 
     xlo, xhi = max(0.0, min(all_spd) - 0.1), max(all_spd) * 1.25
-    # Y-axis zooms to the actual accuracy range. min*0.9 floor with a
-    # safety net so vanilla baseline + a small headroom above the max
-    # point are always visible. Was: ylo=-0.03 which squashed all points
-    # near the top of the panel when overlaying multiple sweeps.
+    # Y-axis zooms tight: 0.9× min .. 1.2× max. User-tuned to spread
+    # overlapping sweeps. Was −0.03 floor (way too low — squashed
+    # everything into the top third).
     min_acc, max_acc = min(all_acc), max(all_acc)
     ylo = max(0.0, min(min_acc, van) * 0.9)
-    yhi = max(max_acc, van) + max(0.02, (max_acc - ylo) * 0.10)
+    yhi = max(max_acc, van) * 1.2
     ax_par.set_xlim(xlo, xhi)
     ax_par.set_ylim(ylo, yhi)
     ax_par.axhline(van, ls="--", color=BASE_COLOR, lw=1)
@@ -219,12 +218,17 @@ def main() -> None:
                 transform=ax_acc.transAxes, va="top", ha="right",
                 fontsize=8, color=BASE_COLOR)
 
-    # Accuracy axis: zoom to the actual range with 10% headroom. min*0.9
-    # floor matches the Pareto panel so vertical comparisons across the
-    # two are meaningful. Clamp ticks above 1.0 since accuracy ≤ 1.
+    # Accuracy axis: floor at 0.9× min, ceiling sized so the tallest bar
+    # reaches ~60% of the panel height (40% headroom above for the legend).
+    # Solves the "legend covers the bars" issue when multiple sweeps are
+    # overlaid. Algebra: bar_top / panel_height = 0.60
+    #   → acc_hi = acc_lo + (max_acc - acc_lo) / 0.60
+    BAR_FILL_FRAC = 0.60
     acc_lo = max(0.0, min(min_acc, van) * 0.9)
-    acc_hi = min(1.0, max(max_acc, van) + max(0.02, (max_acc - acc_lo) * 0.10))
+    acc_hi = acc_lo + (max(max_acc, van) - acc_lo) / BAR_FILL_FRAC
     ax_acc.set_ylim(acc_lo, acc_hi)
+    # Hide any tick above 1.0 — accuracy is bounded but the 60% rule can
+    # push the panel ceiling above 1 when bars are already high.
     ax_acc.yaxis.set_major_formatter(FuncFormatter(
         lambda v, _pos: "" if v > 1.0 + 1e-9 else f"{v:.2f}"
     ))

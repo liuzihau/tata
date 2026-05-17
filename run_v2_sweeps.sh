@@ -164,14 +164,44 @@ done
 total=$((SECONDS - start_all))
 echo "[sweep] all done. ran=$n_ran skipped=$n_skipped failed=$n_failed  total=${total}s"
 
-# --- optional overlay plot of all sweeps that ran --------------------------
+# --- overlay plots: split by data size to keep each plot readable ---------
+#
+# A single 7-file overlay (5k + 3×10k + 3×20k) crowds the bars + legend.
+# Splitting by data size gives two ≤3-file plots that are directly
+# comparable: the 10k bracket vs the 20k bracket, same recipe each.
 
-if [[ ${#ran_jsons[@]} -ge 1 ]]; then
-  overlay_png="$OUT_DIR/v2_sweeps_overlay.png"
-  echo "[sweep] overlay plot → $overlay_png"
-  if ! python -m delta_model.eval.plot_sweep "${ran_jsons[@]}" --out "$overlay_png"; then
-    echo "[sweep] overlay plot failed (non-fatal)." >&2
-  fi
+jsons_10k=()
+jsons_20k=()
+jsons_other=()
+for j in "${ran_jsons[@]}"; do
+  case "$(basename "$j")" in
+    10k_*) jsons_10k+=("$j") ;;
+    20k_*) jsons_20k+=("$j") ;;
+    *)     jsons_other+=("$j") ;;   # e.g. 5k_preload_sweep.json
+  esac
+done
+
+if [[ ${#jsons_10k[@]} -ge 1 ]]; then
+  out_png="$OUT_DIR/v2_10k_sweeps_overlay.png"
+  echo "[sweep] overlay (10k) → $out_png  (${#jsons_10k[@]} file(s))"
+  python -m delta_model.eval.plot_sweep "${jsons_10k[@]}" --out "$out_png" \
+      || echo "[sweep] overlay (10k) failed (non-fatal)." >&2
 fi
+
+if [[ ${#jsons_20k[@]} -ge 1 ]]; then
+  out_png="$OUT_DIR/v2_20k_sweeps_overlay.png"
+  echo "[sweep] overlay (20k) → $out_png  (${#jsons_20k[@]} file(s))"
+  python -m delta_model.eval.plot_sweep "${jsons_20k[@]}" --out "$out_png" \
+      || echo "[sweep] overlay (20k) failed (non-fatal)." >&2
+fi
+
+# Anchor runs (5k_preload, etc.) get a single-file plot each.
+for j in "${jsons_other[@]}"; do
+  short=$(basename "$j" _sweep.json)
+  out_png="$OUT_DIR/v2_${short}_sweep.png"
+  echo "[sweep] single   → $out_png"
+  python -m delta_model.eval.plot_sweep "$j" --out "$out_png" \
+      || echo "[sweep] single plot for ${short} failed (non-fatal)." >&2
+done
 
 [[ $n_failed -gt 0 ]] && exit 1 || exit 0
