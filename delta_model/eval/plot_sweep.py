@@ -2,20 +2,30 @@
 
 `gsm8k_e2e.py --out_json ...` writes a JSON list, one dict per
 `per_pos_threshold`, with accuracy / speedup / rollback fields. This
-script turns one (or more) of those files into a 3-panel figure:
+script turns one (or more) of those files into a 2×2 figure:
 
-  1. Accuracy–speed tradeoff — `accuracy_hybrid` vs `speedup_ratio`, one
-     threshold-ordered polyline. The shaded top-right "win zone" (faster
-     than vanilla AND at least as accurate) is the headline: if no point
-     lands in it, there is no good operating point.
-  2. Accuracy & speedup vs threshold — dual axis: `accuracy_hybrid` as
-     black-edged yellow bars (left), `speedup_ratio` as a thick blue line
-     (right, linear). The left axis carries a dashed vanilla-accuracy
-     reference; the speedup axis needs none (1.0x is trivial). Every
-     point is text-labelled (`+2.5%`, `1.07x`) so the twin axes can't
-     mislead — the reader always has the exact numbers.
-  3. Rollback cost vs threshold — `mean_rollbacks` as bars; the mechanism
-     behind the speedup collapse.
+  ┌─────────────────────────────┬──────────────────────────────┐
+  │  (0,0) Accuracy–speed       │  (0,1) Accuracy vs threshold │
+  │        tradeoff (Pareto)    │        — bars, one per file  │
+  ├─────────────────────────────┼──────────────────────────────┤
+  │  (1,0) Speedup vs threshold │  (1,1) Rollback cost         │
+  │        — line, one per file │        vs threshold — bars   │
+  └─────────────────────────────┴──────────────────────────────┘
+
+Pareto (top-left): one threshold-ordered polyline per file. The Y axis
+zooms to the actual accuracy range (`min*0.9` floor) so overlapping
+sweeps stay distinguishable. Vanilla-accuracy and 1.0x-speedup
+references are dashed lines.
+
+Accuracy panel (top-right): grouped bars per threshold. Each bar
+text-labelled with `accuracy_delta` (`+2.5%` etc.) so the reader gets
+the exact hybrid-vs-vanilla gap independent of axis scale.
+
+Speedup panel (bottom-left): line+marker per file, text-labelled with
+the absolute ratio (`1.07x`). A dashed 1.0x reference marks parity.
+
+Rollback panel (bottom-right): mean rollbacks per problem per
+threshold — the mechanism behind the speedup collapse.
 
 Pass several sweep JSONs to overlay them (grouped bars + one polyline
 per file, one colour per file).
@@ -118,10 +128,14 @@ def main() -> None:
     BASE_COLOR = "#555555"   # accuracy baseline reference line
     RB_COLOR   = "#7d6db3"   # rollback bars
 
-    fig, (ax_par, ax_mid, ax_rb) = plt.subplots(1, 3, figsize=(17, 4.8))
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    ax_par = axes[0, 0]   # accuracy–speed Pareto
+    ax_acc = axes[0, 1]   # accuracy bars vs threshold
+    ax_spd = axes[1, 0]   # speedup line vs threshold
+    ax_rb  = axes[1, 1]   # rollback bars vs threshold
 
     # ===================================================================
-    # Panel 1 — accuracy–speed tradeoff
+    # Panel (0,0) — accuracy–speed Pareto
     # ===================================================================
     all_spd, all_acc = [], []
     for lab, rows in sweeps.items():
@@ -138,19 +152,26 @@ def main() -> None:
                             xytext=(6, 5), fontsize=8, color=c)
 
     xlo, xhi = max(0.0, min(all_spd) - 0.1), max(all_spd) * 1.25
-    ylo, yhi = -0.03, max(0.85, max(all_acc) * 1.12)
+    # Y-axis zooms to the actual accuracy range. min*0.9 floor with a
+    # safety net so vanilla baseline + a small headroom above the max
+    # point are always visible. Was: ylo=-0.03 which squashed all points
+    # near the top of the panel when overlaying multiple sweeps.
+    min_acc, max_acc = min(all_acc), max(all_acc)
+    ylo = max(0.0, min(min_acc, van) * 0.9)
+    yhi = max(max_acc, van) + max(0.02, (max_acc - ylo) * 0.10)
     ax_par.set_xlim(xlo, xhi)
     ax_par.set_ylim(ylo, yhi)
     ax_par.axhline(van, ls="--", color=BASE_COLOR, lw=1)
     ax_par.axvline(1.0, ls="--", color=BASE_COLOR, lw=1)
     if xhi > 1.0 and van < yhi:
+        # Shaded "win zone" (faster than vanilla AND ≥ vanilla accuracy).
+        # The in-plot text label was removed — it overlapped data points
+        # when sweeps were overlaid. The shading + the dashed reference
+        # lines already encode the meaning unambiguously.
         ax_par.add_patch(Rectangle(
             (1.0, van), xhi - 1.0, yhi - van,
             facecolor="tab:green", alpha=0.10, edgecolor="none", zorder=0,
         ))
-        ax_par.text(1.0 + (xhi - 1.0) * 0.5, (van + yhi) / 2,
-                    "win zone\nfaster & ≥ vanilla", rotation=90,
-                    ha="center", va="center", fontsize=7.5, color="#3a7a3a")
     ax_par.text(xlo, van, f" vanilla {van:.3f}", va="bottom", ha="left",
                 fontsize=8, color=BASE_COLOR)
     ax_par.set_xlabel("speedup ratio  (vanilla walltime / hybrid)")
@@ -179,11 +200,8 @@ def main() -> None:
             yield xs, np.array(_col(rows, key)), lab, file_color[lab]
 
     # ===================================================================
-    # Panel 2 — accuracy (bars) + speedup (line), dual axis
+    # Panel (0,1) — accuracy bars vs threshold
     # ===================================================================
-    ax_acc = ax_mid
-    ax_spd = ax_mid.twinx()
-
     for xs, acc, lab, fc in _grouped("accuracy_hybrid"):
         dlt = _col(sweeps[lab], "accuracy_delta")
         # All accuracy bars share the yellow; multi-file falls back to the
@@ -196,47 +214,56 @@ def main() -> None:
             ax_acc.annotate(f"{d * 100:+.1f}%", (xi, a),
                             textcoords="offset points", xytext=(0, 3),
                             ha="center", fontsize=7.5)
-    for xs, spd, lab, fc in _grouped("speedup_ratio"):
-        lc = fc if multi else SPD_COLOR
-        ax_spd.plot(xs, spd, "-o", color=lc, ms=6, lw=2.6, zorder=4)
-        for xi, s in zip(xs, spd):
-            ax_spd.annotate(f"{s:.2f}x", (xi, s), textcoords="offset points",
-                            xytext=(0, 7), ha="center", fontsize=7.5, color=lc)
-
-    # The accuracy axis keeps a dashed vanilla-baseline reference, labelled
-    # at the top-right of the plot region. The speedup axis gets none —
-    # 1.0x is trivial and every point is text-labelled with its exact ratio.
     ax_acc.axhline(van, ls="--", color=BASE_COLOR, lw=1)
     ax_acc.text(0.98, 0.97, f"vanilla accuracy {van:.2f}",
                 transform=ax_acc.transAxes, va="top", ha="right",
                 fontsize=8, color=BASE_COLOR)
 
-    # Accuracy axis: 0.7x the smallest bar .. 1.3x the tallest, so the
-    # speedup line has headroom above the bars. Accuracy can't exceed 1.0,
-    # so blank any tick label above it. (NOTE: a non-zero bottom truncates
-    # the bars — harmless here since min accuracy ≈ 0, but if a future
-    # sweep has a high worst-case accuracy, clamp the bottom to 0.)
-    min_acc, max_acc = min(all_acc), max(all_acc)
-    ax_acc.set_ylim(0.7 * min_acc, 1.5 * max_acc)
+    # Accuracy axis: zoom to the actual range with 10% headroom. min*0.9
+    # floor matches the Pareto panel so vertical comparisons across the
+    # two are meaningful. Clamp ticks above 1.0 since accuracy ≤ 1.
+    acc_lo = max(0.0, min(min_acc, van) * 0.9)
+    acc_hi = min(1.0, max(max_acc, van) + max(0.02, (max_acc - acc_lo) * 0.10))
+    ax_acc.set_ylim(acc_lo, acc_hi)
     ax_acc.yaxis.set_major_formatter(FuncFormatter(
         lambda v, _pos: "" if v > 1.0 + 1e-9 else f"{v:.2f}"
     ))
-    # Speedup axis: 0 .. at least 1.2x the fastest point.
-    ax_spd.set_ylim(0, max(all_spd) * 1.2)
-
     ax_acc.set_xticks(x)
     ax_acc.set_xticklabels([f"{t:g}" for t in thr_all])
     ax_acc.set_xlabel("per_pos_threshold")
-    ax_acc.set_ylabel("accuracy (hybrid)  —  bars")
-    # Both y-axes stay black; only the plotted line is blue.
-    ax_spd.set_ylabel("speedup ratio  —  line")
-    ax_acc.set_title("Accuracy & speedup vs threshold", fontsize=10)
+    ax_acc.set_ylabel("accuracy (hybrid)")
+    ax_acc.set_title("Accuracy vs threshold", fontsize=10)
     ax_acc.grid(alpha=0.25, axis="y")
     if multi:
         ax_acc.legend(fontsize=7, loc="upper right")
 
     # ===================================================================
-    # Panel 3 — rollback cost vs threshold
+    # Panel (1,0) — speedup line vs threshold (split from accuracy panel)
+    # ===================================================================
+    for xs, spd, lab, fc in _grouped("speedup_ratio"):
+        lc = fc if multi else SPD_COLOR
+        ax_spd.plot(xs, spd, "-o", color=lc, ms=6, lw=2.6, zorder=4,
+                    label=lab if multi else None)
+        for xi, s in zip(xs, spd):
+            ax_spd.annotate(f"{s:.2f}x", (xi, s), textcoords="offset points",
+                            xytext=(0, 7), ha="center", fontsize=7.5, color=lc)
+    # 1.0x reference: anything below this line is slower than vanilla.
+    ax_spd.axhline(1.0, ls="--", color=BASE_COLOR, lw=1)
+    ax_spd.text(0.98, 0.04, "1.0x = vanilla",
+                transform=ax_spd.transAxes, va="bottom", ha="right",
+                fontsize=8, color=BASE_COLOR)
+    ax_spd.set_xticks(x)
+    ax_spd.set_xticklabels([f"{t:g}" for t in thr_all])
+    ax_spd.set_xlabel("per_pos_threshold")
+    ax_spd.set_ylabel("speedup ratio  (vanilla walltime / hybrid)")
+    ax_spd.set_ylim(0, max(all_spd) * 1.2)
+    ax_spd.set_title("Speedup vs threshold", fontsize=10)
+    ax_spd.grid(alpha=0.25, axis="y")
+    if multi:
+        ax_spd.legend(fontsize=7, loc="upper right")
+
+    # ===================================================================
+    # Panel (1,1) — rollback cost vs threshold
     # ===================================================================
     max_rb = 0.0
     for xs, rb, lab, fc in _grouped("mean_rollbacks"):
