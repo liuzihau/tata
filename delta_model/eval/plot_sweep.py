@@ -205,9 +205,11 @@ def main() -> None:
         dlt = _col(sweeps[lab], "accuracy_delta")
         # All accuracy bars share the yellow; multi-file falls back to the
         # per-file colour only so overlaid sweeps stay distinguishable.
+        # Thinner edge stroke (0.8 vs 2) so bars read as one unit instead
+        # of dominated by their borders when multiple sweeps are overlaid.
         colors = fc if multi else BAR_COLOR
         ax_acc.bar(xs, acc, width=bar_w * 0.92, color=colors,
-                   edgecolor="black", linewidth=2, zorder=2,
+                   edgecolor="black", linewidth=0.8, zorder=2,
                    label=lab if multi else None)
         for xi, a, d in zip(xs, acc, dlt):
             ax_acc.annotate(f"{d * 100:+.1f}%", (xi, a),
@@ -244,8 +246,15 @@ def main() -> None:
     # ===================================================================
     # Panel (1,0) — speedup line vs threshold (split from accuracy panel)
     # ===================================================================
-    for xs, spd, lab, fc in _grouped("speedup_ratio"):
-        lc = fc if multi else SPD_COLOR
+    # Use raw threshold-index positions (NOT _grouped's per-file x-offset)
+    # so every file plots at the same x per threshold. Lines, unlike bars,
+    # don't visually collide — they're easier to compare on top of each
+    # other than side-by-side.
+    for lab, rows in sweeps.items():
+        lc = file_color[lab] if multi else SPD_COLOR
+        xs = np.array([thr_pos[t] for t in _col(rows, "per_pos_threshold")],
+                      dtype=float)
+        spd = np.array(_col(rows, "speedup_ratio"))
         ax_spd.plot(xs, spd, "-o", color=lc, ms=6, lw=2.6, zorder=4,
                     label=lab if multi else None)
         for xi, s in zip(xs, spd):
@@ -260,7 +269,10 @@ def main() -> None:
     ax_spd.set_xticklabels([f"{t:g}" for t in thr_all])
     ax_spd.set_xlabel("per_pos_threshold")
     ax_spd.set_ylabel("speedup ratio  (vanilla walltime / hybrid)")
-    ax_spd.set_ylim(0, max(all_spd) * 1.2)
+    # Zoom: min*0.9 .. max*1.2 (same convention as the Pareto panel).
+    # Was: ylim(0, max*1.2) — too much wasted space at the bottom when all
+    # sweeps cluster near vanilla (~1.0–1.3x).
+    ax_spd.set_ylim(min(all_spd) * 0.9, max(all_spd) * 1.2)
     ax_spd.set_title("Speedup vs threshold", fontsize=10)
     ax_spd.grid(alpha=0.25, axis="y")
     if multi:
