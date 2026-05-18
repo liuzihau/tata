@@ -1,4 +1,9 @@
-# tata — intra-block delta model for masked-diffusion LMs
+# tata — Think-Anchored Talk Adapter
+
+> **tata** — *Think-Anchored Talk Adapter*: a lightweight 2-layer adapter
+> that predicts per-iteration hidden-state corrections for masked-diffusion
+> LMs (LLaDA-8B, Dream-7B), anchored to the backbone's first full forward
+> so errors can't compound across iterations.
 
 A research note in the style of an informal short paper. Audience: a
 reader who's never seen this project and wants to understand *why* it
