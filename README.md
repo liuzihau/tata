@@ -13,19 +13,18 @@ data collect  →  thin  →  repack  →  train  →  GSM8K sweep  →  plots
                           (or rebuild manifest)              ↘  interactive gen
 ```
 
-Prereqs (one-time):
+## Setup (one-time)
 
 ```bash
-pip install "torch>=2.4" transformers>=4.44 datasets h5py wandb pyyaml \
-            numpy huggingface_hub tqdm matplotlib
+pip install -r requirements.txt
 mkdir -p external && git clone https://github.com/NVlabs/Fast-dLLM external/Fast-dLLM
-wandb login            # before training
-huggingface-cli login  # before real collect (Nemotron is gated)
 ```
 
 All commands assume cwd = repo root (`tata/`). Fast-dLLM v1 is discovered
 via `--fast_dllm_path external/Fast-dLLM/v1` (CLI), `FAST_DLLM_V1_PATH`
-(env), or the default relative path.
+(env), or the default relative path. Auth (`wandb login`,
+`huggingface-cli login`) is covered in the Training section where each
+is actually needed.
 
 ---
 
@@ -35,8 +34,12 @@ via `--fast_dllm_path external/Fast-dLLM/v1` (CLI), `FAST_DLLM_V1_PATH`
 
 Runs LLaDA + Fast-dLLM in prefix-cache mode and writes one `.pt` per
 prompt with `h_per_pass`, `reveal_per_pass`, and a 64-slot prefix-KV.
+Nemotron Post-Training v2 is gated — `huggingface-cli login` once
+before the first collect:
 
 ```bash
+huggingface-cli login    # once per machine
+
 python -m delta_model.data.collect_llada \
     --n_train 20000 --n_test 800 \
     --output_root cache_v1_20k/llada \
@@ -83,9 +86,13 @@ python -m delta_model.data.rebuild_manifest --cache_root cache_v1_20k/llada
 
 ## 4. Train
 
-Single-line invocation:
+`wandb login` once before the first run — every training script logs to
+the `tata-delta-model` project there and also mirrors to a local
+`metrics.jsonl`.
 
 ```bash
+wandb login    # once per machine
+
 python -m delta_model.train \
     --config delta_model/configs/m1_5_v2_20k_interleaved_llada_variant_c.yaml \
     --override backbone.fast_dllm_path=external/Fast-dLLM/v1

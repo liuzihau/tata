@@ -1,0 +1,10 @@
+torch>=2.4
+transformers>=4.44
+datasets
+h5py
+wandb
+pyyaml
+numpy
+huggingface_hub
+tqdm
+matplotlib
