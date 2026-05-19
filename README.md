@@ -152,6 +152,26 @@ python -m delta_model.eval.plot_metrics \
 
 # Part 2 — Inference
 
+## Pre-trained checkpoints
+
+If you don't want to train from scratch, grab a ready-made checkpoint
+from:
+
+**[Google Drive — tata checkpoints](https://drive.google.com/drive/folders/1dfjqqIJ_IviwzJz77rWGMyu0OhkvnnZE?usp=sharing)**
+
+Drop the downloaded `.pt` into `ckpts/` (any subdirectory works — both
+the eval CLI and the ad-hoc snippet below take a path):
+
+```bash
+mkdir -p ckpts/tata_release
+# move/copy the downloaded file in, e.g.:
+mv ~/Downloads/best_gsm8k.pt ckpts/tata_release/best_gsm8k.pt
+```
+
+Then reference it directly in any inference command below
+(`--delta_ckpt ckpts/tata_release/best_gsm8k.pt`, or the same path in
+the Python snippet in §B).
+
 ## A. GSM8K end-to-end evaluation (the headline metric)
 
 Runs the hybrid (delta + Fast-dLLM) vs vanilla (Fast-dLLM only) on the
