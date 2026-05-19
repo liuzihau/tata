@@ -228,9 +228,25 @@ python -m delta_model.eval.plot_sweep \
 
 ## B. Generate text from a prompt (ad-hoc / interactive)
 
-The hybrid decoder is a library function — `generate_with_delta()` in
-`delta_model/inference/hybrid_runner.py`. No standalone CLI yet; the
-canonical 25-line wrapper is:
+A ready-made standalone script lives at `inference.py` in the repo
+root. It reads a question from stdin, decodes it twice — first through
+tata's hybrid (`generate_with_delta`), then through vanilla Fast-dLLM
+(`generate_with_prefix_cache`, same `factor` / mask) — and prints both
+outputs side-by-side with wall-time, backbone-forward counts, rollbacks,
+and the hybrid speedup ratio.
+
+```bash
+python inference.py
+# Override the defaults via env vars:
+DELTA_CKPT=ckpts/tata_release/best_val_kl_step7500.pt \
+PER_POS_THRESHOLD=0.75 FACTOR=1.0 \
+python inference.py
+```
+
+If you'd rather embed the call yourself, the underlying library
+function is `generate_with_delta()` in
+`delta_model/inference/hybrid_runner.py`. The minimum self-contained
+wrapper:
 
 ```python
 import torch
