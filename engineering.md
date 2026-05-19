@@ -10,10 +10,64 @@ For *how* to run anything, see `usage.md`.
 
 ---
 
-## Status snapshot (2026-05-15)
+## Status snapshot (2026-05-19)
 
-Current focus: **scale data to 30k under the disk budget.** Two
-load-bearing fixes landed and were verified end-to-end this week —
+Current focus: **after T9 confirmed the BCE-overfit hypothesis but
+didn't shift the speed-accuracy Pareto, test the capacity hypothesis
+via T10 (T9 recipe + n_layers 2 → 4) and the dynamic per-state
+threshold lookup.**
+
+### v2 bracket result (2026-05-18)
+
+v2 bracket (5k anchor + 10k×{preload,sample,interleaved} +
+20k×{preload,sample,interleaved}) replicated v1's findings on val/kl:
+data scaling works (10k → 20k drops val/kl ~0.015), interleaved
+matches preload at bounded RAM, BlockShardSampler still lags ~0.02.
+**But every GSM8K trace peaks at step 2k–8k and decays to 0.40–0.50
+by step 18k while val/kl keeps falling.** The val/bce minimum at
+every run lands within ~500 steps of the GSM8K peak — *the conf head
+is what gates commits, and its calibration drifts with overfit.*
+
+### T9 result (2026-05-18, BCE-tame)
+
+T9 = lambda_conf 1.0→0.3, `detach_conf_features=true`, dropout 0.20,
+wd 0.03, max_steps 12k, gsm8k_every 500, ref0_mult 1.5. Outcome:
+
+- **Calibration confirmed solved.** thr=0.90 hybrid acc 0.76 (+1.0%
+  vs vanilla 0.75) — first time any tata checkpoint cleanly beats
+  vanilla. The head correctly identifies "don't trust this delta
+  commit."
+- **Pareto did not shift.** At thr=0.85 (standard operating point):
+  acc 0.74 / speedup 1.07× / rollbacks 34 — essentially flat with
+  the 20k_interleaved baseline. The +1.0% at thr=0.90 is paid in
+  0.93× (slower) speedup; zero points in the win zone (faster AND
+  ≥ vanilla).
+- **The thr=0.70 cliff (acc 0.57, -18.0%) is informative.** When the
+  gate is wide open, the delta still commits enough bad tokens to
+  cascade. Calibration alone can route around bad commits at high
+  threshold; it can't make them good.
+
+Interpretation: calibration solved, **underlying Δh quality is the
+remaining bottleneck**.
+
+### Next: T10 + dynamic per-state threshold
+
+- **T10** (`m1_5_v2_t10_20k_interleaved_llada_variant_c.yaml`) — T9
+  recipe + `model.n_layers: 2 → 4`. Tests the capacity hypothesis.
+  ~2× T9's per-step compute (~6 h on the 20k cache).
+- **Dynamic threshold lookup** (`delta_model/inference/thr_lookup.py`,
+  landed 2026-05-19) — exploits the 2D `val/mse_by_gap_{g}_reveal_{rb}`
+  cells now logged by `run_val`. Easy cells (low gap, low reveal)
+  trust the delta more (lower threshold → more delta commits, fewer
+  rollbacks); hard cells trust it less. Composed into `gsm8k_e2e.py`
+  via `--use_thr_lookup <metrics.jsonl> --thr_lookup_brackets
+  "base:max,..."`. Cheap to run on any existing checkpoint that has
+  the 2D cells (T9 onward; older runs need a fresh val tick after
+  pulling the train.py edit).
+
+### Status (legacy notes, kept for context)
+
+Two load-bearing fixes landed and were verified end-to-end earlier —
 the shard-mode loader and the inference rollback semantics. Both
 unblock the data scaling direction:
 
@@ -345,10 +399,33 @@ Final RMSNorm before heads.
 - `ConfHead` (legacy, kept for back-compat) — pooled features → scalar.
 - `ConfHeadPerPos` (§3.2) — per-position features → `[B, BL]` sigmoid. Same MLP shape as `ConfHead` but no pooling. Current default.
 
-### 2.5 Open items in model
+### 2.5 `detach_conf_features` knob (T9; landed 2026-05-18)
+
+`VariantC.__init__(..., detach_conf_features: bool = False)`. When true:
+
+```python
+c_pos = self.conf_head_per_pos(feats.detach())
+```
+
+BCE gradient only trains `ConfHeadPerPos` itself — the shared
+transformer trunk and `DeltaHead` are insulated. Motivation: v2 plots
+showed `val/bce` overfit climbing in lockstep with the GSM8K decay
+(within ~500 steps); the BCE term was pushing the trunk in a direction
+that hurt downstream commits. Default false → all pre-T9 configs
+unchanged.
+
+### 2.6 `n_layers` (T10 lever)
+
+The architecture is otherwise unchanged from §2.1; only `n_layers`
+moves. At `n_layers = 2` (M1.5 / T9 default) the delta model has
+~500M params. T10's `n_layers = 4` doubles that to ~1B — ~2× the
+forward/backward compute per step. Tests the capacity hypothesis after
+T9 confirmed calibration alone doesn't shift the Pareto.
+
+### 2.7 Open items in model
 
 - **Variants A and B** (M2) — cross-attn anchor and AdaLN-Zero. Same input/output signature; only inner mixing differs.
-- **Multi-layer fusion** (M2) — EAGLE-3-style. Requires recollect with multi-layer hidden states.
+- **Multi-layer fusion** (T11; deferred) — EAGLE-3-style fusion of `{layer_8, layer_16, layer_24, layer_31}`. Requires recollect with multi-layer hidden states. Strongest single architectural lever per the DFlash comparison; runs after T10 if depth alone doesn't close the Pareto gap.
 
 ---
 
@@ -619,7 +696,18 @@ loss / bwd / opt / val`. Prints `[time]` line every `log_every` steps.
 CUDA-synced. After preload landed, `data` is typically <5%.
 
 `run_val` mirrors the train step but inside `@torch.no_grad()`, also
-bins `mse` by `(i_target − i_ref)` gap and by `reveal_frac`.
+bins `mse` by `(i_target − i_ref)` gap and by `reveal_frac`. As of
+2026-05-19, it additionally emits the **2-D cells**:
+
+```
+val/mse_by_gap_{g}_reveal_{rb}     # MSE per row (mse_space)
+val/n_by_gap_{g}_reveal_{rb}       # support count, for the calibrator
+```
+
+for every populated `(gap, reveal_bin)` pair. Disentangles the v2
+diagnostic confound: `mse_by_reveal_4` averaged over (gap=1, 2, 3)
+together; `mse_by_reveal_0` was gap=1 only. The 2-D cells feed the
+inference-time threshold lookup (§5.2).
 
 Mid-train GSM8K eval every `cfg.log.gsm8k_every` steps on a small
 subset (`cfg.log.gsm8k_subset` problems), with `per_pos_threshold`
@@ -735,6 +823,58 @@ iter ≥ 1:
 Stats: `rollbacks`, `backbone_forwards`, `delta_forwards`, `disagreements`,
 `per_block_passes`, `per_block_revealed_at_finish`, `walltime`.
 
+### 5.2 Dynamic per-state threshold lookup (2026-05-19)
+
+`per_pos_threshold` in `generate_with_delta()` accepts either:
+
+- a **float** (legacy behavior — one global gate)
+- a **callable** `(gap: int, reveal_frac: float) → float` — picks a
+  per-state threshold each delta pass
+
+The hybrid runner tracks `i_ref_step` (the pass at which the current
+`h_ref` was captured; resets on every rollback) and computes
+`gap = n_passes − i_ref_step`, `reveal_frac = mean(x[s:e] != mask_id)`
+right before the gate. If `per_pos_threshold` is callable, both are
+passed; else the float is used as-is.
+
+`delta_model/inference/thr_lookup.py` provides:
+
+- `ThresholdLookup(table, *, default, bins_reveal)` — the callable
+  itself. `table` is `dict[(int, int), float]`. Out-of-range gap
+  clamps to the highest-gap row available (biases toward rollbacks,
+  the safer direction).
+- `build_lookup_from_metrics(metrics, *, base_threshold, max_threshold,
+  min_support=32)` — reads `metrics.jsonl` (or a dict), pulls every
+  `val/mse_by_gap_{g}_reveal_{rb}` cell with support ≥ `min_support`,
+  normalizes MSE across populated cells to `[0, 1]`, and linearly
+  remaps to `[base_threshold, max_threshold]`. Easy cells get `base`,
+  hard cells get `max`. Cells absent in metrics fall back to
+  `(base + max) / 2`.
+
+End-to-end via the eval CLI:
+
+```bash
+python -m delta_model.eval.gsm8k_e2e \
+    --delta_ckpt ckpts/<run>/best_xxx.pt \
+    --fast_dllm_path external/Fast-dLLM/v1 \
+    --n_problems 200 \
+    --use_thr_lookup ckpts/<run>/metrics.jsonl \
+    --thr_lookup_brackets "0.65:0.95,0.70:0.95,0.65:0.90,0.70:0.90" \
+    --out_json eval_results/<run>_lookup_sweep.json
+```
+
+Each `(base, max)` bracket becomes one row in the output JSON. The
+`per_pos_threshold` field in each row is a descriptor string
+(`lookup(base=0.65,max=0.95)`), with additional fields
+`thr_mode=lookup`, `thr_lookup_base`, `thr_lookup_max`,
+`thr_lookup_metrics` for the calibrator's record.
+
+Calibration is intentionally simple (linear MSE remap). The
+principled replacement is to log
+`val/shared_mass_by_gap_{g}_reveal_{rb}` and pick the threshold per
+cell that targets a fixed false-commit rate. Cheap follow-up;
+parked until empirical evidence shows the lookup approach helps.
+
 ### 5.1 Agreement decoding + rollback semantics
 
 Block-aggregate confidence is a poor fit for Fast-dLLM's per-position
@@ -805,7 +945,9 @@ on the same GSM8K slice. Reports per-`per_pos_threshold`:
 - `accuracy_hybrid`, `accuracy_vanilla`, `accuracy_delta`
 - `speedup_ratio` (vanilla wall-time / hybrid wall-time)
 - `mean_rollbacks`, `mean_backbone_calls` per problem
-- `mean_disagreements` (§3.2) — proxy for how strict the per-pos gate is
+- `mean_vanilla_backbone_calls` per problem — comparable to `mean_backbone_calls`; their difference is the per-problem backbone-forward saving the delta produced
+- `mean_delta_forwards`, `mean_disagreements`
+- `rollback_rate` — per-problem `disagreements / delta_forwards`, averaged across problems
 
 Standalone CLI:
 ```
@@ -891,21 +1033,40 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blo
   loss being a memorization artifact) and val/kl drops to 0.280 — data
   scaling works. Confirmed by the three-way comparison; sampler was the
   bottleneck, not data.
-- `[~]` **T5b — scale to 30k under disk budget.** New cache
-  `cache_v1_30k/llada/` thinned at collect time to 6 blocks × 3 iters ×
-  KV 32 (~236 GB). Test split kept full. Curriculum: stage-1 trains on
-  early-iter pairs `(0,1) (0,2) (1,2)`; stage 2 (optional) adds late
-  iters if early-iter plateaus. Needs CLI flags `--keep_blocks` /
-  `--keep_iters` in `collect_llada.py` to write thinned files directly
-  (full-then-thin would peak at ~600 GB during collect).
-- `[ ]` **T7 (M2)** Deeper delta model (2 → 4 layers). Only if T5b
-  plateaus and per-bin diagnostic implicates capacity.
-- `[ ]` **T8 = old C (M2)** Sliced 1-D distribution-matching
-  regularizer on `h_pred` vs `h_target` — SIGReg mechanism. See §3.3.
-- `[ ]` Variant A (cross-attn anchor) — M2 candidate.
-- `[ ]` Variant B (AdaLN-Zero) — M2 candidate.
-- `[ ]` Multi-layer hidden fusion (EAGLE-3 hint) — M2; requires recollect.
-  Closest single architectural lever per the DFlash comparison.
+- `[x]` **v2 bracket** (5k anchor + 10k×{preload, sample, interleaved} +
+  20k×{preload, sample, interleaved}). Cache thinned to 6 blocks × 4
+  iters × KV 32; test split aligned with train. Headline finding:
+  GSM8K peaks at step 2k–8k and decays while val/kl keeps falling;
+  val/bce minimum is co-located with the GSM8K peak in every run.
+- `[x]` **T9 — BCE-tame** (`m1_5_v2_t9_*.yaml`). `lambda_conf 1→0.3`,
+  `detach_conf_features=true`, dropout 0.20, wd 0.03, max_steps 12k,
+  gsm8k_every 500, ref0_mult 1.5. Confirmed calibration is now
+  correct (thr=0.90 beats vanilla by +1.0% acc), but the Pareto did
+  not shift — operating point at thr=0.85 is acc 0.74 / speedup 1.07×,
+  essentially flat with the baseline. Diagnosis: Δh quality, not
+  gating, is the remaining bottleneck.
+- `[~]` **T10 — deeper delta** (`m1_5_v2_t10_*.yaml`). T9 recipe +
+  `n_layers 2 → 4`. Tests capacity hypothesis. ~6 h compute. Decision
+  gate: if Pareto moves into the win zone, ship; else proceed to T11.
+- `[x]` **2-D val/mse logging.** `run_val` emits
+  `val/mse_by_gap_{g}_reveal_{rb}` + `val/n_by_gap_{g}_reveal_{rb}` for
+  every populated cell. Disentangles the gap-vs-reveal-fraction
+  confound and feeds the dynamic threshold lookup (§5.2).
+- `[x]` **Dynamic per-state threshold lookup.**
+  `delta_model/inference/thr_lookup.py`. `hybrid_runner.py` accepts
+  callable `per_pos_threshold`. CLI: `gsm8k_e2e.py --use_thr_lookup
+  metrics.jsonl --thr_lookup_brackets "base:max,..."`. See §5.2.
+- `[ ]` **T11 — multi-layer hidden fusion (EAGLE-3).** Re-collect with
+  `{layer_8, layer_16, layer_24, layer_31}`; small fusion layer added
+  to VariantC. Only if T10 doesn't close the Pareto gap.
+- `[ ]` **T5b — 30k cache.** Deferred behind the architecture path —
+  scaling data on a still-capacity-limited model is wasted compute.
+- `[ ]` **T8 — sliced 1-D distribution-matching regularizer** on
+  `h_pred` vs `h_target` (SIGReg mechanism, see §3.3). Conditional:
+  only if the 2-D val matrix on T10 shows clear drift signature
+  (high-reveal × any-gap dominant).
+- `[ ]` Variant A (cross-attn anchor) — deferred.
+- `[ ]` Variant B (AdaLN-Zero) — deferred.
 
 ### Data
 - `[x]` Schema v2: `prefix_kv` field, `prefix_window=64` stored, optional pad mask.

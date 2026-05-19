@@ -106,7 +106,8 @@ python -m delta_model.train --config <cfg> \
 ```
 
 Or run the whole v2 bracket (5k preload anchor + 10k×{preload, sample,
-interleaved} + 20k×{preload, sample, interleaved} + T9) sequentially:
+interleaved} + 20k×{preload, sample, interleaved} + T9 + T10)
+sequentially:
 
 ```bash
 ./run_v2_trainings.sh

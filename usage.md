@@ -243,9 +243,15 @@ Pass criteria:
 ## 5 · Train (`train.py`)
 
 ```bash
+# Current frontier — T10 (T9 + n_layers=4):
 python -m delta_model.train \
-    --config delta_model/configs/m1_5_data20k_interleaved_llada_variant_c.yaml \
+    --config delta_model/configs/m1_5_v2_t10_20k_interleaved_llada_variant_c.yaml \
     --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+
+# Or run the whole v2 bracket (5k+10k+20k×3 samplers + T9 + T10) sequentially:
+./run_v2_trainings.sh                           # all configured runs
+ONLY="t10_20k_interleaved" ./run_v2_trainings.sh
+SKIP="20k_preload" ./run_v2_trainings.sh
 ```
 
 Single-line config overrides via `--override key=value` (dot notation):
@@ -348,6 +354,36 @@ for best in best_gsm8k_step best_val_kl_step; do
         --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
         --out_json eval_results/<run>_${best}_sweep.json
 done
+```
+
+### Dynamic per-state threshold sweep (`--use_thr_lookup`)
+
+When a checkpoint's `metrics.jsonl` carries the 2-D val cells
+(`val/mse_by_gap_{g}_reveal_{rb}` — T9 onward, or any older run after
+one fresh val tick post-2026-05-19), the gate can switch from a single
+global threshold to a `(gap, reveal_frac) → threshold` lookup built
+from those cells. Easy cells (low gap, low reveal) get a lower
+threshold, hard cells get a higher one. Sweep across `(base, max)`
+brackets:
+
+```bash
+python -m delta_model.eval.gsm8k_e2e \
+    --delta_ckpt ckpts/<run>/best_gsm8k_step<N>.pt \
+    --fast_dllm_path external/Fast-dLLM/v1 \
+    --n_problems 200 \
+    --use_thr_lookup ckpts/<run>/metrics.jsonl \
+    --thr_lookup_brackets "0.65:0.95,0.70:0.95,0.65:0.90,0.70:0.90" \
+    --out_json eval_results/<run>_lookup_sweep.json
+```
+
+Each `(base, max)` becomes one row in the output JSON, with
+`per_pos_threshold` set to a descriptor string
+(`lookup(base=0.65,max=0.95)`) and `thr_mode=lookup`. Inspect the
+lookup table without running the full eval:
+
+```bash
+python -m delta_model.inference.thr_lookup \
+    --metrics_jsonl ckpts/<run>/metrics.jsonl --base 0.65 --max 0.95
 ```
 
 ---

@@ -259,11 +259,22 @@ def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
                 bin_counts["gap"][g] += 1
             # reveal bin (find the bucket index)
             r = float(reveal[r_idx])
+            rb_found = None
             for bi_, (lo, hi) in enumerate(zip(bins_reveal[:-1], bins_reveal[1:])):
                 if lo <= r <= hi:
                     bin_sums["reveal"][bi_]   += float(row_mse_np[r_idx])
                     bin_counts["reveal"][bi_] += 1
+                    rb_found = bi_
                     break
+            # 2D (gap, reveal_bin) binning — disentangles "is late reveal
+            # hard because of more committed tokens?" from "is it hard
+            # because larger-gap pairs leak into the high-reveal bin?".
+            # Many of the 3×5 cells are empty by construction (e.g. gap=3
+            # rarely lands in reveal_0); we only emit populated cells.
+            if rb_found is not None and g in bins_gap:
+                key = (g, rb_found)
+                bin_sums["gap_reveal"][key]   += float(row_mse_np[r_idx])
+                bin_counts["gap_reveal"][key] += 1
 
     out = {}
     for k, total in sums.items():
@@ -272,6 +283,12 @@ def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
         out[f"mse_by_gap_{g}"] = total / max(1, bin_counts["gap"][g])
     for bi_, total in bin_sums["reveal"].items():
         out[f"mse_by_reveal_{bi_}"] = total / max(1, bin_counts["reveal"][bi_])
+    # 2D cells: emit count too so a future thr-lookup builder can weight
+    # by support and skip noisy sparse cells.
+    for (g, rb_), total in bin_sums["gap_reveal"].items():
+        n = bin_counts["gap_reveal"][(g, rb_)]
+        out[f"mse_by_gap_{g}_reveal_{rb_}"]   = total / max(1, n)
+        out[f"n_by_gap_{g}_reveal_{rb_}"]     = int(n)
     model.train()
     return out
 

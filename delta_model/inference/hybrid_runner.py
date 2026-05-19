@@ -29,7 +29,7 @@ harness can plot accuracy / speed / per-position-threshold curves.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn as nn
@@ -65,7 +65,7 @@ def generate_with_delta(
     block_length: int = S.BLOCK_LENGTH,
     max_iter_per_block: int = S.MAX_ITER,
     inner_loop_max_iter: int | None = None,
-    per_pos_threshold: float = 0.85,        # §3.2 — per-position confidence gate
+    per_pos_threshold: "float | Callable[[int, float], float]" = 0.85,
     threshold: float | None = None,         # Fast-dLLM fixed-threshold mode
     factor: float | None = 1.0,             # Fast-dLLM dynamic-threshold mode
     temperature: float = 0.0,
@@ -226,6 +226,11 @@ def generate_with_delta(
                 )
             x = torch.where(transfer_index, x0, x)
             n_passes = 1
+            # `i_ref_step` tracks which pass's hidden state the current
+            # h_ref reflects (= n_passes at the moment it was captured).
+            # gap = n_passes - i_ref_step at the start of each delta pass.
+            # Updated whenever a rollback refreshes h_ref.
+            i_ref_step = 0
 
             # Pad mask: leading `pad_len` slots were zero-padded above
             # (short-prompt case at block 0); the trailing `valid_len`
@@ -276,6 +281,9 @@ def generate_with_delta(
                     # pass. After the commit below, h_ref lags the reveal
                     # state — the in-distribution i_ref < i_target setup.
                     h_ref = hook_state["latest"]
+                    # h_ref now reflects the just-completed rollback pass,
+                    # so the next delta forward sees gap=1 again.
+                    i_ref_step = n_passes
                     force_rollback_next = False
 
                     # Vanilla Fast-dLLM transfer on the backbone's own
@@ -346,9 +354,19 @@ def generate_with_delta(
                     )
                 # transfer_blk: [1, BL] bool — positions Fast-dLLM wants.
 
-                # Step 2: per-position confidence gate.
-                #   c_pos has shape [1, BL]; broadcast threshold check.
-                per_pos_pass = (c_pos.float() >= per_pos_threshold)             # [1, BL]
+                # Step 2: per-position confidence gate. `per_pos_threshold`
+                # may be a float (global gate) OR a callable
+                # `(gap, reveal_frac) -> float` that returns a per-state
+                # threshold (see delta_model/inference/thr_lookup.py).
+                if callable(per_pos_threshold):
+                    gap_now = n_passes - i_ref_step
+                    reveal_frac_now = float(
+                        (x[:, s:e] != mask_id).float().mean().item()
+                    )
+                    thr_now = float(per_pos_threshold(gap_now, reveal_frac_now))
+                else:
+                    thr_now = float(per_pos_threshold)
+                per_pos_pass = (c_pos.float() >= thr_now)                        # [1, BL]
                 agreement_blk = transfer_blk & per_pos_pass                      # [1, BL]
 
                 # Step 3: commit ONLY agreement-set positions this pass.

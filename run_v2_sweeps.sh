@@ -49,6 +49,8 @@ RUNS=(
   #   SKIP="t9_20k_interleaved" ./run_v2_sweeps.sh
   # if the training hasn't finished yet.
   "t9_20k_interleaved:m1_5_v2_t9_20k_interleaved_llada_variant_c"
+  # T10 — T9 + n_layers 4. Same sweep range.
+  "t10_20k_interleaved:m1_5_v2_t10_20k_interleaved_llada_variant_c"
 )
 
 SKIP="${SKIP:-}"

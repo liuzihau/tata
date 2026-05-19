@@ -79,7 +79,7 @@ def run_gsm8k_eval(
     delta_ckpt: str | None = None,
     fast_dllm_path: str | None = None,
     n_problems: int = 200,
-    per_pos_threshold: float = 0.85,
+    per_pos_threshold: "float | callable" = 0.85,
     seed: int = 42,
     threshold: float | None = None,
     factor: float | None = 1.0,
@@ -160,8 +160,12 @@ def run_gsm8k_eval(
     def _van_count_hook(module, inputs):
         _van_counter["n"] += 1
 
+    # `per_pos_threshold` may be a callable (dynamic lookup) — format the
+    # progress-bar tag with a `lookup` label in that case.
+    thr_tag = (f"{per_pos_threshold:.2f}" if isinstance(per_pos_threshold, float)
+               else "lookup")
     pbar = tqdm(
-        ds, desc=f"gsm8k thr={per_pos_threshold:.2f}",
+        ds, desc=f"gsm8k thr={thr_tag}",
         dynamic_ncols=True, disable=not show_progress, leave=show_progress,
     )
     for i, prob in enumerate(pbar):
@@ -261,7 +265,12 @@ def run_gsm8k_eval(
         # mean the per-pos confidence gate is vetoing most delta-pass
         # commits — the small model isn't being trusted on this slice.
         "rollback_rate":              float(np.mean(rollback_rates)),
-        "per_pos_threshold":          per_pos_threshold,
+        # `per_pos_threshold` is JSON-serialisable only when float; when a
+        # callable (dynamic lookup), the caller (main()) overrides this
+        # field with a descriptor string.
+        "per_pos_threshold":          per_pos_threshold
+                                       if isinstance(per_pos_threshold, float)
+                                       else "callable",
         "inner_loop_max_iter":        inner_loop_max_iter,
     }
     if revealed_at_finish:
@@ -301,6 +310,24 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_json", default=None)
     p.add_argument(
+        "--use_thr_lookup", type=str, default=None,
+        help="Path to a `metrics.jsonl` that contains "
+             "val/mse_by_gap_{g}_reveal_{rb} 2D cells. When set, switches "
+             "the gate from a fixed per_pos_threshold to a "
+             "(gap, reveal_frac) -> threshold lookup built from those "
+             "metrics. Sweeps `--thr_lookup_brackets` instead of "
+             "`--per_pos_thresholds` in this mode.",
+    )
+    p.add_argument(
+        "--thr_lookup_brackets", type=str,
+        default="0.65:0.95,0.70:0.95,0.65:0.90,0.70:0.90",
+        help="Comma-separated `base:max` brackets to sweep in lookup "
+             "mode. base = threshold for the easiest cell, max = "
+             "threshold for the hardest cell; cells in between are "
+             "linearly remapped by per-cell MSE. Only used when "
+             "--use_thr_lookup is set.",
+    )
+    p.add_argument(
         "--inner_loop_max_iter", type=int, default=None,
         help="Hard cap on the agreement-decoding inner while loop. "
              "Default = None → resolves to 2 * BLOCK_LENGTH (= 64), "
@@ -329,20 +356,63 @@ def main() -> None:
     )
 
     rows = []
-    for thr in [float(x) for x in args.per_pos_thresholds.split(",") if x.strip()]:
-        print(f"[gsm8k] per_pos_threshold={thr}", flush=True)
-        m = run_gsm8k_eval(
-            delta_ckpt=args.delta_ckpt,
-            fast_dllm_path=args.fast_dllm_path,
-            n_problems=args.n_problems,
-            per_pos_threshold=thr,
-            seed=args.seed,
-            threshold=decoding_threshold,
-            factor=decoding_factor,
-            inner_loop_max_iter=args.inner_loop_max_iter,
+    if args.use_thr_lookup:
+        # Lookup mode: build a (gap, reveal_frac) -> threshold callable
+        # from the training metrics, then sweep across (base, max)
+        # brackets. Each bracket is one row in the output JSON.
+        from delta_model.inference.thr_lookup import (
+            build_lookup_from_metrics,
         )
-        print(json.dumps(m, indent=2), flush=True)
-        rows.append(m)
+        brackets = []
+        for tok in args.thr_lookup_brackets.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            lo_s, hi_s = tok.split(":")
+            brackets.append((float(lo_s), float(hi_s)))
+        for (base, mx) in brackets:
+            lookup = build_lookup_from_metrics(
+                args.use_thr_lookup,
+                base_threshold=base,
+                max_threshold=mx,
+            )
+            label = f"lookup(base={base:g},max={mx:g})"
+            print(f"[gsm8k] {label}  table={lookup}", flush=True)
+            m = run_gsm8k_eval(
+                delta_ckpt=args.delta_ckpt,
+                fast_dllm_path=args.fast_dllm_path,
+                n_problems=args.n_problems,
+                per_pos_threshold=lookup,            # callable
+                seed=args.seed,
+                threshold=decoding_threshold,
+                factor=decoding_factor,
+                inner_loop_max_iter=args.inner_loop_max_iter,
+            )
+            # Replace the un-sortable callable with a descriptor for the
+            # output JSON; keep the (base, max) values for plot tools.
+            m["per_pos_threshold"]    = label
+            m["thr_mode"]             = "lookup"
+            m["thr_lookup_base"]      = base
+            m["thr_lookup_max"]       = mx
+            m["thr_lookup_metrics"]   = args.use_thr_lookup
+            print(json.dumps(m, indent=2), flush=True)
+            rows.append(m)
+    else:
+        for thr in [float(x) for x in args.per_pos_thresholds.split(",") if x.strip()]:
+            print(f"[gsm8k] per_pos_threshold={thr}", flush=True)
+            m = run_gsm8k_eval(
+                delta_ckpt=args.delta_ckpt,
+                fast_dllm_path=args.fast_dllm_path,
+                n_problems=args.n_problems,
+                per_pos_threshold=thr,
+                seed=args.seed,
+                threshold=decoding_threshold,
+                factor=decoding_factor,
+                inner_loop_max_iter=args.inner_loop_max_iter,
+            )
+            m["thr_mode"] = "fixed"
+            print(json.dumps(m, indent=2), flush=True)
+            rows.append(m)
 
     if args.out_json:
         out_path = Path(args.out_json)

@@ -1,0 +1,91 @@
+# M1.5-v2 — T10 "deeper delta" (= T9 recipe + n_layers 2 → 4)
+#
+# T9 confirmed the BCE-overfit hypothesis: per-position confidence is now
+# well-calibrated (T9 sweep shows thr=0.90 beats vanilla by +1.0% acc),
+# and val/bce no longer climbs in lockstep with the GSM8K decay. But the
+# Pareto frontier did not shift into the win zone — at thr=0.85 the
+# operating point is acc=0.74 (-1.0%) / speedup=1.07× (~same as the
+# pre-T9 baseline). The thr=0.70 cliff (acc=0.57, -18.0%) tells the
+# complementary story from below: when the gate is wide open, the delta
+# commits enough bad tokens to cascade.
+#
+# Interpretation: calibration is solved; the residual bottleneck is
+# underlying Δh quality, not gating. The head correctly identifies
+# "don't trust this commit" — but doesn't make the commit better.
+#
+# T10 tests the capacity hypothesis. Only one knob changes:
+#
+#     model.n_layers:  2 → 4
+#
+# Everything else inherits from T9 (lambda_conf=0.3, detach_conf=true,
+# dropout=0.20, wd=0.03, max_steps=12000, gsm8k_every=500,
+# ref0_mult=1.5, gsm8k_per_pos_threshold=0.75). Doubling layers roughly
+# doubles params (~500M → ~1B) at ~2× the per-step compute. If Pareto
+# moves into the win zone, capacity was the limit. If not, the next
+# lever is multi-layer hidden fusion (EAGLE-3 hint, T11) — needs a
+# re-collect, so the cheap T10 test goes first.
+
+run_name:          m1_5_v2_t10_20k_interleaved_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada
+  fast_dllm_path:  null
+  load_for:        [token_embed, final_norm, lm_head]
+
+data:
+  cache_root:      cache_v1_20k/llada
+  manifest:        cache_v1_20k/llada/manifest.json
+  val_split:       test
+  shuffle_seed:    42
+  num_workers:     0
+  batch_size:      256
+  pin_memory:      false
+  preload:         false
+  shard_sampler:   interleaved
+  active_shards:   8
+  mask_token_id:   126336
+  ref0_weight_multiplier: 1.5
+
+model:
+  variant:         C
+  d_model:         4096
+  n_heads:         32
+  n_layers:        4                                 # 2 → 4 (the T10 lever)
+  d_ff_inner:      10944
+  dropout:         0.20
+  detach_conf_features: true
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.03
+  betas:           [0.9, 0.95]
+  warmup_steps:    300
+  max_steps:       12000
+  scheduler:       cosine
+  grad_clip:       1.0
+  precision:       bf16
+
+loss:
+  mse_space:       final_norm
+  lambda_mse:      1.0
+  lambda_kl:       1.0
+  lambda_conf:     0.3
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           M1.5-v2-t10-llada
+  log_every:       50
+  val_every:       500
+  gsm8k_every:     500
+  gsm8k_subset:    50
+  gsm8k_per_pos_threshold: 0.75
+  bins_gap:        [1, 2, 3]
+  bins_reveal:     [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+checkpoint:
+  every:           2000
+  keep_last:       3
+  out_dir:         ckpts/m1_5_v2_t10_20k_interleaved_llada_variant_c

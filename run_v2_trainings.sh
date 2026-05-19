@@ -36,6 +36,10 @@ RUNS=(
   # dropout 0.2, wd 0.03, max_steps 12k, ref0_mult 1.5, gsm8k_every 500.
   # Targets the v2 finding that val/bce overfit drives the GSM8K decay.
   "t9_20k_interleaved:m1_5_v2_t9_20k_interleaved_llada_variant_c.yaml"
+  # T10 — "deeper delta". T9 recipe + n_layers 2→4. Tests the capacity
+  # hypothesis after T9 confirmed calibration is solved but the Pareto
+  # didn't shift. ~2× the per-step compute of T9.
+  "t10_20k_interleaved:m1_5_v2_t10_20k_interleaved_llada_variant_c.yaml"
 )
 
 SKIP="${SKIP:-}"
