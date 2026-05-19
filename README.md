@@ -242,9 +242,14 @@ import delta_model.data.schema as S
 backbone, tokenizer = load_llada(fast_dllm_path="external/Fast-dLLM/v1")
 ckpt = torch.load("ckpts/tata_release/best_val_kl_step7500.pt",
                   map_location="cpu", weights_only=False)
-bb_cfg = {"rope_theta": float(backbone.config.rope_theta),
-          "rms_eps":    float(backbone.config.layer_norm_eps),
-          "max_seq_len": int(backbone.config.max_sequence_length)}
+# Some LLaDA builds rename these config fields — fall back the same way
+# train.py / gsm8k_e2e.py do (e.g. `layer_norm_eps` is absent on the
+# checkpoint the user reported, only `layer_norm_type` is).
+bb_cfg = {
+    "rope_theta":  float(getattr(backbone.config, "rope_theta", 1e6)),
+    "rms_eps":     float(getattr(backbone.config, "layer_norm_eps", 1e-5)),
+    "max_seq_len": int(getattr(backbone.config, "max_sequence_length", 8192)),
+}
 delta = VariantC(d_model=ckpt["cfg"]["model"]["d_model"],
                  n_heads=ckpt["cfg"]["model"]["n_heads"],
                  n_layers=ckpt["cfg"]["model"]["n_layers"],

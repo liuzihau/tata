@@ -185,9 +185,26 @@ def generate_with_delta(
                 tuple(t[:, :, :s, :] for t in pkv) for pkv in past_key_values
             ]
 
-            # Last-PREFIX_WINDOW prefix KV for the delta model.
-            last_K = past_key_values[-1][0][0, :, s - S.PREFIX_WINDOW:s, :]
-            last_V = past_key_values[-1][1][0, :, s - S.PREFIX_WINDOW:s, :]
+            # Last-PREFIX_WINDOW prefix KV for the delta model. Mirror
+            # collect_llada's front-pad behavior: when block start `s` is
+            # under PREFIX_WINDOW (short prompt at block 0), zero-pad the
+            # leading slots and record which slots are real via the pad
+            # mask below. Without this, the slice yields fewer than
+            # PREFIX_WINDOW tokens and SDPA in the delta model broadcast-
+            # fails against the fixed-size mask.
+            W = S.PREFIX_WINDOW
+            valid_len = min(int(s), W)
+            pad_len   = W - valid_len
+            real_K = past_key_values[-1][0][0, :, s - valid_len:s, :]
+            real_V = past_key_values[-1][1][0, :, s - valid_len:s, :]
+            if pad_len > 0:
+                pad_shape = (real_K.shape[0], pad_len, real_K.shape[2])
+                zeros_K = torch.zeros(pad_shape, dtype=real_K.dtype, device=real_K.device)
+                zeros_V = torch.zeros(pad_shape, dtype=real_V.dtype, device=real_V.device)
+                last_K = torch.cat([zeros_K, real_K], dim=1)
+                last_V = torch.cat([zeros_V, real_V], dim=1)
+            else:
+                last_K, last_V = real_K, real_V
             prefix_kv_slice = torch.stack([last_K, last_V], dim=0).unsqueeze(0)
 
             # h_ref: last-block output at the masked block region.
@@ -210,12 +227,15 @@ def generate_with_delta(
             x = torch.where(transfer_index, x0, x)
             n_passes = 1
 
-            # The prompt's prefix is always at least PREFIX_WINDOW tokens at
-            # inference (precondition), so the pad mask we hand to the delta
-            # model is all-True.
-            prefix_kv_pad_mask = torch.ones(
-                (1, S.PREFIX_WINDOW), dtype=torch.bool, device=device,
+            # Pad mask: leading `pad_len` slots were zero-padded above
+            # (short-prompt case at block 0); the trailing `valid_len`
+            # slots are real KV. For prompts ≥ PREFIX_WINDOW tokens this
+            # collapses to all-True (the pre-existing behavior).
+            prefix_kv_pad_mask = torch.zeros(
+                (1, W), dtype=torch.bool, device=device,
             )
+            if valid_len > 0:
+                prefix_kv_pad_mask[:, pad_len:] = True
 
             # ---- Passes 1..loop_cap-1: delta + agreement decode ----
             force_rollback_next = False
