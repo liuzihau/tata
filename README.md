@@ -159,18 +159,19 @@ from:
 
 **[Google Drive — tata checkpoints](https://drive.google.com/drive/folders/1dfjqqIJ_IviwzJz77rWGMyu0OhkvnnZE?usp=sharing)**
 
-Drop the downloaded `.pt` into `ckpts/` (any subdirectory works — both
-the eval CLI and the ad-hoc snippet below take a path):
+Currently published: **`best_val_kl_step7500.pt`** (one file). Drop it
+into `ckpts/tata_release/`:
 
 ```bash
 mkdir -p ckpts/tata_release
-# move/copy the downloaded file in, e.g.:
-mv ~/Downloads/best_gsm8k.pt ckpts/tata_release/best_gsm8k.pt
+mv ~/Downloads/best_val_kl_step7500.pt ckpts/tata_release/
 ```
 
-Then reference it directly in any inference command below
-(`--delta_ckpt ckpts/tata_release/best_gsm8k.pt`, or the same path in
-the Python snippet in §B).
+The inference commands in §A and §B below are temporarily pinned to
+this exact filename. Once more checkpoints are released (e.g. a
+`best_gsm8k_*` companion), they'll switch back to the
+`best_<metric>_step*.pt` glob pattern so the latest of each kind is
+picked automatically.
 
 ## A. GSM8K end-to-end evaluation (the headline metric)
 
@@ -181,12 +182,12 @@ calls.
 
 ```bash
 python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt $(ls ckpts/m1_5_v2_20k_interleaved_llada_variant_c/best_gsm8k_step*.pt) \
+    --delta_ckpt ckpts/tata_release/best_val_kl_step7500.pt \
     --fast_dllm_path external/Fast-dLLM/v1 \
     --n_problems 200 \
     --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
     --factor 1.0 \
-    --out_json eval_results/v2_20k_interleaved_sweep.json
+    --out_json eval_results/tata_release_sweep.json
 ```
 
 Live `tqdm` shows running per-problem decode time hybrid vs vanilla,
@@ -239,7 +240,7 @@ from delta_model.models.variant_c import VariantC
 import delta_model.data.schema as S
 
 backbone, tokenizer = load_llada(fast_dllm_path="external/Fast-dLLM/v1")
-ckpt = torch.load("ckpts/<run>/best_gsm8k_step<N>.pt",
+ckpt = torch.load("ckpts/tata_release/best_val_kl_step7500.pt",
                   map_location="cpu", weights_only=False)
 bb_cfg = {"rope_theta": float(backbone.config.rope_theta),
           "rms_eps":    float(backbone.config.layer_norm_eps),
