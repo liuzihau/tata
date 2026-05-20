@@ -86,43 +86,64 @@ python -m delta_model.data.rebuild_manifest --cache_root cache_v1_20k/llada
 
 ## 4. Train
 
-`wandb login` once before the first run — every training script logs to
-the `tata-delta-model` project there and also mirrors to a local
-`metrics.jsonl`.
+`wandb login` once before the first run — training logs to the
+`tata-delta-model` project and mirrors to a local `metrics.jsonl`.
+
+The current frontier is the **v3 two-phase pipeline** (see `v3_plan.md`):
+phase 1 trains the delta, phase 2 trains the confidence head on
+free-running DAgger labels. The whole pipeline:
 
 ```bash
-wandb login    # once per machine
+wandb login                          # once per machine
+./run_v3.sh                          # phase 1 → top-3 → 3×(phase 2 + GSM8K sweep)
+ONLY_PHASE1=1 ./run_v3.sh             # phase 1 only
+SKIP_PHASE1=1 ./run_v3.sh             # phases 2+3 from existing phase-1 ckpts
+```
 
+Or run the phases by hand:
+
+```bash
+# Phase 1 — delta training (--phase delta forces lambda_conf=0,
+# runs delta-only mid-train GSM8K, keeps the top-3 checkpoints).
+python -m delta_model.train --phase delta \
+    --config delta_model/configs/v3_phase1_delta_llada_variant_c.yaml \
+    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+
+# Phase 2 — conf-head training (frozen delta, free-running DAgger labels).
+# Run once per top-3 phase-1 checkpoint, each to its own out_dir.
+python -m delta_model.train --phase conf \
+    --config delta_model/configs/v3_phase2_conf_llada_variant_c.yaml \
+    --resume_from ckpts/v3_phase1_delta_llada_variant_c/best_delta_gsm8k_step<N>.pt \
+    --override backbone.fast_dllm_path=external/Fast-dLLM/v1 \
+    --override checkpoint.out_dir=ckpts/v3_phase2_conf_cand1
+```
+
+**Legacy / v2** — the v2 bracket configs (`m1_5_v2_*`, `m1_5_v2_t9/t10_*`)
+still train with the default `--phase joint`:
+
+```bash
 python -m delta_model.train \
     --config delta_model/configs/m1_5_v2_20k_interleaved_llada_variant_c.yaml \
     --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+./run_v2_trainings.sh                 # the full v2 bracket
 ```
 
-Resume:
+Resume any run:
 
 ```bash
 python -m delta_model.train --config <cfg> \
     --resume_from ckpts/<run>/step_0010000.pt
 ```
 
-Or run the whole v2 bracket (5k preload anchor + 10k×{preload, sample,
-interleaved} + 20k×{preload, sample, interleaved} + T9 + T10)
-sequentially:
+Checkpoints land in `ckpts/<run_name>/`:
 
-```bash
-./run_v2_trainings.sh
-# Subset:
-ONLY="t9_20k_interleaved 20k_interleaved" ./run_v2_trainings.sh
-SKIP="20k_preload" ./run_v2_trainings.sh
-```
-
-Per run, three kinds of checkpoints land in `ckpts/<run_name>/`:
-
-| pattern | when | rotated by `keep_last` |
+| pattern | when | phase |
 |---|---|---|
-| `step_<NNNNNNN>.pt` | every `cfg.checkpoint.every` steps | yes |
-| `best_val_kl_step<N>.pt` | new minimum on `val/kl` | no |
-| `best_gsm8k_step<N>.pt` | new maximum on `gsm8k/accuracy_hybrid` | no |
+| `step_<NNNNNNN>.pt` | every `cfg.checkpoint.every` steps (rotated) | all |
+| `best_val_kl_step<N>.pt` | new `val/kl` minimum | joint |
+| `best_gsm8k_step<N>.pt` | new `gsm8k/accuracy_hybrid` max | joint |
+| `best_delta_gsm8k_step<N>.pt` × 3 | top-3 by free-running delta-only GSM8K | delta (phase 1) |
+| `best_conf_step<N>.pt` | best in-band (rollback rate ∈ [0.5,0.7]) | conf (phase 2) |
 
 `<ckpt_dir>/metrics.jsonl` mirrors every `wandb.log` payload — plottable
 locally without wandb cloud.
@@ -142,12 +163,25 @@ python -m delta_model.eval.plot_metrics \
     --smooth 25 \
     --out plots/v2_data_scaling_interleaved.png
 
-# Per-bin diagnostics (regex)
+# Per-bin diagnostics (regex) — 1-D gap/reveal bins, the 2-D matrix,
+# and the v3 diagnostics (val/bce, val/top1_agree)
 python -m delta_model.eval.plot_metrics \
     ckpts/<run>/metrics.jsonl \
-    --metric "val/mse_by_gap_.*" \
-    --out plots/gap_bins.png
+    --metric "val/mse_by_gap_[0-9]_reveal_[0-9]" \
+    --out plots/gap_reveal_2d.png
+
+python -m delta_model.eval.plot_metrics \
+    ckpts/<run>/metrics.jsonl \
+    --metric val/bce val/top1_agree gsm8k/accuracy_hybrid \
+    --out plots/v3_diag.png
 ```
+
+Metrics now available in `metrics.jsonl`: `train/kl`, `train/kl_backward`
+(symmetric-KL runs), `val/kl`, `val/bce`, `val/top1_agree`,
+`val/mse_by_gap_{g}`, `val/mse_by_reveal_{rb}`,
+`val/mse_by_gap_{g}_reveal_{rb}` (+ `n_by_*` support counts),
+`gsm8k/accuracy_hybrid`, `gsm8k/rollback_rate`, and (phase 1)
+`gsm8k/*` from the delta-only eval.
 
 ---
 
@@ -201,7 +235,33 @@ gsm8k thr=0.85:  47%|████▋ | 94/200  hyb=1.83s van=2.05s x=1.12
                                       bb_h=40.3 bb_v=24.6 rb%=80
 ```
 
-Sweep every trained v2 checkpoint sequentially with the runner script:
+Three sweep modes (`gsm8k_e2e` flags):
+
+```bash
+# (1) fixed per_pos_threshold sweep — the default
+python -m delta_model.eval.gsm8k_e2e --delta_ckpt <ckpt> \
+    --fast_dllm_path external/Fast-dLLM/v1 --n_problems 200 \
+    --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
+    --out_json eval_results/<run>_sweep.json
+
+# (2) dynamic per-(gap,reveal) threshold lookup — needs a metrics.jsonl
+#     with the 2-D val cells (any v3 / post-2026-05-19 run)
+python -m delta_model.eval.gsm8k_e2e --delta_ckpt <ckpt> \
+    --fast_dllm_path external/Fast-dLLM/v1 --n_problems 200 \
+    --use_thr_lookup ckpts/<run>/metrics.jsonl \
+    --thr_lookup_brackets "0.65:0.95,0.70:0.90" \
+    --out_json eval_results/<run>_lookup_sweep.json
+
+# (3) delta-only — pure free-running delta, no gate, no rollback
+#     (the v3 phase-1 selection metric)
+python -m delta_model.eval.gsm8k_e2e --delta_ckpt <ckpt> \
+    --fast_dllm_path external/Fast-dLLM/v1 --n_problems 200 \
+    --delta_only --out_json eval_results/<run>_deltaonly.json
+```
+
+Sweep every trained checkpoint sequentially with a runner script —
+`run_v3.sh` runs the v3 sweeps as its stage 3; `run_v2_sweeps.sh`
+covers the v2 bracket:
 
 ```bash
 ./run_v2_sweeps.sh
@@ -322,8 +382,11 @@ Knobs that affect quality vs speed:
 tata/
 ├── README.md                                — this file
 ├── design.md  engineering.md  usage.md      — long-form docs
-├── run_v2_trainings.sh                      — sequential training runner
-├── run_v2_sweeps.sh                         — sequential GSM8K sweep runner
+├── v3_plan.md                               — v3 implementation spec
+├── run_v3.sh                                — v3 pipeline: phase1 → top-3 → 3×(phase2 + sweep)
+├── run_v2_trainings.sh                      — v2-bracket sequential training runner
+├── run_v2_sweeps.sh                         — v2-bracket sequential GSM8K sweep runner
+├── inference.py                             — interactive hybrid-vs-vanilla single-prompt decode
 ├── delta_model/
 │   ├── data/
 │   │   ├── collect_llada.py                 — cache builder
@@ -335,19 +398,22 @@ tata/
 │   ├── models/
 │   │   ├── variant_c.py                     — VariantC (with detach_conf_features knob)
 │   │   └── heads.py                         — DeltaHead, ConfHeadPerPos
-│   ├── losses.py                            — composite MSE + KL + per-pos BCE
-│   ├── train.py                             — single-file training loop
+│   ├── losses.py                            — composite MSE + KL(±backward) + tiered/shared-mass BCE
+│   ├── train.py                             — train loop + --phase {joint,delta,conf}
 │   ├── inference/
-│   │   └── hybrid_runner.py                 — generate_with_delta
+│   │   ├── hybrid_runner.py                 — generate_with_delta (+ delta_only mode)
+│   │   ├── conf_rollout.py                  — v3 free-running DAgger labelling
+│   │   └── thr_lookup.py                    — dynamic per-(gap,reveal) threshold
 │   ├── eval/
-│   │   ├── gsm8k_e2e.py                     — sweep harness (with rollback_rate, vanilla bb)
+│   │   ├── gsm8k_e2e.py                     — sweep harness (fixed / lookup / delta_only modes)
 │   │   ├── plot_sweep.py                    — 2×2 sweep visualizer
 │   │   └── plot_metrics.py                  — training curve overlay
 │   ├── sanity/                              — T2..T5 tests
 │   └── configs/
-│       ├── m1_5_v2_*_llada_variant_c.yaml   — the active v2 bracket
-│       ├── m1_5_v2_t9_*.yaml                — BCE-tame trial
-│       └── configs_old/                     — legacy v1 configs
+│       ├── v3_phase1_delta_llada_variant_c.yaml   — v3 phase 1 (delta)
+│       ├── v3_phase2_conf_llada_variant_c.yaml    — v3 phase 2 (conf head)
+│       ├── m1_5_v2_*_llada_variant_c.yaml         — v2 bracket + t9/t10 trials
+│       └── configs_old/                            — legacy v1 configs
 ├── ckpts/                                   — checkpoints per run
 ├── eval_results/                            — sweep JSONs
 ├── plots/                                   — generated figures

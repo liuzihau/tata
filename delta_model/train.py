@@ -197,17 +197,25 @@ def _lr_schedule(step: int, *, warmup: int, total: int, base_lr: float,
 
 @torch.no_grad()
 def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
-            lambda_mse, lambda_kl, lambda_conf, mse_space,
+            loss_kwargs: dict,
             bins_gap, bins_reveal,
             max_batches: int = 50,
             device="cuda", dtype=torch.bfloat16) -> dict:
     """Compute val loss components + per-bin breakdowns.
 
-    Per-bin MSE is computed in the *same* space as the loss (`mse_space`)
-    so the binned diagnostic stays comparable to `val/mse`. When
-    `mse_space="final_norm"` this means computing one extra RMSNorm
-    forward on `h_pred` / `h_target` per batch — cheap.
+    `loss_kwargs` is the exact dict passed to `composite_loss` in the
+    train loop, so val and train never diverge on the loss recipe.
+
+    Per-bin MSE is computed in the *same* space as the loss
+    (`loss_kwargs["mse_space"]`) so the binned diagnostic stays
+    comparable to `val/mse`.
+
+    Also logs `top1_agree` — mean over masked positions of
+    `argmax(p_pred) == argmax(p_actual)`. This is a *diagnostic only*
+    (it is teacher-forced, hence exposure-bias-blind); never use it for
+    checkpoint selection (v3 plan, Change 2).
     """
+    mse_space = loss_kwargs.get("mse_space", "raw")
     model.eval()
     sums = defaultdict(float); counts = defaultdict(int)
     bin_sums = defaultdict(lambda: defaultdict(float))
@@ -232,12 +240,26 @@ def run_val(model, val_dl, token_embed, final_norm, lm_head, *,
             delta_h, c_pos,
             batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
             final_norm, lm_head,
-            lambda_mse=lambda_mse, lambda_kl=lambda_kl, lambda_conf=lambda_conf,
-            mse_space=mse_space,
+            **loss_kwargs,
         )
         for k, v in loss_dict.items():
             sums[k]   += float(v.item())
             counts[k] += 1
+
+        # v3 — top1_agree diagnostic: argmax(p_pred) vs argmax(p_actual)
+        # at mask positions. Teacher-forced, so exposure-bias-blind —
+        # logged for the diagnostic gap vs free-running metrics, never
+        # used as a selector.
+        with torch.no_grad():
+            h_pred_t1   = batch_dev["h_ref"] + delta_h
+            logits_pred = lm_head(final_norm(h_pred_t1))
+            logits_act  = lm_head(final_norm(batch_dev["h_target"]))
+            agree = (logits_pred.argmax(-1) == logits_act.argmax(-1))    # [B, T]
+            m_t1  = batch_dev["mask_tgt"].bool()
+            denom_t1 = int(m_t1.sum().item())
+            if denom_t1 > 0:
+                sums["top1_agree"]   += float(agree[m_t1].float().mean().item())
+                counts["top1_agree"] += 1
 
         # Per-(gap, reveal_bin) sums of MSE per row, in the loss's space.
         gap = (batch["i_target"] - batch["i_ref"]).numpy()              # [B]
@@ -401,15 +423,268 @@ class _BestTracker:
         )
         return True
 
+    def maybe_save_topk(self, *, label: str, value: float | None, mode: str,
+                        step: int, model, opt, cfg, k: int = 3) -> bool:
+        """Keep the top-`k` checkpoints by `label` (v3 phase-1 selection).
+
+        Unlike `maybe_save` (one file per label), this retains up to `k`
+        `best_<label>_step<N>.pt` files. When a new value beats the worst
+        of the current k, the new checkpoint is written and the worst is
+        evicted. State for `label` is stored as a list of
+        `{value, step, mode}`.
+        """
+        if value is None or not math.isfinite(value):
+            return False
+        entries = self.state.get(label, [])
+        if not isinstance(entries, list):   # migrate any stale scalar state
+            entries = []
+        better = (lambda v, w: v < w) if mode == "min" else (lambda v, w: v > w)
+
+        if len(entries) >= k:
+            worst = (max if mode == "min" else min)(
+                entries, key=lambda e: e["value"],
+            )
+            if not better(value, worst["value"]):
+                return False
+
+        new_path = self.ckpt_dir / f"best_{label}_step{step}.pt"
+        torch.save({
+            "step": step,
+            "model": model.state_dict(),
+            "opt":   opt.state_dict(),
+            "cfg":   dict(cfg),
+            "best_label": label,
+            "best_value": value,
+            "best_mode":  mode,
+        }, new_path)
+        entries.append({"value": float(value), "step": int(step), "mode": mode})
+        # Sort best-first, evict everything past rank k.
+        entries.sort(key=lambda e: e["value"], reverse=(mode == "max"))
+        for e in entries[k:]:
+            old = self.ckpt_dir / f"best_{label}_step{e['step']}.pt"
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        entries = entries[:k]
+        self.state[label] = entries
+        self.sidecar.write_text(json.dumps(self.state, indent=2))
+        self.log(
+            f"[best] {label}={value:.4f} @ step {step} → top-{k}: "
+            + ", ".join(f"{e['value']:.4f}@{e['step']}" for e in entries)
+        )
+        return True
+
+
+def run_conf_phase(cfg, resume_from: str) -> None:
+    """v3 phase 2 (Change 3) — train ONLY the confidence head.
+
+    The delta + trunk are loaded frozen from a phase-1 checkpoint; only
+    `conf_head_per_pos` trains. Supervision is the free-running DAgger
+    label from `inference/conf_rollout.py` — the conf head learns to
+    predict commit safety on the delta's *own* free-running states, not
+    on cached teacher-forced ones.
+
+    Selection: every `log.val_every` steps a small hybrid GSM8K eval
+    measures `rollback_rate`; the checkpoint is scored
+    `accuracy_hybrid` when `rollback_rate ∈ [0.5, 0.7]` (the healthy
+    band) and `accuracy_hybrid − 1.0` otherwise, so an in-band
+    checkpoint always wins. Best is saved as `best_conf_step<N>.pt`.
+    """
+    import torch.nn.functional as F
+    from .llada_runtime import load_llada
+    from .inference.conf_rollout import collect_dagger_records, records_to_batches
+    from .eval.gsm8k_e2e import run_gsm8k_eval
+
+    device = "cuda"
+    dtype  = {"bf16": torch.bfloat16, "fp16": torch.float16,
+              "fp32": torch.float32}[cfg.optim.precision]
+
+    # --- backbone (full model — the rollout needs real forwards) ----------
+    print("[conf] loading backbone …", flush=True)
+    backbone, tokenizer = load_llada(fast_dllm_path=cfg.backbone.fast_dllm_path)
+    backbone = backbone.to(device)
+    backbone.eval()
+    # run_gsm8k_eval reads `backbone_model._tokenizer` when both the
+    # backbone and delta model are passed in — load_llada doesn't attach
+    # it, so do it here.
+    backbone._tokenizer = tokenizer
+    for p_ in backbone.parameters():
+        p_.requires_grad_(False)
+    transformer = backbone.model.transformer
+    token_embed, final_norm, lm_head = (
+        transformer.wte, transformer.ln_f, transformer.ff_out,
+    )
+    bb_cfg = {
+        "rope_theta":  float(getattr(backbone.config, "rope_theta", 1e6)),
+        "rms_eps":     float(getattr(backbone.config, "layer_norm_eps", 1e-5)),
+        "max_seq_len": int(getattr(backbone.config, "max_sequence_length", 8192)),
+    }
+
+    # --- delta model — phase-1 weights, frozen except the conf head -------
+    ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
+    model = VariantC(
+        d_model=cfg.model.d_model, n_heads=cfg.model.n_heads,
+        n_layers=cfg.model.n_layers,
+        d_ff_inner=getattr(cfg.model, "d_ff_inner", None),
+        dropout=cfg.model.dropout,
+        rope_theta=bb_cfg["rope_theta"], rms_eps=bb_cfg["rms_eps"],
+        max_seq_len=bb_cfg["max_seq_len"],
+        detach_conf_features=bool(getattr(cfg.model, "detach_conf_features", False)),
+    ).to(device, dtype=dtype)
+    model.load_state_dict(ckpt["model"])
+    for p_ in model.parameters():
+        p_.requires_grad_(False)
+    for p_ in model.conf_head_per_pos.parameters():
+        p_.requires_grad_(True)
+    conf_params = [p_ for p_ in model.conf_head_per_pos.parameters()]
+    n_conf = sum(p_.numel() for p_ in conf_params)
+    print(f"[conf] phase-1 ckpt={resume_from}  trainable conf-head params={n_conf}",
+          flush=True)
+
+    opt = torch.optim.AdamW(
+        conf_params, lr=cfg.optim.lr, betas=tuple(cfg.optim.betas),
+        weight_decay=cfg.optim.weight_decay,
+    )
+
+    # --- rollout prompts (GSM8K train split) ------------------------------
+    from datasets import load_dataset
+    n_prompts   = int(getattr(cfg, "conf_rollout_prompts", 64))
+    ds = load_dataset("gsm8k", "main", split="train").shuffle(seed=cfg.seed)
+    ds = ds.select(range(min(n_prompts, len(ds))))
+    prompts = [
+        torch.tensor(
+            tokenizer(tokenizer.apply_chat_template(
+                [{"role": "user", "content": r["question"]}],
+                add_generation_prompt=True, tokenize=False))["input_ids"],
+            dtype=torch.long,
+        ).unsqueeze(0).to(device)
+        for r in ds
+    ]
+    print(f"[conf] {len(prompts)} rollout prompts", flush=True)
+
+    # --- logging / checkpoints --------------------------------------------
+    wandb = _setup_wandb(cfg)
+    ckpt_dir = Path(cfg.checkpoint.out_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    metrics_fp = (ckpt_dir / "metrics.jsonl").open("a", buffering=1)
+
+    def log_metrics(step: int, payload: dict) -> None:
+        if wandb is not None:
+            wandb.log(payload, step=step)
+        metrics_fp.write(json.dumps({"step": int(step), **payload}) + "\n")
+
+    best_tracker = _BestTracker(ckpt_dir, log=lambda s: print(s, flush=True))
+
+    # --- DAgger loop ------------------------------------------------------
+    max_steps  = int(cfg.optim.max_steps)
+    conf_batch = int(getattr(cfg, "conf_batch_size", 64))
+    factor     = float(getattr(cfg.loss, "decode_factor", 1.0))
+    conf_topk  = int(getattr(cfg.loss, "conf_topk", 10))
+    gen = torch.Generator(); gen.manual_seed(int(cfg.seed))
+
+    # Collect the DAgger buffer ONCE. The rollout is delta-only (ungated)
+    # and the delta is frozen in phase 2 → the free-running trajectory,
+    # and hence the buffer, is fixed. No refresh needed; phase 2 then
+    # epochs over this buffer.
+    model.eval()
+    records = collect_dagger_records(
+        backbone, model, final_norm, lm_head, token_embed, prompts,
+        factor=factor, conf_topk=conf_topk,
+    )
+    print(f"[conf] collected {len(records)} DAgger records", flush=True)
+    if not records:
+        raise RuntimeError("conf phase: rollout produced no records")
+
+    step = 0
+    while step < max_steps:
+        model.train()   # only conf_head_per_pos has requires_grad
+        for batch in records_to_batches(records, conf_batch,
+                                        device=device, generator=gen):
+            _delta_h, c_pos = model(
+                batch["h_ref"].to(dtype),
+                batch["prev_emb"].to(dtype),
+                batch["prefix_kv"].to(torch.float16),
+                batch["block_start_pos"],
+                prefix_kv_pad_mask=batch["prefix_kv_pad_mask"],
+            )
+            mask_f = batch["mask_tgt"].to(c_pos.dtype)
+            denom  = mask_f.sum().clamp_min(1.0)
+            bce_pp = F.binary_cross_entropy(
+                c_pos.float(), batch["c_label"].float(), reduction="none",
+            )
+            loss = (bce_pp * mask_f).sum() / denom
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(conf_params, cfg.optim.grad_clip)
+            opt.step(); opt.zero_grad()
+            step += 1
+
+            if step % cfg.log.log_every == 0:
+                log_metrics(step, {"conf/bce": float(loss.item())})
+
+            if step % cfg.log.val_every == 0:
+                model.eval()
+                try:
+                    gsm = run_gsm8k_eval(
+                        backbone_model=backbone, delta_model=model,
+                        n_problems=cfg.log.gsm8k_subset,
+                        per_pos_threshold=getattr(
+                            cfg.log, "gsm8k_per_pos_threshold", 0.75),
+                        seed=cfg.seed, show_progress=False,
+                    )
+                    rb  = float(gsm.get("rollback_rate", 1.0))
+                    acc = float(gsm.get("accuracy_hybrid", 0.0))
+                    # In-band rollback rate always outranks out-of-band.
+                    in_band = 0.5 <= rb <= 0.7
+                    score   = acc if in_band else acc - 1.0
+                    log_metrics(step, {f"gsm8k/{k}": v for k, v in gsm.items()})
+                    best_tracker.maybe_save(
+                        label="conf", value=score, mode="max",
+                        step=step, model=model, opt=opt, cfg=cfg,
+                    )
+                    print(f"[conf] step {step}: acc={acc:.3f} rb_rate={rb:.3f} "
+                          f"in_band={in_band}", flush=True)
+                except Exception as e:
+                    print(f"[conf] gsm8k eval failed (continuing): {e}", flush=True)
+                model.train()
+
+            if step >= max_steps:
+                break
+
+    _ckpt_save(model, opt, step, cfg, out_dir=ckpt_dir)
+    metrics_fp.close()
+    print(f"[conf] done — {step} steps. checkpoints in {ckpt_dir}", flush=True)
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--override", action="append", default=[])
     p.add_argument("--resume_from", default=None)
+    p.add_argument(
+        "--phase", choices=["joint", "delta", "conf"], default="joint",
+        help="v3 training phase. joint = legacy v2 behavior (delta + conf "
+             "trained together). delta = phase 1 (delta only: lambda_conf "
+             "forced to 0, hybrid-GSM8K off, delta-only GSM8K on, top-3 "
+             "checkpoints tracked). conf = phase 2 (freeze all but the "
+             "conf head, BCE-only on free-running DAgger labels; requires "
+             "--resume_from a phase-1 checkpoint).",
+    )
     args = p.parse_args()
 
+    phase = args.phase
+    if phase == "conf" and not args.resume_from:
+        p.error("--phase conf requires --resume_from <phase-1 checkpoint>")
+
     cfg = _load_config(args.config, args.override)
+
+    # v3 phase 2 is a separate training mode — dispatch before the
+    # teacher-forced dataset / dataloader machinery (which it never uses).
+    if phase == "conf":
+        torch.manual_seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        run_conf_phase(cfg, args.resume_from)
+        return
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -626,7 +901,30 @@ def main() -> None:
     if best_tracker.state:
         print(f"[train] resumed best_metrics: {best_tracker.state}", flush=True)
 
-    log_keys = ("loss", "mse", "kl", "bce", "c_label_mean", "c_pred_mean")
+    log_keys = ("loss", "mse", "kl", "kl_backward", "bce",
+                "c_label_mean", "c_pred_mean")
+
+    # v3 loss knobs (Change 1 + Change 4). Pulled once; passed verbatim to
+    # every composite_loss call (train loop + run_val) so the two never
+    # diverge. Legacy defaults reproduce pre-v3 behaviour exactly.
+    loss_kwargs = dict(
+        lambda_mse=cfg.loss.lambda_mse,
+        lambda_kl=cfg.loss.lambda_kl,
+        lambda_conf=cfg.loss.lambda_conf,
+        mse_space=getattr(cfg.loss, "mse_space", "raw"),
+        conf_target=getattr(cfg.loss, "conf_target", "shared_mass"),
+        conf_topk=int(getattr(cfg.loss, "conf_topk", 10)),
+        kl_mode=getattr(cfg.loss, "kl_mode", "forward"),
+        lambda_kl_backward=float(getattr(cfg.loss, "lambda_kl_backward", 0.5)),
+        kl_backward_clamp=float(getattr(cfg.loss, "kl_backward_clamp", 10.0)),
+    )
+    # v3 phase 1 (delta): the conf head is not trained. Force its loss
+    # weight to 0 so BCE contributes no gradient, regardless of the
+    # config value.
+    if phase == "delta":
+        loss_kwargs["lambda_conf"] = 0.0
+        print("[train] phase=delta → lambda_conf forced to 0 (conf head untrained)",
+              flush=True)
     print("[train] starting", flush=True)
     t0 = time.time()
     train_iter = iter(train_dl)
@@ -665,10 +963,7 @@ def main() -> None:
                 delta_h, c_pos,
                 batch_dev["h_ref"], batch_dev["h_target"], batch_dev["mask_tgt"],
                 final_norm, lm_head,
-                lambda_mse=cfg.loss.lambda_mse,
-                lambda_kl=cfg.loss.lambda_kl,
-                lambda_conf=cfg.loss.lambda_conf,
-                mse_space=getattr(cfg.loss, "mse_space", "raw"),
+                **loss_kwargs,
             )
 
         with timers.time("bwd"):
@@ -713,10 +1008,7 @@ def main() -> None:
             with timers.time("val"):
                 val_metrics = run_val(
                     model, val_dl, token_embed, final_norm, lm_head,
-                    lambda_mse=cfg.loss.lambda_mse,
-                    lambda_kl=cfg.loss.lambda_kl,
-                    lambda_conf=cfg.loss.lambda_conf,
-                    mse_space=getattr(cfg.loss, "mse_space", "raw"),
+                    loss_kwargs=loss_kwargs,
                     bins_gap=cfg.log.bins_gap,
                     bins_reveal=cfg.log.bins_reveal,
                     device=device, dtype=dtype,
@@ -733,6 +1025,11 @@ def main() -> None:
                 and step % cfg.log.gsm8k_every == 0):
             try:
                 from .eval.gsm8k_e2e import run_gsm8k_eval
+                # v3 phase=delta: the conf head is untrained, so the hybrid
+                # gate is meaningless — run delta-only GSM8K instead (the
+                # free-running phase-1 selection metric) and track top-3.
+                # Other phases keep the hybrid eval + single-best tracker.
+                delta_only_eval = (phase == "delta")
                 gsm = run_gsm8k_eval(
                     backbone_model=None,         # let the eval load its own
                     delta_model=model,
@@ -740,6 +1037,7 @@ def main() -> None:
                     per_pos_threshold=getattr(
                         cfg.log, "gsm8k_per_pos_threshold", 0.85,
                     ),
+                    delta_only=delta_only_eval,
                     inner_loop_max_iter=getattr(
                         cfg.log, "gsm8k_inner_loop_max_iter", None,
                     ),
@@ -747,10 +1045,17 @@ def main() -> None:
                     show_progress=False,   # keep the train loop's pbar clean
                 )
                 log_metrics(step, {f"gsm8k/{k}": v for k, v in gsm.items()})
-                best_tracker.maybe_save(
-                    label="gsm8k", value=gsm.get("accuracy_hybrid"), mode="max",
-                    step=step, model=model, opt=opt, cfg=cfg,
-                )
+                if delta_only_eval:
+                    best_tracker.maybe_save_topk(
+                        label="delta_gsm8k",
+                        value=gsm.get("accuracy_hybrid"), mode="max",
+                        step=step, model=model, opt=opt, cfg=cfg, k=3,
+                    )
+                else:
+                    best_tracker.maybe_save(
+                        label="gsm8k", value=gsm.get("accuracy_hybrid"),
+                        mode="max", step=step, model=model, opt=opt, cfg=cfg,
+                    )
             except Exception as e:
                 pbar.write(f"[gsm8k] mid-train eval failed (continuing): {e}")
 

@@ -36,6 +36,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _tiered_conf_label(
+    p_actual: torch.Tensor,        # [B, T, V]  detached
+    p_pred:   torch.Tensor,        # [B, T, V]  detached
+    *,
+    topk: int = 10,
+) -> torch.Tensor:
+    """v3 Change 1 — tiered confidence target in [0, 1], shape [B, T].
+
+        c_label = (1/3)·s_top1 + (1/3)·s_topk + (1/3)·s_all
+
+    - s_top1  : binary — 1.0 iff argmax(p_actual) == argmax(p_pred).
+    - s_topk  : normalized overlap on p_actual's top-k support,
+                Σ_topk min(p_a,p_p) / Σ_topk p_a  — 1.0 on a perfect
+                in-support match.
+    - s_all   : normalized overlap on the full support; Σ p_a = 1 so this
+                is just the sum-of-min (= legacy shared_mass).
+
+    Equal 1/3 weights ⇒ if the top-1 disagrees, c_label ≤ 2/3 regardless
+    of the rest of the match — the label tracks the greedy commit
+    outcome instead of a tail artefact.
+    """
+    # s_top1 — binary argmax agreement.
+    s_top1 = (p_actual.argmax(-1) == p_pred.argmax(-1)).to(p_actual.dtype)
+
+    # s_all — full-support normalized overlap (denominator = Σ p_a = 1).
+    s_all = torch.minimum(p_actual, p_pred).sum(-1)
+
+    # s_topk — normalized overlap restricted to p_actual's top-k tokens.
+    topk_vals, topk_idx = p_actual.topk(topk, dim=-1)               # [B,T,k]
+    p_pred_topk  = p_pred.gather(-1, topk_idx)                       # [B,T,k]
+    overlap_topk = torch.minimum(topk_vals, p_pred_topk).sum(-1)     # [B,T]
+    denom_topk   = topk_vals.sum(-1).clamp_min(1e-9)                 # [B,T]
+    s_topk       = overlap_topk / denom_topk                         # [B,T]
+
+    c_label = (s_top1 + s_topk + s_all) / 3.0
+    return c_label.clamp_(0.0, 1.0)
+
+
 def composite_loss(
     delta_h_pred: torch.Tensor,         # [B, T, d_model]
     c_pos:        torch.Tensor,         # [B, T]                     per-position conf in (0, 1)
@@ -49,6 +87,13 @@ def composite_loss(
     lambda_kl:   float = 0.1,
     lambda_conf: float = 0.1,
     mse_space:   str   = "raw",         # "raw" (legacy) | "final_norm" (T1, M1 default)
+    # v3 Change 1 — confidence-head target.
+    conf_target: str   = "shared_mass", # "shared_mass" (legacy) | "tiered" (v3)
+    conf_topk:   int   = 10,            # k for the tiered target's s_topk
+    # v3 Change 4 — symmetric KL on the delta objective.
+    kl_mode:           str   = "forward",   # "forward" (legacy) | "symmetric" (v3)
+    lambda_kl_backward: float = 0.5,        # weight on KL(p_pred ‖ p_actual)
+    kl_backward_clamp:  float = 10.0,       # max of the per-token backward-KL log-ratio
 ) -> dict[str, torch.Tensor]:
     """Returns a dict containing 'loss' (scalar w/ grad) and detached
     component scalars suitable for logging."""
@@ -81,22 +126,52 @@ def composite_loss(
             "expected 'raw' or 'final_norm'."
         )
 
-    # KL(p_actual ‖ p_predicted) at mask positions only.
-    kl_per_pos = (p_actual * (log_p_actual - log_p_pred)).sum(-1)       # [B, T]
-    mask_f     = mask_tgt.to(kl_per_pos.dtype)                          # [B, T]
+    # Forward KL(p_actual ‖ p_predicted) at mask positions only. This is
+    # the metric of record — `kl` in the return dict keeps meaning the
+    # forward KL so `train/kl` / `val/kl` plots stay comparable across
+    # every run, regardless of `kl_mode`.
+    kl_fwd_per_pos = (p_actual * (log_p_actual - log_p_pred)).sum(-1)   # [B, T]
+    mask_f     = mask_tgt.to(kl_fwd_per_pos.dtype)                      # [B, T]
     mask_denom = mask_f.sum().clamp_min(1.0)                            # scalar
-    kl         = (kl_per_pos * mask_f).sum() / mask_denom
+    kl         = (kl_fwd_per_pos * mask_f).sum() / mask_denom
 
-    # Per-position shared-mass label (detached — only c_pos trains).
-    # Clamp guards against fp32-softmax roundoff: p_actual.sum() and
-    # p_pred.sum() each drift from exactly 1.0 by ~1e-7, so the sum-of-min
-    # can land at 1+ε. F.binary_cross_entropy's CUDA kernel hard-asserts
-    # `target ∈ [0, 1]`, aborting the whole step.
+    # v3 Change 4 — backward KL(p_predicted ‖ p_actual). Mode-seeking /
+    # zero-forcing: punishes p_pred mass on tokens p_actual considers
+    # unlikely (the spurious-argmax case forward KL is blind to). The
+    # per-token log-ratio is clamped on the max side — it diverges when
+    # p_actual(v) → 0 with p_pred(v) > 0; that divergence IS the signal
+    # but the clamp bounds the gradient where it would otherwise spike.
+    if kl_mode == "symmetric":
+        log_ratio = (log_p_pred - log_p_actual).clamp(max=kl_backward_clamp)
+        kl_bwd_per_pos = (log_p_pred.exp() * log_ratio).sum(-1)         # [B, T]
+        kl_backward = (kl_bwd_per_pos * mask_f).sum() / mask_denom
+    elif kl_mode == "forward":
+        kl_backward = torch.zeros((), device=kl.device, dtype=kl.dtype)
+    else:
+        raise ValueError(
+            f"composite_loss: unknown kl_mode={kl_mode!r}; "
+            "expected 'forward' or 'symmetric'."
+        )
+
+    # Per-position confidence-head label (detached — only c_pos trains).
+    # `clamp_(0,1)` guards fp32-softmax roundoff: p_actual / p_pred each
+    # drift from exactly 1.0 by ~1e-7, so an overlap can land at 1+ε,
+    # and F.binary_cross_entropy's CUDA kernel hard-asserts target∈[0,1].
     with torch.no_grad():
         p_pred_detached = log_p_pred.exp()
-        c_label_per_pos = (
-            torch.minimum(p_actual, p_pred_detached).sum(-1).clamp_(0.0, 1.0)
-        )   # [B, T]
+        if conf_target == "shared_mass":
+            c_label_per_pos = (
+                torch.minimum(p_actual, p_pred_detached).sum(-1).clamp_(0.0, 1.0)
+            )   # [B, T]
+        elif conf_target == "tiered":
+            c_label_per_pos = _tiered_conf_label(
+                p_actual, p_pred_detached, topk=conf_topk,
+            )   # [B, T]  (already clamped to [0, 1])
+        else:
+            raise ValueError(
+                f"composite_loss: unknown conf_target={conf_target!r}; "
+                "expected 'shared_mass' or 'tiered'."
+            )
 
     # Per-position BCE, masked to mask positions only. c_pos is in the
     # model dtype (bf16); c_label_per_pos is fp32 from the softmax upcast
@@ -113,11 +188,20 @@ def composite_loss(
         c_pred_mean  = (c_pos.float()         * mask_f).sum() / mask_denom
         c_label_mean = (c_label_per_pos       * mask_f).sum() / mask_denom
 
-    total = lambda_mse * mse + lambda_kl * kl + lambda_conf * bce
+    # The grad-bearing total. `kl` is always the forward KL; the backward
+    # term enters only under kl_mode="symmetric" (kl_backward is exactly
+    # 0 otherwise, so this line is correct in both modes).
+    total = (
+        lambda_mse * mse
+        + lambda_kl * kl
+        + lambda_kl_backward * kl_backward
+        + lambda_conf * bce
+    )
     return {
         "loss":         total,
         "mse":          mse.detach(),
         "kl":           kl.detach(),
+        "kl_backward":  kl_backward.detach(),
         "bce":          bce.detach(),
         "c_label_mean": c_label_mean.detach(),
         "c_pred_mean":  c_pred_mean.detach(),

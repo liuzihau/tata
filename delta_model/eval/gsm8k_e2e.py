@@ -80,6 +80,7 @@ def run_gsm8k_eval(
     fast_dllm_path: str | None = None,
     n_problems: int = 200,
     per_pos_threshold: "float | callable" = 0.85,
+    delta_only: bool = False,
     seed: int = 42,
     threshold: float | None = None,
     factor: float | None = 1.0,
@@ -172,12 +173,15 @@ def run_gsm8k_eval(
         prompt_ids = _format_prompt_llada(tokenizer, prob["question"])
         gold_num = extract_final_number(prob["answer"])
 
-        # Hybrid run.
+        # Hybrid run. With delta_only=True the gate + rollback are
+        # bypassed — pure free-running delta decode, the v3 phase-1
+        # selection metric.
         t0 = time.time()
         out_ids, stats = generate_with_delta(
             backbone_model, delta_model, final_norm, lm_head, token_embed,
             prompt_ids,
             per_pos_threshold=per_pos_threshold,
+            delta_only=delta_only,
             threshold=threshold, factor=factor,
             inner_loop_max_iter=inner_loop_max_iter,
         )
@@ -271,6 +275,7 @@ def run_gsm8k_eval(
         "per_pos_threshold":          per_pos_threshold
                                        if isinstance(per_pos_threshold, float)
                                        else "callable",
+        "delta_only":                 bool(delta_only),
         "inner_loop_max_iter":        inner_loop_max_iter,
     }
     if revealed_at_finish:
@@ -309,6 +314,14 @@ def main() -> None:
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_json", default=None)
+    p.add_argument(
+        "--delta_only", action="store_true",
+        help="Pure free-running delta decode — bypass the conf gate and "
+             "rollback entirely (the delta commits whatever Fast-dLLM "
+             "wants every in-block pass, no backbone help). This is the "
+             "v3 phase-1 selection metric. Ignores --per_pos_thresholds "
+             "(runs a single delta-only eval).",
+    )
     p.add_argument(
         "--use_thr_lookup", type=str, default=None,
         help="Path to a `metrics.jsonl` that contains "
@@ -356,7 +369,23 @@ def main() -> None:
     )
 
     rows = []
-    if args.use_thr_lookup:
+    if args.delta_only:
+        # Delta-only mode: one free-running eval, no gate / no rollback.
+        print("[gsm8k] delta_only — single free-running delta decode", flush=True)
+        m = run_gsm8k_eval(
+            delta_ckpt=args.delta_ckpt,
+            fast_dllm_path=args.fast_dllm_path,
+            n_problems=args.n_problems,
+            delta_only=True,
+            seed=args.seed,
+            threshold=decoding_threshold,
+            factor=decoding_factor,
+            inner_loop_max_iter=args.inner_loop_max_iter,
+        )
+        m["thr_mode"] = "delta_only"
+        print(json.dumps(m, indent=2), flush=True)
+        rows.append(m)
+    elif args.use_thr_lookup:
         # Lookup mode: build a (gap, reveal_frac) -> threshold callable
         # from the training metrics, then sweep across (base, max)
         # brackets. Each bracket is one row in the output JSON.

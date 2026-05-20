@@ -12,9 +12,13 @@ sibling `peft_project/` trees. The only external code dependency is
 The current end-to-end pipeline:
 
 ```
-collect_llada  →  thin_cache  →  repack --rm_source  →  sanity  →  train  →  gsm8k_e2e  →  plot_sweep
-                  (optional)                            (preflight)            (sweep)      / plot_metrics
+collect_llada → thin_cache → repack --rm_source → sanity → train → gsm8k_e2e → plot_sweep
+                (optional)                        (preflight)        (sweep)    / plot_metrics
 ```
+
+`train` is either the legacy single `--phase joint` run, or the v3
+two-phase pipeline (`run_v3.sh`: `--phase delta` → top-3 →
+`--phase conf` ×3). See §5.
 
 A clean run from scratch is in [Quickstart](#quickstart). Sections
 below cover each step in detail.
@@ -242,16 +246,37 @@ Pass criteria:
 
 ## 5 · Train (`train.py`)
 
+`train.py --phase {joint, delta, conf}` selects the training mode.
+`joint` is the legacy v2 behavior (delta + conf head together). `delta`
+and `conf` are the v3 two-phase pipeline (`v3_plan.md`).
+
 ```bash
-# Current frontier — T10 (T9 + n_layers=4):
+# === v3 frontier — two-phase pipeline ===
+# Whole pipeline: phase 1 → top-3 → 3×(phase 2 + GSM8K sweep)
+./run_v3.sh
+ONLY_PHASE1=1 ./run_v3.sh                       # phase 1 only
+SKIP_PHASE1=1 ./run_v3.sh                       # phases 2+3 from existing phase-1 ckpts
+
+# Phase 1 by hand — delta training. --phase delta forces lambda_conf=0,
+# runs delta-only mid-train GSM8K, keeps the top-3 checkpoints.
+python -m delta_model.train --phase delta \
+    --config delta_model/configs/v3_phase1_delta_llada_variant_c.yaml \
+    --override backbone.fast_dllm_path=external/Fast-dLLM/v1
+
+# Phase 2 by hand — conf-head training (frozen delta, DAgger labels).
+# Run once per top-3 phase-1 checkpoint, each to a distinct out_dir.
+python -m delta_model.train --phase conf \
+    --config delta_model/configs/v3_phase2_conf_llada_variant_c.yaml \
+    --resume_from ckpts/v3_phase1_delta_llada_variant_c/best_delta_gsm8k_step<N>.pt \
+    --override backbone.fast_dllm_path=external/Fast-dLLM/v1 \
+    --override checkpoint.out_dir=ckpts/v3_phase2_conf_cand1
+
+# === legacy v2 — default --phase joint ===
 python -m delta_model.train \
     --config delta_model/configs/m1_5_v2_t10_20k_interleaved_llada_variant_c.yaml \
     --override backbone.fast_dllm_path=external/Fast-dLLM/v1
-
-# Or run the whole v2 bracket (5k+10k+20k×3 samplers + T9 + T10) sequentially:
-./run_v2_trainings.sh                           # all configured runs
+./run_v2_trainings.sh                           # the whole v2 bracket
 ONLY="t10_20k_interleaved" ./run_v2_trainings.sh
-SKIP="20k_preload" ./run_v2_trainings.sh
 ```
 
 Single-line config overrides via `--override key=value` (dot notation):
@@ -300,44 +325,63 @@ locally without wandb cloud (`plot_metrics.py`, §7).
 
 ### Best-checkpoint files (auto-saved)
 
-Every run saves three kinds of checkpoint to `cfg.checkpoint.out_dir`:
+Checkpoints saved to `cfg.checkpoint.out_dir`, by phase:
 
-| pattern | when | survives `keep_last` |
+| pattern | when | phase |
 |---|---|---|
-| `step_<NNNNNNN>.pt` | every `cfg.checkpoint.every` steps | no (rotated) |
-| `best_val_kl_step<N>.pt` | when `val/kl` hits a new minimum | yes |
-| `best_gsm8k_step<N>.pt` | when `gsm8k/accuracy_hybrid` hits a new max | yes |
+| `step_<NNNNNNN>.pt` | every `cfg.checkpoint.every` steps (rotated by `keep_last`) | all |
+| `best_val_kl_step<N>.pt` | new `val/kl` minimum | joint |
+| `best_gsm8k_step<N>.pt` | new `gsm8k/accuracy_hybrid` max | joint |
+| `best_delta_gsm8k_step<N>.pt` × 3 | top-3 by free-running delta-only GSM8K | delta (phase 1) |
+| `best_conf_step<N>.pt` | best in-band — hybrid accuracy where rollback rate ∈ [0.5, 0.7] | conf (phase 2) |
 
 Use the `best_*` files for final eval. `<ckpt_dir>/best_metrics.json` is
-a sidecar that records the running best per metric (persists across
-resumes).
+a sidecar that records the running best per metric / per top-k list
+(persists across resumes).
 
 ---
 
 ## 6 · GSM8K eval & sweep (`eval/gsm8k_e2e.py`)
 
-Sweeps `per_pos_threshold` against the same GSM8K slice, comparing
-hybrid vs vanilla `generate_with_prefix_cache`.
+Compares hybrid (delta + Fast-dLLM) vs vanilla `generate_with_prefix_cache`
+on the same GSM8K slice. Three modes:
 
 ```bash
+# (1) fixed per_pos_threshold sweep — the default
 python -m delta_model.eval.gsm8k_e2e \
-    --delta_ckpt $(ls ckpts/m1_5_data20k_interleaved_llada_variant_c/best_gsm8k_step*.pt) \
+    --delta_ckpt $(ls ckpts/<run>/best_gsm8k_step*.pt) \
     --fast_dllm_path external/Fast-dLLM/v1 \
     --n_problems 200 \
     --per_pos_thresholds 0.70,0.80,0.85,0.90,0.95 \
-    --out_json eval_results/m1_5_data20k_interleaved_sweep.json
+    --out_json eval_results/<run>_sweep.json
+
+# (2) dynamic per-(gap,reveal) threshold lookup — see §"Dynamic … sweep"
+python -m delta_model.eval.gsm8k_e2e --delta_ckpt <ckpt> \
+    --fast_dllm_path external/Fast-dLLM/v1 --n_problems 200 \
+    --use_thr_lookup ckpts/<run>/metrics.jsonl \
+    --thr_lookup_brackets "0.65:0.95,0.70:0.90" \
+    --out_json eval_results/<run>_lookup_sweep.json
+
+# (3) delta-only — pure free-running delta, no conf gate, no rollback.
+#     The v3 phase-1 selection metric; ignores --per_pos_thresholds.
+python -m delta_model.eval.gsm8k_e2e --delta_ckpt <ckpt> \
+    --fast_dllm_path external/Fast-dLLM/v1 --n_problems 200 \
+    --delta_only --out_json eval_results/<run>_deltaonly.json
 ```
 
-Live progress bar shows running per-problem decode times, speedup, and
-accuracy — a broken threshold is visible after ~10 problems:
+Live progress bar shows running per-problem decode times, speedup,
+accuracy, hybrid/vanilla backbone calls, and rollback rate — a broken
+threshold is visible after ~10 problems:
 
 ```
-gsm8k thr=0.85:  47%|████▋     | 94/200 [03:12<03:36, hyb=1.83s, van=2.05s, x=1.12, acc_h=0.41, acc_v=0.75]
+gsm8k thr=0.85:  47%|████▋ | 94/200  hyb=1.83s van=2.05s x=1.12 acc_h=0.41 acc_v=0.75 bb_h=40.3 bb_v=24.6 rb%=80
 ```
 
-Output (one dict per threshold): `accuracy_hybrid`, `accuracy_vanilla`,
-`accuracy_delta`, `speedup_ratio`, `mean_rollbacks`,
-`mean_backbone_calls`, `mean_revealed_per_block`, `mean_blocks_finished`.
+Output (one dict per threshold / bracket): `accuracy_hybrid`,
+`accuracy_vanilla`, `accuracy_delta`, `speedup_ratio`, `mean_rollbacks`,
+`mean_backbone_calls`, `mean_vanilla_backbone_calls`,
+`mean_delta_forwards`, `mean_disagreements`, `rollback_rate`,
+`mean_revealed_per_block`, `mean_blocks_finished`, `thr_mode`.
 
 **Decoding mode must match collect.** Pass `--factor 1.0` (default) or
 `--threshold 0.9` — whichever was used to build the cache. The cache's

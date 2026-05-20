@@ -66,6 +66,7 @@ def generate_with_delta(
     max_iter_per_block: int = S.MAX_ITER,
     inner_loop_max_iter: int | None = None,
     per_pos_threshold: "float | Callable[[int, float], float]" = 0.85,
+    delta_only: bool = False,               # v3: bypass gate+rollback (pure delta)
     threshold: float | None = None,         # Fast-dLLM fixed-threshold mode
     factor: float | None = 1.0,             # Fast-dLLM dynamic-threshold mode
     temperature: float = 0.0,
@@ -358,27 +359,39 @@ def generate_with_delta(
                 # may be a float (global gate) OR a callable
                 # `(gap, reveal_frac) -> float` that returns a per-state
                 # threshold (see delta_model/inference/thr_lookup.py).
-                if callable(per_pos_threshold):
-                    gap_now = n_passes - i_ref_step
-                    reveal_frac_now = float(
-                        (x[:, s:e] != mask_id).float().mean().item()
-                    )
-                    thr_now = float(per_pos_threshold(gap_now, reveal_frac_now))
+                #
+                # delta_only mode (v3 phase-1 selection metric): the gate
+                # and rollback are bypassed entirely — the delta commits
+                # whatever Fast-dLLM wants on its own logits, every pass,
+                # no backbone help. This measures pure free-running delta
+                # quality. h_ref is never refreshed (no rollback), so all
+                # passes anchor to the pass-0 backbone forward.
+                if delta_only:
+                    agreement_blk = transfer_blk
                 else:
-                    thr_now = float(per_pos_threshold)
-                per_pos_pass = (c_pos.float() >= thr_now)                        # [1, BL]
-                agreement_blk = transfer_blk & per_pos_pass                      # [1, BL]
+                    if callable(per_pos_threshold):
+                        gap_now = n_passes - i_ref_step
+                        reveal_frac_now = float(
+                            (x[:, s:e] != mask_id).float().mean().item()
+                        )
+                        thr_now = float(per_pos_threshold(gap_now, reveal_frac_now))
+                    else:
+                        thr_now = float(per_pos_threshold)
+                    per_pos_pass = (c_pos.float() >= thr_now)                    # [1, BL]
+                    agreement_blk = transfer_blk & per_pos_pass                  # [1, BL]
 
                 # Step 3: commit ONLY agreement-set positions this pass.
                 new_blk = torch.where(agreement_blk, x0_blk, x[:, s:e])
                 x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
 
                 # Step 4: any disagreement → force rollback next pass.
-                n_want   = int(transfer_blk.sum().item())
-                n_agree  = int(agreement_blk.sum().item())
-                if n_want > n_agree:
-                    force_rollback_next = True
-                    stats["disagreements"] += 1
+                # Skipped in delta_only mode (no backbone, no rollback).
+                if not delta_only:
+                    n_want   = int(transfer_blk.sum().item())
+                    n_agree  = int(agreement_blk.sum().item())
+                    if n_want > n_agree:
+                        force_rollback_next = True
+                        stats["disagreements"] += 1
 
                 n_passes += 1
 
