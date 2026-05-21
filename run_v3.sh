@@ -19,7 +19,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 FAST_DLLM_PATH="${FAST_DLLM_PATH:-external/Fast-dLLM/v1}"
 N_PROBLEMS="${N_PROBLEMS:-200}"
-PER_POS_THRESHOLDS="${PER_POS_THRESHOLDS:-0.70,0.80,0.85,0.90,0.95}"
+PER_POS_THRESHOLDS="${PER_POS_THRESHOLDS:-0.70,0.75,0.80,0.85,0.90,0.95}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/v3}"
 
 PHASE1_CFG="delta_model/configs/v3_phase1_delta_llada_variant_c.yaml"
