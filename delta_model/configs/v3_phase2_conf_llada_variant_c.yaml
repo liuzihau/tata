@@ -33,6 +33,11 @@ backbone:
 conf_rollout_prompts:        64          # GSM8K-train prompts rolled out
 conf_batch_size:             64          # conf-head minibatch (one delta pass = one row)
 
+# Phase-2 checkpoint admissibility. A checkpoint is kept (top-2 by
+# speedup) only if it is fast enough AND accurate enough:
+conf_rollback_max:           0.70        # reject if rollback_rate above this (≈vanilla speed)
+conf_acc_keep_frac:          0.95        # reject if accuracy_hybrid < this × accuracy_vanilla
+
 data:
   # phase 2 does not read the teacher-forced cache, but keep these so
   # the config validates against the shared schema.

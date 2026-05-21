@@ -485,11 +485,16 @@ def run_conf_phase(cfg, resume_from: str) -> None:
     predict commit safety on the delta's *own* free-running states, not
     on cached teacher-forced ones.
 
-    Selection: every `log.val_every` steps a small hybrid GSM8K eval
-    measures `rollback_rate`; the checkpoint is scored
-    `accuracy_hybrid` when `rollback_rate ∈ [0.5, 0.7]` (the healthy
-    band) and `accuracy_hybrid − 1.0` otherwise, so an in-band
-    checkpoint always wins. Best is saved as `best_conf_step<N>.pt`.
+    Selection: every `log.val_every` steps a small hybrid GSM8K eval.
+    A checkpoint is *admissible* iff
+        rollback_rate  <= conf_rollback_max   (default 0.70 — slower than
+                                               this and the hybrid is ~vanilla)
+        accuracy_hybrid >= conf_acc_keep_frac * accuracy_vanilla
+                                              (default 0.95 — ≤5% acc drop)
+    Among admissible checkpoints the **top-2 by speedup_ratio** are kept
+    (`best_conf_step<N>.pt` ×2). Top-2, not top-1, is noise insurance —
+    the small in-loop eval is noisy, so Stage 3's full sweep picks the
+    real winner between the two.
     """
     import torch.nn.functional as F
     from .llada_runtime import load_llada
@@ -581,6 +586,11 @@ def run_conf_phase(cfg, resume_from: str) -> None:
     conf_batch = int(getattr(cfg, "conf_batch_size", 64))
     factor     = float(getattr(cfg.loss, "decode_factor", 1.0))
     conf_topk  = int(getattr(cfg.loss, "conf_topk", 10))
+    # Phase-2 admissibility: keep the top-2 by speedup among checkpoints
+    # that are both fast enough (rollback ≤ cap) and accurate enough
+    # (within conf_acc_keep_frac of vanilla).
+    conf_rollback_max  = float(getattr(cfg, "conf_rollback_max", 0.70))
+    conf_acc_keep_frac = float(getattr(cfg, "conf_acc_keep_frac", 0.95))
     gen = torch.Generator(); gen.manual_seed(int(cfg.seed))
 
     # Collect the DAgger buffer ONCE. The rollout is delta-only (ungated)
@@ -632,18 +642,26 @@ def run_conf_phase(cfg, resume_from: str) -> None:
                             cfg.log, "gsm8k_per_pos_threshold", 0.75),
                         seed=cfg.seed, show_progress=False,
                     )
-                    rb  = float(gsm.get("rollback_rate", 1.0))
-                    acc = float(gsm.get("accuracy_hybrid", 0.0))
-                    # In-band rollback rate always outranks out-of-band.
-                    in_band = 0.5 <= rb <= 0.7
-                    score   = acc if in_band else acc - 1.0
+                    rb   = float(gsm.get("rollback_rate", 1.0))
+                    acc  = float(gsm.get("accuracy_hybrid", 0.0))
+                    van  = float(gsm.get("accuracy_vanilla", 0.0))
+                    spd  = float(gsm.get("speedup_ratio", 0.0))
                     log_metrics(step, {f"gsm8k/{k}": v for k, v in gsm.items()})
-                    best_tracker.maybe_save(
-                        label="conf", value=score, mode="max",
-                        step=step, model=model, opt=opt, cfg=cfg,
-                    )
-                    print(f"[conf] step {step}: acc={acc:.3f} rb_rate={rb:.3f} "
-                          f"in_band={in_band}", flush=True)
+                    # Admissible = fast enough (rollback ≤ cap) AND accurate
+                    # enough (≥ conf_acc_keep_frac of vanilla). Among the
+                    # admissible checkpoints, keep the top-2 by speedup_ratio.
+                    acc_floor  = conf_acc_keep_frac * van
+                    admissible = (rb <= conf_rollback_max) and (acc >= acc_floor)
+                    print(f"[conf] step {step}: acc={acc:.3f} "
+                          f"(van={van:.3f} floor={acc_floor:.3f})  "
+                          f"rb={rb:.3f} (cap={conf_rollback_max})  "
+                          f"speedup={spd:.2f}x  admissible={admissible}",
+                          flush=True)
+                    if admissible:
+                        best_tracker.maybe_save_topk(
+                            label="conf", value=spd, mode="max", k=2,
+                            step=step, model=model, opt=opt, cfg=cfg,
+                        )
                 except Exception as e:
                     print(f"[conf] gsm8k eval failed (continuing): {e}", flush=True)
                 model.train()

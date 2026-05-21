@@ -83,26 +83,34 @@ for p1 in "${PHASE1_CKPTS[@]}"; do
       --override "checkpoint.out_dir=${p2_dir}" \
       2>&1 | tee "$LOG_DIR/phase2_${tag}.$(date +%Y%m%d_%H%M%S).log"
 
-  best_conf=$(ls -1 "$p2_dir"/best_conf_step*.pt 2>/dev/null | head -n 1 || true)
-  if [[ -z "$best_conf" ]]; then
-    # fall back to the newest rolling checkpoint if no in-band best landed
-    best_conf=$(ls -1 "$p2_dir"/step_*.pt 2>/dev/null | sort | tail -n 1 || true)
+  # phase 2 keeps up to 2 admissible checkpoints (top-2 by speedup) —
+  # sweep every one of them; Stage 3's full 200-problem sweep picks the
+  # real winner between them.
+  mapfile -t conf_ckpts < <(ls -1 "$p2_dir"/best_conf_step*.pt 2>/dev/null || true)
+  if [[ ${#conf_ckpts[@]} -eq 0 ]]; then
+    # no admissible checkpoint landed — fall back to the newest rolling one
+    fallback=$(ls -1 "$p2_dir"/step_*.pt 2>/dev/null | sort | tail -n 1 || true)
+    [[ -n "$fallback" ]] && conf_ckpts=("$fallback")
   fi
-  if [[ -z "$best_conf" ]]; then
+  if [[ ${#conf_ckpts[@]} -eq 0 ]]; then
     echo "[v3] WARN: no checkpoint produced for ${tag}; skipping its sweep" >&2
     continue
   fi
 
-  out_json="eval_results/v3_${tag}_sweep.json"
-  echo "[v3] === Stage 3 (${tag}): GSM8K sweep on $(basename "$best_conf") ==="
-  python -m delta_model.eval.gsm8k_e2e \
-      --delta_ckpt "$best_conf" \
-      --fast_dllm_path "$FAST_DLLM_PATH" \
-      --n_problems "$N_PROBLEMS" \
-      --per_pos_thresholds "$PER_POS_THRESHOLDS" \
-      --out_json "$out_json" \
-      2>&1 | tee "$LOG_DIR/sweep_${tag}.$(date +%Y%m%d_%H%M%S).log"
-  sweep_jsons+=("$out_json")
+  ci=0
+  for cc in "${conf_ckpts[@]}"; do
+    ci=$((ci + 1))
+    out_json="eval_results/v3_${tag}_c${ci}_sweep.json"
+    echo "[v3] === Stage 3 (${tag} c${ci}): GSM8K sweep on $(basename "$cc") ==="
+    python -m delta_model.eval.gsm8k_e2e \
+        --delta_ckpt "$cc" \
+        --fast_dllm_path "$FAST_DLLM_PATH" \
+        --n_problems "$N_PROBLEMS" \
+        --per_pos_thresholds "$PER_POS_THRESHOLDS" \
+        --out_json "$out_json" \
+        2>&1 | tee "$LOG_DIR/sweep_${tag}_c${ci}.$(date +%Y%m%d_%H%M%S).log"
+    sweep_jsons+=("$out_json")
+  done
 done
 
 # --- summary ---------------------------------------------------------------
