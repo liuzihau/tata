@@ -47,6 +47,26 @@ from ..llada_runtime import (
     _get_transfer_index_dynamic,
     load_llada,
 )
+from ..models.variant_c import VariantC
+
+
+def _load_delta_for_collect(delta_ckpt: str, backbone) -> torch.nn.Module:
+    """Load a VariantC delta from a v3 phase-1 checkpoint, for in-the-loop
+    scheduled sampling (v4). Backbone hyperparams are read off
+    `backbone.config` so RoPE / RMSNorm match what produced the cache.
+    """
+    ckpt = torch.load(delta_ckpt, map_location="cpu", weights_only=False)
+    cm = ckpt["cfg"]["model"]
+    delta = VariantC(
+        d_model=cm["d_model"], n_heads=cm["n_heads"], n_layers=cm["n_layers"],
+        d_ff_inner=cm.get("d_ff_inner"), dropout=0.0,
+        detach_conf_features=bool(cm.get("detach_conf_features", False)),
+        rope_theta=float(getattr(backbone.config, "rope_theta", 1e6)),
+        rms_eps=float(getattr(backbone.config, "layer_norm_eps", 1e-5)),
+        max_seq_len=int(getattr(backbone.config, "max_sequence_length", 8192)),
+    ).to(backbone.device, dtype=torch.bfloat16).eval()
+    delta.load_state_dict(ckpt["model"])
+    return delta
 
 
 # ---------------------------------------------------------------------------
@@ -239,9 +259,25 @@ def collect_one_sample(
     temperature: float = 0.0,
     remasking: str = "low_confidence",
     mask_id: int = S.LLADA_MASK_TOKEN_ID,
+    delta_model=None,
+    final_norm=None,
+    lm_head=None,
+    token_embed=None,
+    sched_sampling_p: float = 0.0,
+    sched_rng: "random.Random | None" = None,
 ) -> dict | None:
     """Run prefix-cache generation on one prompt and return the cache dict
     described in `data/schema.py`. Returns None only for empty prompts.
+
+    Scheduled sampling (v4 — DAgger for the delta). When `delta_model` is
+    given and `sched_sampling_p > 0`, then at each in-block iteration ≥ 1,
+    with that probability, the committed tokens come from the **delta
+    model's** logits (`lm_head(final_norm(h_ref + Δh))`) instead of the
+    backbone's. The reveal pattern and committed token IDs then follow a
+    delta-influenced (free-running) trajectory, while `h_per_pass[i]`
+    stays the *backbone's* hidden at that state — exactly the
+    exposure-bias-correcting training target. `sched_sampling_p = 0`
+    (default) → pure teacher-forced collect, identical to the legacy path.
 
     `prefix_window` is the number of last-prefix slots cached per block.
     Default = `S.COLLECT_PREFIX_WINDOW` (64) so we have headroom over the
@@ -411,8 +447,10 @@ def collect_one_sample(
                     # Partial forward over the suffix x[:, s:] with cached
                     # prefix. This is the prefix-cache decoding pattern the
                     # baseline uses; h_per_pass[i] for i ≥ 1 is captured
-                    # under this same path so training target distribution
-                    # aligns with what the baseline produces at the same iter.
+                    # under this same path (via the hook) so the training
+                    # target distribution aligns with the baseline. This
+                    # backbone forward happens regardless of scheduled
+                    # sampling — h_per_pass[i] is always the backbone's.
                     out = model(
                         x[:, s:],
                         past_key_values=past_key_values,
@@ -420,26 +458,77 @@ def collect_one_sample(
                     )
                     logits = out.logits   # [1, GL - nb*BL, V] — covers x[:, s:]
 
-                    # Pass-≥1 token transfer: logits are suffix-only; restrict
-                    # the mask to the first `block_length` positions (the block).
-                    mask_index_blk = (x[:, s:] == mask_id)
-                    mask_index_blk[:, block_length:] = False
-                    if factor is not None:
-                        x0_full, transfer_full = _get_transfer_index_dynamic(
-                            logits, temperature, remasking, mask_index_blk,
-                            x[:, s:], factor=factor,
+                    # v4 scheduled sampling: with prob `sched_sampling_p`,
+                    # this iter's commit comes from the delta's logits, so
+                    # the reveal pattern / committed IDs follow a
+                    # delta-influenced trajectory.
+                    use_delta = (
+                        delta_model is not None
+                        and sched_sampling_p > 0.0
+                        and sched_rng is not None
+                        and sched_rng.random() < sched_sampling_p
+                    )
+
+                    if use_delta:
+                        ddt = delta_model.delta_head.proj.weight.dtype
+                        h_ref_g  = h_per_pass[0].to(
+                            model.device, dtype=torch.bfloat16,
+                        ).unsqueeze(0)                                # [1, BL, D]
+                        prev_emb = token_embed(x[0, s:e]).unsqueeze(0)
+                        pkv_g = prefix_kv[..., -S.PREFIX_WINDOW:, :].to(
+                            model.device,
+                        ).unsqueeze(0)
+                        pad_g = prefix_kv_pad_mask[-S.PREFIX_WINDOW:].to(
+                            model.device,
+                        ).unsqueeze(0)
+                        bsp = torch.tensor(
+                            [s], dtype=torch.long, device=model.device,
                         )
+                        delta_h, _c = delta_model(
+                            h_ref_g.to(ddt), prev_emb.to(ddt),
+                            pkv_g.to(torch.float16), bsp,
+                            prefix_kv_pad_mask=pad_g,
+                        )
+                        h_pred = h_ref_g + delta_h.to(h_ref_g.dtype)
+                        delta_logits = lm_head(final_norm(h_pred))    # [1, BL, V]
+                        mask_blk = (x[:, s:e] == mask_id)
+                        if factor is not None:
+                            x0_blk, transfer_blk = _get_transfer_index_dynamic(
+                                delta_logits, temperature, remasking, mask_blk,
+                                x[:, s:e], factor=factor,
+                            )
+                        else:
+                            quota = (
+                                None if threshold is not None
+                                else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                            )
+                            x0_blk, transfer_blk = _get_transfer_index(
+                                delta_logits, temperature, remasking, mask_blk,
+                                x[:, s:e], quota, threshold,
+                            )
+                        new_blk = torch.where(transfer_blk, x0_blk, x[:, s:e])
+                        x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
                     else:
-                        quota = (
-                            None if threshold is not None
-                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
-                        )
-                        x0_full, transfer_full = _get_transfer_index(
-                            logits, temperature, remasking, mask_index_blk,
-                            x[:, s:], quota, threshold,
-                        )
-                    new_suffix = torch.where(transfer_full, x0_full, x[:, s:])
-                    x = torch.cat([x[:, :s], new_suffix], dim=1)
+                        # Backbone transfer — pass-≥1 logits are suffix-only;
+                        # restrict the mask to the first `block_length` rows.
+                        mask_index_blk = (x[:, s:] == mask_id)
+                        mask_index_blk[:, block_length:] = False
+                        if factor is not None:
+                            x0_full, transfer_full = _get_transfer_index_dynamic(
+                                logits, temperature, remasking, mask_index_blk,
+                                x[:, s:], factor=factor,
+                            )
+                        else:
+                            quota = (
+                                None if threshold is not None
+                                else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                            )
+                            x0_full, transfer_full = _get_transfer_index(
+                                logits, temperature, remasking, mask_index_blk,
+                                x[:, s:], quota, threshold,
+                            )
+                        new_suffix = torch.where(transfer_full, x0_full, x[:, s:])
+                        x = torch.cat([x[:, :s], new_suffix], dim=1)
 
                 if recorded_passes < max_iter:
                     h_per_pass.append(hook_state["latest"])
@@ -490,6 +579,9 @@ def collect_one_sample(
                 {"mode": "factor",    "factor":    factor}    if factor is not None
                 else {"mode": "threshold", "threshold": threshold}
             ),
+            # v4 provenance: 0.0 = pure teacher-forced collect; > 0 = a
+            # fraction of in-block commits followed the delta's tokens.
+            "sched_sampling_p": float(sched_sampling_p),
             "schema_version": S.SCHEMA_VERSION,
         },
     }
@@ -571,7 +663,28 @@ def main() -> None:
         help="If set, load prompts from this file (one per line) instead of "
              "Nemotron. No HuggingFace auth needed. Used for smoke tests.",
     )
+    p.add_argument(
+        "--delta_ckpt", type=str, default=None,
+        help="v4 scheduled sampling: a v3 phase-1 delta checkpoint. When "
+             "set together with --sched_sampling_p > 0, the delta runs in "
+             "the decode loop and commits its own tokens with that "
+             "probability per in-block iter ≥ 1 — producing "
+             "delta-influenced (free-running) reveal trajectories. "
+             "h_per_pass targets stay the backbone's hidden states.",
+    )
+    p.add_argument(
+        "--sched_sampling_p", type=float, default=0.0,
+        help="Probability of committing the delta's tokens at each "
+             "in-block iteration ≥ 1. 0.0 (default) = pure teacher-forced "
+             "collect (legacy behaviour). Any value > 0 requires "
+             "--delta_ckpt.",
+    )
     args = p.parse_args()
+
+    if args.sched_sampling_p < 0.0 or args.sched_sampling_p > 1.0:
+        p.error("--sched_sampling_p must be in [0, 1]")
+    if args.sched_sampling_p > 0.0 and not args.delta_ckpt:
+        p.error("--sched_sampling_p > 0 requires --delta_ckpt")
 
     # Mutual exclusion + default. Both default to None at the CLI; if neither
     # was passed we use factor=1.0 (paper-recommended mode).
@@ -638,6 +751,10 @@ def main() -> None:
             if decoding_factor is not None
             else {"mode": "threshold", "threshold": decoding_threshold}
         ),
+        "sched_sampling": {
+            "p":          float(args.sched_sampling_p),
+            "delta_ckpt": args.delta_ckpt,
+        },
         "records":  [
             {
                 "split": r["split"], "subset": r["subset"], "id": r["id"],
@@ -652,6 +769,20 @@ def main() -> None:
     print("[collect] loading LLaDA …", flush=True)
     model, tokenizer = load_llada(fast_dllm_path=args.fast_dllm_path)
 
+    # v4 scheduled sampling — load the delta + the frozen backbone heads
+    # it needs (final_norm / lm_head / token_embed) once, up front.
+    delta_model = sched_final_norm = sched_lm_head = sched_token_embed = None
+    sched_rng = random.Random(args.shuffle_seed)
+    if args.sched_sampling_p > 0.0:
+        print(f"[collect] scheduled sampling ON (train split only): "
+              f"p={args.sched_sampling_p} delta_ckpt={args.delta_ckpt}",
+              flush=True)
+        delta_model = _load_delta_for_collect(args.delta_ckpt, model)
+        _tr = model.model.transformer
+        sched_final_norm = _tr.ln_f
+        sched_lm_head    = _tr.ff_out
+        sched_token_embed = _tr.wte
+
     runtimes: list[float] = []
     skipped = 0
     for idx, rec in enumerate(all_records[args.start_index:], start=args.start_index):
@@ -662,10 +793,22 @@ def main() -> None:
             continue
         try:
             t0 = time.time()
+            # Scheduled sampling applies to the TRAIN split only — the
+            # test split stays pure teacher-forced so it remains a clean,
+            # fixed held-out set comparable across runs (and to v3).
+            rec_sched_p = (
+                args.sched_sampling_p if rec["split"] == "train" else 0.0
+            )
             data = collect_one_sample(
                 model, tokenizer, rec["prompt"],
                 prefix_window=args.prefix_window,
                 threshold=decoding_threshold, factor=decoding_factor,
+                delta_model=delta_model,
+                final_norm=sched_final_norm,
+                lm_head=sched_lm_head,
+                token_embed=sched_token_embed,
+                sched_sampling_p=rec_sched_p,
+                sched_rng=sched_rng,
             )
             if data is None:
                 skipped += 1
