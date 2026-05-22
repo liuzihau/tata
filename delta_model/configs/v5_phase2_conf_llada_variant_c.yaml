@@ -1,0 +1,82 @@
+# v5 phase 2 — confidence-head training (same recipe as v3 phase 2)
+#
+# Identical to v3 phase 2 — trains ONLY conf_head_per_pos on free-running
+# DAgger labels, frozen delta loaded from a v5 phase-1 checkpoint. Only
+# the names (run_name / group / out_dir / cache) differ from v3 so the
+# v3 artifacts are preserved.
+#
+# Run once per top-3 v5 phase-1 checkpoint:
+#     python -m delta_model.train --phase conf \
+#         --config delta_model/configs/v5_phase2_conf_llada_variant_c.yaml \
+#         --resume_from ckpts/v5_phase1_delta_llada_variant_c/best_delta_gsm8k_step<N>.pt \
+#         --override backbone.fast_dllm_path=external/Fast-dLLM/v1 \
+#         --override checkpoint.out_dir=ckpts/v5_phase2_conf_cand<N>
+#
+# `model.*` must match the phase-1 checkpoint.
+
+run_name:          v5_phase2_conf_llada_variant_c_seed42
+seed:              42
+
+backbone:
+  model:           llada
+  fast_dllm_path:  null
+
+# DAgger rollout knobs (read by run_conf_phase via getattr on cfg).
+conf_rollout_prompts:        64
+conf_batch_size:             64
+
+# Phase-2 checkpoint admissibility — keep top-2 by speedup among
+# checkpoints that are fast enough AND accurate enough.
+conf_rollback_max:           0.70
+conf_acc_keep_frac:          0.95
+
+data:
+  # phase 2 does not read the teacher-forced cache, but keep these so
+  # the config validates against the shared schema.
+  cache_root:      cache_v5_20k/llada
+  manifest:        cache_v5_20k/llada/manifest.json
+  val_split:       test
+  num_workers:     0
+  batch_size:      256
+  pin_memory:      false
+  preload:         false
+  mask_token_id:   126336
+
+model:
+  variant:         C
+  d_model:         4096
+  n_heads:         32
+  n_layers:        2                     # MUST match the phase-1 checkpoint
+  d_ff_inner:      10944
+  dropout:         0.20
+  detach_conf_features: true
+
+optim:
+  optimizer:       adamw
+  lr:              1.0e-4
+  weight_decay:    0.03
+  betas:           [0.9, 0.95]
+  warmup_steps:    0
+  max_steps:       1000
+  scheduler:       cosine
+  grad_clip:       1.0
+  precision:       bf16
+
+loss:
+  conf_target:     tiered
+  conf_topk:       10
+  decode_factor:   1.0
+
+log:
+  framework:       wandb
+  project:         tata-delta-model
+  group:           v5-phase2-llada
+  log_every:       25
+  val_every:       100
+  gsm8k_subset:    50
+  gsm8k_per_pos_threshold: 0.75
+
+checkpoint:
+  every:           500
+  keep_last:       3
+  out_dir:         ckpts/v5_phase2_conf_llada_variant_c

@@ -51,9 +51,11 @@ from ..models.variant_c import VariantC
 
 
 def _load_delta_for_collect(delta_ckpt: str, backbone) -> torch.nn.Module:
-    """Load a VariantC delta from a v3 phase-1 checkpoint, for in-the-loop
-    scheduled sampling (v4). Backbone hyperparams are read off
-    `backbone.config` so RoPE / RMSNorm match what produced the cache.
+    """Load a VariantC (delta + conf head) for in-the-loop gated-hybrid
+    rollout (v4 DAgger). Pass a v3 **phase-2** checkpoint — it carries
+    the phase-1 delta AND the phase-2-trained conf head, so the rollout
+    can gate exactly as the deployed hybrid does. Backbone hyperparams
+    are read off `backbone.config` so RoPE / RMSNorm match the cache.
     """
     ckpt = torch.load(delta_ckpt, map_location="cpu", weights_only=False)
     cm = ckpt["cfg"]["model"]
@@ -263,20 +265,20 @@ def collect_one_sample(
     final_norm=None,
     lm_head=None,
     token_embed=None,
-    sched_sampling_p: float = 0.0,
-    sched_rng: "random.Random | None" = None,
+    gate_threshold: float = 0.75,
 ) -> dict | None:
     """Run prefix-cache generation on one prompt and return the cache dict
     described in `data/schema.py`. Returns None only for empty prompts.
 
-    Scheduled sampling (v4 — DAgger for the delta). When `delta_model` is
-    given and `sched_sampling_p > 0`, then at each in-block iteration ≥ 1,
-    with that probability, the committed tokens come from the **delta
-    model's** logits (`lm_head(final_norm(h_ref + Δh))`) instead of the
-    backbone's. The reveal pattern and committed token IDs then follow a
-    delta-influenced (free-running) trajectory, while `h_per_pass[i]`
-    stays the *backbone's* hidden at that state — exactly the
-    exposure-bias-correcting training target. `sched_sampling_p = 0`
+    Gated-hybrid rollout (v4 — DAgger for the delta). When `delta_model`
+    is given (a v3 phase-2 VariantC: delta + trained conf head), each
+    in-block iteration ≥ 1 commits like the *deployed hybrid policy*:
+    the delta proposes tokens, and per position the conf head's
+    `c_pos ≥ gate_threshold` decides whether the **delta's** token or the
+    **backbone's** token is committed. The reveal pattern / committed IDs
+    then follow the gated free-running trajectory, while `h_per_pass[i]`
+    stays the *backbone's* hidden at that state — the
+    exposure-bias-correcting training target. `delta_model = None`
     (default) → pure teacher-forced collect, identical to the legacy path.
 
     `prefix_window` is the number of last-prefix slots cached per block.
@@ -458,59 +460,10 @@ def collect_one_sample(
                     )
                     logits = out.logits   # [1, GL - nb*BL, V] — covers x[:, s:]
 
-                    # v4 scheduled sampling: with prob `sched_sampling_p`,
-                    # this iter's commit comes from the delta's logits, so
-                    # the reveal pattern / committed IDs follow a
-                    # delta-influenced trajectory.
-                    use_delta = (
-                        delta_model is not None
-                        and sched_sampling_p > 0.0
-                        and sched_rng is not None
-                        and sched_rng.random() < sched_sampling_p
-                    )
-
-                    if use_delta:
-                        ddt = delta_model.delta_head.proj.weight.dtype
-                        h_ref_g  = h_per_pass[0].to(
-                            model.device, dtype=torch.bfloat16,
-                        ).unsqueeze(0)                                # [1, BL, D]
-                        prev_emb = token_embed(x[0, s:e]).unsqueeze(0)
-                        pkv_g = prefix_kv[..., -S.PREFIX_WINDOW:, :].to(
-                            model.device,
-                        ).unsqueeze(0)
-                        pad_g = prefix_kv_pad_mask[-S.PREFIX_WINDOW:].to(
-                            model.device,
-                        ).unsqueeze(0)
-                        bsp = torch.tensor(
-                            [s], dtype=torch.long, device=model.device,
-                        )
-                        delta_h, _c = delta_model(
-                            h_ref_g.to(ddt), prev_emb.to(ddt),
-                            pkv_g.to(torch.float16), bsp,
-                            prefix_kv_pad_mask=pad_g,
-                        )
-                        h_pred = h_ref_g + delta_h.to(h_ref_g.dtype)
-                        delta_logits = lm_head(final_norm(h_pred))    # [1, BL, V]
-                        mask_blk = (x[:, s:e] == mask_id)
-                        if factor is not None:
-                            x0_blk, transfer_blk = _get_transfer_index_dynamic(
-                                delta_logits, temperature, remasking, mask_blk,
-                                x[:, s:e], factor=factor,
-                            )
-                        else:
-                            quota = (
-                                None if threshold is not None
-                                else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
-                            )
-                            x0_blk, transfer_blk = _get_transfer_index(
-                                delta_logits, temperature, remasking, mask_blk,
-                                x[:, s:e], quota, threshold,
-                            )
-                        new_blk = torch.where(transfer_blk, x0_blk, x[:, s:e])
-                        x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
-                    else:
-                        # Backbone transfer — pass-≥1 logits are suffix-only;
-                        # restrict the mask to the first `block_length` rows.
+                    if delta_model is None:
+                        # Teacher-forced (legacy) — backbone transfer.
+                        # Pass-≥1 logits are suffix-only; restrict the mask
+                        # to the first `block_length` rows.
                         mask_index_blk = (x[:, s:] == mask_id)
                         mask_index_blk[:, block_length:] = False
                         if factor is not None:
@@ -529,6 +482,71 @@ def collect_one_sample(
                             )
                         new_suffix = torch.where(transfer_full, x0_full, x[:, s:])
                         x = torch.cat([x[:, :s], new_suffix], dim=1)
+                    else:
+                        # v4 gated-hybrid rollout — commit like the deployed
+                        # policy: delta token where the conf gate passes,
+                        # backbone token where it vetoes. h_per_pass[i] (the
+                        # hook above) stays the backbone's hidden.
+                        ddt = delta_model.delta_head.proj.weight.dtype
+                        h_ref_g  = h_per_pass[0].to(
+                            model.device, dtype=torch.bfloat16,
+                        ).unsqueeze(0)                                # [1, BL, D]
+                        prev_emb = token_embed(x[0, s:e]).unsqueeze(0)
+                        pkv_g = prefix_kv[..., -S.PREFIX_WINDOW:, :].to(
+                            model.device,
+                        ).unsqueeze(0)
+                        pad_g = prefix_kv_pad_mask[-S.PREFIX_WINDOW:].to(
+                            model.device,
+                        ).unsqueeze(0)
+                        bsp = torch.tensor(
+                            [s], dtype=torch.long, device=model.device,
+                        )
+                        delta_h, c_pos = delta_model(
+                            h_ref_g.to(ddt), prev_emb.to(ddt),
+                            pkv_g.to(torch.float16), bsp,
+                            prefix_kv_pad_mask=pad_g,
+                        )
+                        h_pred = h_ref_g + delta_h.to(h_ref_g.dtype)
+                        delta_logits = lm_head(final_norm(h_pred))    # [1, BL, V]
+                        bb_logits_blk = logits[:, :block_length, :]   # [1, BL, V]
+                        mask_blk = (x[:, s:e] == mask_id)
+
+                        quota = (
+                            None if threshold is not None
+                            else num_transfer_tokens[:, min(i, num_transfer_tokens.size(1) - 1)]
+                        )
+                        if factor is not None:
+                            x0_d, transfer_d = _get_transfer_index_dynamic(
+                                delta_logits, temperature, remasking, mask_blk,
+                                x[:, s:e], factor=factor,
+                            )
+                            x0_b, _transfer_b = _get_transfer_index_dynamic(
+                                bb_logits_blk, temperature, remasking, mask_blk,
+                                x[:, s:e], factor=factor,
+                            )
+                        else:
+                            x0_d, transfer_d = _get_transfer_index(
+                                delta_logits, temperature, remasking, mask_blk,
+                                x[:, s:e], quota, threshold,
+                            )
+                            x0_b, _transfer_b = _get_transfer_index(
+                                bb_logits_blk, temperature, remasking, mask_blk,
+                                x[:, s:e], quota, threshold,
+                            )
+
+                        # Gate: positions the delta wants AND the conf head
+                        # trusts (c_pos ≥ gate_threshold) commit the delta's
+                        # token; delta-wanted-but-vetoed positions commit the
+                        # backbone's token (the rollback's effect, applied
+                        # per-position). Every delta-wanted position is thus
+                        # committed — never an ungated delta token.
+                        per_pos_pass = (c_pos.float() >= gate_threshold)
+                        commit_delta = transfer_d & per_pos_pass
+                        commit_bb    = transfer_d & (~per_pos_pass)
+                        new_blk = x[:, s:e].clone()
+                        new_blk = torch.where(commit_delta, x0_d, new_blk)
+                        new_blk = torch.where(commit_bb,    x0_b, new_blk)
+                        x = torch.cat([x[:, :s], new_blk, x[:, e:]], dim=1)
 
                 if recorded_passes < max_iter:
                     h_per_pass.append(hook_state["latest"])
@@ -579,9 +597,12 @@ def collect_one_sample(
                 {"mode": "factor",    "factor":    factor}    if factor is not None
                 else {"mode": "threshold", "threshold": threshold}
             ),
-            # v4 provenance: 0.0 = pure teacher-forced collect; > 0 = a
-            # fraction of in-block commits followed the delta's tokens.
-            "sched_sampling_p": float(sched_sampling_p),
+            # v4 provenance: None = pure teacher-forced collect; a float
+            # = the conf-gate threshold used for the gated-hybrid rollout
+            # (this sample's trajectory followed the deployed policy).
+            "gate_threshold": (
+                float(gate_threshold) if delta_model is not None else None
+            ),
             "schema_version": S.SCHEMA_VERSION,
         },
     }
@@ -664,27 +685,28 @@ def main() -> None:
              "Nemotron. No HuggingFace auth needed. Used for smoke tests.",
     )
     p.add_argument(
-        "--delta_ckpt", type=str, default=None,
-        help="v4 scheduled sampling: a v3 phase-1 delta checkpoint. When "
-             "set together with --sched_sampling_p > 0, the delta runs in "
-             "the decode loop and commits its own tokens with that "
-             "probability per in-block iter ≥ 1 — producing "
-             "delta-influenced (free-running) reveal trajectories. "
-             "h_per_pass targets stay the backbone's hidden states.",
+        "--conf_ckpt", type=str, default=None,
+        help="v4 gated-hybrid rollout (DAgger for the delta): a v3 "
+             "phase-2 checkpoint — a full VariantC carrying the phase-1 "
+             "delta AND the phase-2-trained conf head. When set, the "
+             "TRAIN split is collected by rolling out the gated hybrid "
+             "policy (delta token where the conf gate passes, backbone "
+             "token where it vetoes), so reveal trajectories match the "
+             "deployed policy. h_per_pass targets stay the backbone's "
+             "hidden states. Unset (default) = pure teacher-forced "
+             "collect (legacy).",
     )
     p.add_argument(
-        "--sched_sampling_p", type=float, default=0.0,
-        help="Probability of committing the delta's tokens at each "
-             "in-block iteration ≥ 1. 0.0 (default) = pure teacher-forced "
-             "collect (legacy behaviour). Any value > 0 requires "
-             "--delta_ckpt.",
+        "--collect_gate_threshold", type=float, default=0.75,
+        help="conf-gate threshold for the gated-hybrid rollout — a "
+             "position commits the delta's token iff c_pos ≥ this, else "
+             "the backbone's token. Only used when --conf_ckpt is set; "
+             "pick the per_pos_threshold you expect to deploy at.",
     )
     args = p.parse_args()
 
-    if args.sched_sampling_p < 0.0 or args.sched_sampling_p > 1.0:
-        p.error("--sched_sampling_p must be in [0, 1]")
-    if args.sched_sampling_p > 0.0 and not args.delta_ckpt:
-        p.error("--sched_sampling_p > 0 requires --delta_ckpt")
+    if not (0.0 <= args.collect_gate_threshold <= 1.0):
+        p.error("--collect_gate_threshold must be in [0, 1]")
 
     # Mutual exclusion + default. Both default to None at the CLI; if neither
     # was passed we use factor=1.0 (paper-recommended mode).
@@ -751,9 +773,10 @@ def main() -> None:
             if decoding_factor is not None
             else {"mode": "threshold", "threshold": decoding_threshold}
         ),
-        "sched_sampling": {
-            "p":          float(args.sched_sampling_p),
-            "delta_ckpt": args.delta_ckpt,
+        "dagger_rollout": {
+            "conf_ckpt":      args.conf_ckpt,
+            "gate_threshold": float(args.collect_gate_threshold),
+            "applies_to":     "train split only" if args.conf_ckpt else None,
         },
         "records":  [
             {
@@ -769,15 +792,14 @@ def main() -> None:
     print("[collect] loading LLaDA …", flush=True)
     model, tokenizer = load_llada(fast_dllm_path=args.fast_dllm_path)
 
-    # v4 scheduled sampling — load the delta + the frozen backbone heads
-    # it needs (final_norm / lm_head / token_embed) once, up front.
+    # v4 gated-hybrid rollout — load the delta+conf model + the frozen
+    # backbone heads it needs (final_norm / lm_head / token_embed) once.
     delta_model = sched_final_norm = sched_lm_head = sched_token_embed = None
-    sched_rng = random.Random(args.shuffle_seed)
-    if args.sched_sampling_p > 0.0:
-        print(f"[collect] scheduled sampling ON (train split only): "
-              f"p={args.sched_sampling_p} delta_ckpt={args.delta_ckpt}",
-              flush=True)
-        delta_model = _load_delta_for_collect(args.delta_ckpt, model)
+    if args.conf_ckpt is not None:
+        print(f"[collect] gated-hybrid rollout ON (train split only): "
+              f"gate_threshold={args.collect_gate_threshold} "
+              f"conf_ckpt={args.conf_ckpt}", flush=True)
+        delta_model = _load_delta_for_collect(args.conf_ckpt, model)
         _tr = model.model.transformer
         sched_final_norm = _tr.ln_f
         sched_lm_head    = _tr.ff_out
@@ -793,22 +815,19 @@ def main() -> None:
             continue
         try:
             t0 = time.time()
-            # Scheduled sampling applies to the TRAIN split only — the
+            # Gated-hybrid rollout applies to the TRAIN split only — the
             # test split stays pure teacher-forced so it remains a clean,
             # fixed held-out set comparable across runs (and to v3).
-            rec_sched_p = (
-                args.sched_sampling_p if rec["split"] == "train" else 0.0
-            )
+            rec_delta = delta_model if rec["split"] == "train" else None
             data = collect_one_sample(
                 model, tokenizer, rec["prompt"],
                 prefix_window=args.prefix_window,
                 threshold=decoding_threshold, factor=decoding_factor,
-                delta_model=delta_model,
+                delta_model=rec_delta,
                 final_norm=sched_final_norm,
                 lm_head=sched_lm_head,
                 token_embed=sched_token_embed,
-                sched_sampling_p=rec_sched_p,
-                sched_rng=sched_rng,
+                gate_threshold=args.collect_gate_threshold,
             )
             if data is None:
                 skipped += 1
